@@ -3,11 +3,11 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 
+use crate::player::Direction;
+use crate::player::MoveError;
 use crate::pos::Position;
 use crate::tiles::Letter;
 use crate::tiles::ALPHABET;
-use crate::Direction;
-use crate::MoveError;
 
 use crate::tiles::LetterSet;
 use crate::tiles::Tile;

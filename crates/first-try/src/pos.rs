@@ -5,7 +5,7 @@ use std::fmt::{Debug, Display, Formatter};
 use std::ops::AddAssign;
 use std::str::FromStr;
 
-use crate::Direction;
+use crate::player::Direction;
 
 type PosIndex = u8;
 

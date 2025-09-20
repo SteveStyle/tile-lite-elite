@@ -2,7 +2,9 @@ use std::fmt::{Display, Formatter};
 
 use rand::Rng;
 
-use crate::{board::ScrabbleVariant, MoveError, TScore};
+use crate::board::ScrabbleVariant;
+use crate::player::MoveError;
+use crate::player::TScore;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub struct LetterSet {
@@ -240,7 +242,7 @@ impl Tile {
             Tile::Blank { .. } => true,
         }
     }
-    pub fn try_letter(&self) -> Result<Letter, crate::MoveError> {
+    pub fn try_letter(&self) -> Result<Letter, MoveError> {
         match self {
             Tile::Letter(letter) => Ok(*letter),
             Tile::Blank {
@@ -248,7 +250,7 @@ impl Tile {
             } => Ok(*letter),
             Tile::Blank {
                 acting_as_letter: None,
-            } => Err(crate::MoveError::BlankTileNotActingAsLetter),
+            } => Err(MoveError::BlankTileNotActingAsLetter),
         }
     }
 
@@ -362,12 +364,12 @@ impl TileBag {
             } => self.remove_blank(),
         }
     }
-    fn try_remove_tile(&mut self, tile: Tile) -> Result<(), crate::MoveError> {
+    fn try_remove_tile(&mut self, tile: Tile) -> Result<(), MoveError> {
         if self.count_tile(tile) > 0 {
             self.remove_tile(tile);
             Ok(())
         } else {
-            Err(crate::MoveError::TilesNotInRack(tile.clone()))
+            Err(MoveError::TilesNotInRack(tile.clone()))
         }
     }
     pub fn confirm_contains_tile_list(&self, other: &TileList) -> Result<(), MoveError> {
@@ -453,7 +455,7 @@ impl From<TileList> for TileBag {
 }
 
 impl TryFrom<&str> for TileList {
-    type Error = crate::MoveError;
+    type Error = MoveError;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         let mut vec = Vec::new();
@@ -469,15 +471,15 @@ impl TryFrom<&str> for TileList {
                         });
                         index += 1;
                     } else {
-                        return Err(crate::MoveError::InvalidTile(c));
+                        return Err(MoveError::InvalidTile(c));
                     }
                 } else {
-                    return Err(crate::MoveError::InvalidTile(c));
+                    return Err(MoveError::InvalidTile(c));
                 }
             } else if c.is_ascii_uppercase() {
                 vec.push(Tile::Letter(c.into()));
             } else {
-                return Err(crate::MoveError::InvalidTile(c));
+                return Err(MoveError::InvalidTile(c));
             }
             index += 1;
         }

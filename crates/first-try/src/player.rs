@@ -3,21 +3,14 @@ use std::{
     ops::Neg,
 };
 
-use board::{CellValue, MoveCell};
-use pos::Position;
+use crate::board::{Board, CellValue, MoveCell, ScrabbleVariant};
+use crate::pos::Position;
 
-use tiles::{Tile, TileBag, TileList, ALPHABET};
-use utils::Timer;
+use crate::tiles::{Tile, TileBag, TileList, ALPHABET};
+use crate::utils::Timer;
 
 use crate::word_list::is_word;
 //use word_list::{is_word, LETTER_PREFIXES, LETTER_SUFFIXES};
-
-pub mod board;
-pub mod tiles;
-pub mod word_list;
-
-pub mod pos;
-pub mod utils;
 
 pub type TScore = i16;
 
@@ -29,7 +22,7 @@ pub enum PlayerType {
 #[derive(Debug, Clone, Copy)]
 pub struct Player {
     pub player_type: PlayerType,
-    pub rack: tiles::TileBag,
+    pub rack: TileBag,
     pub score: TScore,
     pub passes: u8,
     pub exchanges: u8,
@@ -132,7 +125,7 @@ impl GameMove {
             score,
         }
     }
-    pub fn get_main_word_start_pos(&self, board: &board::Board) -> Position {
+    pub fn get_main_word_start_pos(&self, board: &Board) -> Position {
         let mut current_position = self.starting_position;
         while let Some(next_position) = current_position.try_step_backward(self.direction) {
             if board.get_cell_pos(next_position).is_empty() {
@@ -188,13 +181,13 @@ impl Display for GameMoveRecord {
 #[derive(Debug, Clone)]
 pub struct Game {
     //  fixed part of the game
-    scrabble_variant: &'static board::ScrabbleVariant,
+    scrabble_variant: &'static ScrabbleVariant,
     //  mutable part of the game
     pub number_of_players: usize,
     pub player: [Player; 4],
     pub player_name: Vec<String>,
-    pub board: board::Board,
-    pub bag: tiles::TileBag,
+    pub board: Board,
+    pub bag: TileBag,
     pub current_player: usize, // index into `players`
     pub first_move: bool,
     pub is_over: bool,
@@ -270,16 +263,16 @@ pub enum MoveError {
 
 impl Game {
     pub fn new(
-        scrabble_variant: &'static board::ScrabbleVariant,
+        scrabble_variant: &'static ScrabbleVariant,
         number_of_players: usize,
         players: [Player; 4],
         player_name: Vec<String>,
     ) -> Self {
         is_word("the"); //  just to make sure the word list is loaded
 
-        let bag = tiles::TileBag::new(scrabble_variant);
+        let bag = TileBag::new(scrabble_variant);
 
-        let board = board::Board::new(scrabble_variant);
+        let board = Board::new(scrabble_variant);
         let next_player = 0;
         let moves = Vec::new();
         //let local_word_list = word_list::generate_anagrams(&players[1].rack);
@@ -309,8 +302,8 @@ impl Game {
     }
 
     pub fn restart(&mut self) {
-        self.bag = tiles::TileBag::new(self.scrabble_variant);
-        self.board = board::Board::new(self.scrabble_variant);
+        self.bag = TileBag::new(self.scrabble_variant);
+        self.board = Board::new(self.scrabble_variant);
         self.first_move = true;
         self.is_over = false;
         self.last_player_to_play = None;

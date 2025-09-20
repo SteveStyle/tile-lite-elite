@@ -1,15 +1,29 @@
 use std::io;
 use std::str::FromStr;
 
-use itertools::Itertools;
-use scrabble::board::SCRABBLE_VARIANT_OFFICIAL;
-use scrabble::board::SCRABBLE_VARIANT_WORDFEUD;
-use scrabble::*;
+pub mod player;
 
-use scrabble::board::ScrabbleVariant;
-use scrabble::pos::Position;
-use scrabble::tiles::TileList;
-use scrabble::word_list::is_word;
+pub mod board;
+pub mod tiles;
+pub mod word_list;
+
+pub mod pos;
+pub mod utils;
+
+use board::SCRABBLE_VARIANT_OFFICIAL;
+use board::SCRABBLE_VARIANT_WORDFEUD;
+use itertools::Itertools;
+
+use board::ScrabbleVariant;
+use pos::Position;
+use tiles::TileList;
+use word_list::is_word;
+
+use crate::player::Direction;
+use crate::player::Game;
+use crate::player::GameMoveRecordDetail;
+use crate::player::Player;
+use crate::player::PlayerType;
 
 //TO DO : use terminal escape codes to clear the screen
 //https://stackoverflow.com/questions/2979383/c-clear-the-console

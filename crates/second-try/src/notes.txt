@@ -1,0 +1,40 @@
+modes:
+    human vs computer
+    computer, step through
+    suggestions
+    word lookup
+
+
+allow negative score - DONE
+handle resignation properly (don't make the resigner the winner)
+
+correct timer for suggestion, make suggested move a seperate function from application?  In general seperate out computer player from the shared playing board.
+
+allow cancel out of any menu, to reach the previous menu, 
+have a quit from program option
+only show default when relevant but allow default to cancel or quit
+
+improve end game message - DONE
+
+highlight last move letters, and not blanks - DONE
+
+
+show coordinates - all sides - DONE
+offer link to last word - DONE
+
+
+
+
+store top n moves, not just best
+
+use termcolor crate
+
+profiler
+    how much time is looking up words?
+    can we improve time by using a local cache?
+
+
+strategy
+    rate rack
+    check for opportunities left on the board
+    genetic algorythm?
