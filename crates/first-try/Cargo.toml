@@ -12,4 +12,5 @@ lazy_static = "1.4.0"
 num-traits = "0.2.15"
 rand = "0.8.5"
 regex = "1.7.1"
+srm-utils = { workspace = true }
 termcolor = "1.2.0"

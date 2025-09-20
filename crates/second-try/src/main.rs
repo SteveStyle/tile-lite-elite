@@ -8,7 +8,7 @@ pub mod tiles;
 pub mod word_list;
 
 pub mod pos;
-pub mod utils;
+// pub mod utils;
 
 use board::SCRABBLE_VARIANT_OFFICIAL;
 use board::SCRABBLE_VARIANT_WORDFEUD;
