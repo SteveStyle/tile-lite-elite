@@ -610,7 +610,11 @@ impl Board {
         end_pos
     }
 
-    pub fn move_iterator(&self, starting_position: Position, direction: Direction) -> MoveIterator {
+    pub fn move_iterator(
+        &'_ self,
+        starting_position: Position,
+        direction: Direction,
+    ) -> MoveIterator<'_> {
         MoveIterator::new(
             self,
             self.start_of_word(starting_position, direction),
