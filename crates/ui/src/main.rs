@@ -6,19 +6,22 @@ fn main() {
     {
         use dioxus_desktop::{Config, WindowBuilder};
 
-        dioxus_desktop::launch_cfg(
+        dioxus_desktop::launch::launch(
             App,
-            Config::new().with_window(
-                WindowBuilder::new()
-                    .with_title("Scrabble Desktop")
-                    .with_resizable(true)
-                    .with_min_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(800, 600))
-                    .with_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(1000, 800)),
-            ),
+            vec![],
+            vec![Box::new(
+                Config::new().with_window(
+                    WindowBuilder::new()
+                        .with_title("Scrabble Desktop")
+                        .with_resizable(true)
+                        .with_min_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(800, 600))
+                        .with_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(1000, 800)),
+                ),
+            )],
         );
     }
 
-    #[cfg(feature = "web")]
+    #[cfg(all(feature = "web", not(feature = "desktop")))]
     {
         dioxus::launch(App);
     }

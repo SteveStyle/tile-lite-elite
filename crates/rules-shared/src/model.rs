@@ -1,0 +1,410 @@
+use std::fmt::{Display, Formatter};
+use std::ops::Neg;
+use std::str::FromStr;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Direction {
+    Horizontal,
+    Vertical,
+}
+
+impl Neg for Direction {
+    type Output = Direction;
+
+    fn neg(self) -> Self::Output {
+        match self {
+            Direction::Horizontal => Direction::Vertical,
+            Direction::Vertical => Direction::Horizontal,
+        }
+    }
+}
+
+impl Display for Direction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Direction::Horizontal => write!(f, "Horizontal"),
+            Direction::Vertical => write!(f, "Vertical"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Position {
+    pub x: u8,
+    pub y: u8,
+}
+
+impl Position {
+    pub const fn new(x: u8, y: u8) -> Self {
+        Self { x, y }
+    }
+
+    pub fn try_step_forward(&self, direction: Direction, width: u8, height: u8) -> Option<Self> {
+        match direction {
+            Direction::Horizontal if self.x + 1 < width => Some(Self::new(self.x + 1, self.y)),
+            Direction::Vertical if self.y + 1 < height => Some(Self::new(self.x, self.y + 1)),
+            _ => None,
+        }
+    }
+
+    pub fn try_step_backward(&self, direction: Direction) -> Option<Self> {
+        match direction {
+            Direction::Horizontal if self.x > 0 => Some(Self::new(self.x - 1, self.y)),
+            Direction::Vertical if self.y > 0 => Some(Self::new(self.x, self.y - 1)),
+            _ => None,
+        }
+    }
+
+    pub const fn to_index(self, width: usize) -> usize {
+        (self.y as usize) * width + (self.x as usize)
+    }
+}
+
+impl Display for Position {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", (self.x + b'A') as char, self.y + 1)
+    }
+}
+
+impl FromStr for Position {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.len() < 2 {
+            return Err(format!("Invalid position: {s}"));
+        }
+
+        let mut chars = s.chars();
+        let column = chars
+            .next()
+            .ok_or_else(|| format!("Invalid position: {s}"))?;
+
+        if !(('A'..='O').contains(&column)) {
+            return Err(format!("Invalid position: {s}"));
+        }
+
+        let row_str: String = chars.collect();
+        let row = row_str
+            .parse::<u8>()
+            .map_err(|_| format!("Invalid position: {s}"))?;
+
+        if !(1..=15).contains(&row) {
+            return Err(format!("Invalid position: {s}"));
+        }
+
+        Ok(Self::new(column as u8 - b'A', row - 1))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Letter(pub u8);
+
+impl Letter {
+    pub const FIRST_ASCII: u8 = b'A';
+
+    pub const fn as_byte(self) -> u8 {
+        self.0
+    }
+
+    pub const fn as_char(self) -> char {
+        (self.0 + Self::FIRST_ASCII) as char
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl From<u8> for Letter {
+    fn from(value: u8) -> Self {
+        Self(value)
+    }
+}
+
+impl From<char> for Letter {
+    fn from(value: char) -> Self {
+        Self(value as u8 - Self::FIRST_ASCII)
+    }
+}
+
+impl Display for Letter {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_char())
+    }
+}
+
+pub const ALPHABET: [Letter; 26] = [
+    Letter(0),
+    Letter(1),
+    Letter(2),
+    Letter(3),
+    Letter(4),
+    Letter(5),
+    Letter(6),
+    Letter(7),
+    Letter(8),
+    Letter(9),
+    Letter(10),
+    Letter(11),
+    Letter(12),
+    Letter(13),
+    Letter(14),
+    Letter(15),
+    Letter(16),
+    Letter(17),
+    Letter(18),
+    Letter(19),
+    Letter(20),
+    Letter(21),
+    Letter(22),
+    Letter(23),
+    Letter(24),
+    Letter(25),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Tile {
+    Letter(Letter),
+    Blank { acting_as: Option<Letter> },
+}
+
+impl Tile {
+    pub fn letter(self) -> Option<Letter> {
+        match self {
+            Tile::Letter(letter) => Some(letter),
+            Tile::Blank { acting_as } => acting_as,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Premium {
+    Blank,
+    DoubleLetter,
+    TripleLetter,
+    DoubleWord,
+    TripleWord,
+}
+
+impl Premium {
+    pub const fn letter_multiplier(self) -> u8 {
+        match self {
+            Premium::DoubleLetter => 2,
+            Premium::TripleLetter => 3,
+            _ => 1,
+        }
+    }
+
+    pub const fn word_multiplier(self) -> u8 {
+        match self {
+            Premium::DoubleWord => 2,
+            Premium::TripleWord => 3,
+            _ => 1,
+        }
+    }
+}
+
+pub type LetterMask = u32;
+pub type Score = i16;
+
+pub const FULL_LETTER_MASK: LetterMask = (1 << 26) - 1;
+
+pub const fn mask_contains(mask: LetterMask, letter: Letter) -> bool {
+    (mask & (1 << letter.as_usize())) != 0
+}
+
+pub fn mask_insert(mask: &mut LetterMask, letter: Letter) {
+    *mask |= 1 << letter.as_usize();
+}
+
+pub fn mask_remove(mask: &mut LetterMask, letter: Letter) {
+    *mask &= !(1 << letter.as_usize());
+}
+
+pub const fn mask_is_empty(mask: LetterMask) -> bool {
+    mask == 0
+}
+
+pub const fn mask_is_full(mask: LetterMask) -> bool {
+    mask == FULL_LETTER_MASK
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rack {
+    pub counts: [u8; 26],
+    pub blanks: u8,
+}
+
+impl Rack {
+    pub fn contains_letter(self, letter: Letter) -> bool {
+        self.counts[letter.as_usize()] > 0
+    }
+
+    pub fn add_letter(&mut self, letter: Letter) {
+        self.counts[letter.as_usize()] += 1;
+    }
+
+    pub fn remove_letter(&mut self, letter: Letter) -> bool {
+        let count = &mut self.counts[letter.as_usize()];
+        if *count > 0 {
+            *count -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn remove_blank(&mut self) -> bool {
+        if self.blanks > 0 {
+            self.blanks -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn consume_tile(&mut self, tile: Tile) -> bool {
+        match tile {
+            Tile::Letter(letter) => self.remove_letter(letter),
+            Tile::Blank { acting_as: Some(_) } => self.remove_blank(),
+            Tile::Blank { acting_as: None } => false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantRules {
+    pub letter_values: [u8; 26],
+    pub rack_size: u8,
+    pub width: u8,
+    pub height: u8,
+    pub bingo_bonus: Score,
+}
+
+impl VariantRules {
+    pub fn official() -> Self {
+        Self {
+            letter_values: [
+                1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3, 1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10,
+            ],
+            rack_size: 7,
+            width: 15,
+            height: 15,
+            bingo_bonus: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TilePlacement {
+    pub offset: u8,
+    pub tile: Tile,
+}
+
+#[derive(Debug, Clone)]
+pub struct MoveCandidate {
+    pub start: Position,
+    pub direction: Direction,
+    pub tiles: Vec<TilePlacement>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CrossWordPreview {
+    pub pos: Position,
+    pub word: String,
+    pub score: Score,
+}
+
+#[derive(Debug, Clone)]
+pub struct MovePreview {
+    pub legal: bool,
+    pub main_word: String,
+    pub total_score: Score,
+    pub cross_words: Vec<CrossWordPreview>,
+    pub error: Option<MoveError>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MoveScore {
+    pub total: Score,
+    pub main_word_score: Score,
+    pub cross_word_score: Score,
+    pub bingo_bonus: Score,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedMove {
+    pub candidate: MoveCandidate,
+    pub preview: MovePreview,
+    pub score: MoveScore,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveError {
+    InvalidMove,
+    InvalidWord(String),
+    InvalidPosition,
+    InvalidDirection,
+    TilesDoNotFit,
+    TilesDoNotConnect,
+    LetterNotAllowedInPosition,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Direction, Letter, LetterMask, Position, Rack, Tile, mask_contains, mask_insert,
+        mask_is_empty, mask_remove,
+    };
+    use std::str::FromStr;
+
+    #[test]
+    fn parse_position() {
+        let pos = Position::from_str("H8").unwrap();
+        assert_eq!(pos, Position::new(7, 7));
+    }
+
+    #[test]
+    fn step_position() {
+        let pos = Position::new(7, 7);
+        assert_eq!(
+            pos.try_step_forward(Direction::Horizontal, 15, 15),
+            Some(Position::new(8, 7))
+        );
+        assert_eq!(
+            pos.try_step_backward(Direction::Vertical),
+            Some(Position::new(7, 6))
+        );
+    }
+
+    #[test]
+    fn letter_to_char() {
+        assert_eq!(Letter::from('A').as_char(), 'A');
+        assert_eq!(Letter::from('Z').as_usize(), 25);
+    }
+
+    #[test]
+    fn letter_mask_helpers() {
+        let mut mask: LetterMask = 0;
+        assert!(mask_is_empty(mask));
+        mask_insert(&mut mask, Letter::from('C'));
+        assert!(mask_contains(mask, Letter::from('C')));
+        mask_remove(&mut mask, Letter::from('C'));
+        assert!(mask_is_empty(mask));
+    }
+
+    #[test]
+    fn rack_consumes_tiles() {
+        let mut rack = Rack {
+            counts: [0; 26],
+            blanks: 1,
+        };
+        rack.add_letter(Letter::from('A'));
+
+        assert!(rack.consume_tile(Tile::Letter(Letter::from('A'))));
+        assert!(rack.consume_tile(Tile::Blank {
+            acting_as: Some(Letter::from('B')),
+        }));
+        assert!(!rack.consume_tile(Tile::Letter(Letter::from('Z'))));
+    }
+}

@@ -38,26 +38,34 @@ if command_exists dx; then
     dx serve --port 3000 &
     SERVER_PID=$!
     echo "✅ Server started with PID: $SERVER_PID"
+elif command_exists cargo; then
+    echo "⚠️  Dioxus CLI (dx) not found. Falling back to native desktop launch via Cargo..."
+    cargo run --features desktop &
+    SERVER_PID=$!
+    echo "✅ Desktop app started with PID: $SERVER_PID"
 else
-    echo "❌ Dioxus CLI (dx) not found. Please install with: cargo install dioxus-cli"
+    echo "❌ Neither Dioxus CLI (dx) nor Cargo was found."
+    echo "   Install dx with: cargo install dioxus-cli"
     exit 1
 fi
 
-# Wait for server to start
-echo "⏳ Waiting for server to start..."
-sleep 3
+if command_exists dx; then
+    # Wait for server to start before opening the browser.
+    echo "⏳ Waiting for server to start..."
+    sleep 3
 
-# Detect available browsers and launch in desktop mode
-if command_exists google-chrome; then
-    launch_desktop_mode "google-chrome"
-elif command_exists chromium; then
-    launch_desktop_mode "chromium"
-elif command_exists firefox; then
-    launch_desktop_mode "firefox"
-else
-    echo "❌ No suitable browser found. Please install Chrome, Chromium, or Firefox."
-    echo "   Opening server at: http://127.0.0.1:3000"
-    echo "   You can manually open this URL in your browser."
+    # Detect available browsers and launch in desktop mode
+    if command_exists google-chrome; then
+        launch_desktop_mode "google-chrome"
+    elif command_exists chromium; then
+        launch_desktop_mode "chromium"
+    elif command_exists firefox; then
+        launch_desktop_mode "firefox"
+    else
+        echo "❌ No suitable browser found. Please install Chrome, Chromium, or Firefox."
+        echo "   Opening server at: http://127.0.0.1:3000"
+        echo "   You can manually open this URL in your browser."
+    fi
 fi
 
 echo ""
