@@ -6,7 +6,7 @@ use std::{
 use crate::board::{Board, CellValue, MoveCell, ScrabbleVariant};
 use crate::pos::Position;
 
-use crate::tiles::{Tile, TileBag, TileList, ALPHABET};
+use crate::tiles::{ALPHABET, Tile, TileBag, TileList};
 use srm_utils::timer::Timer;
 
 use crate::word_list::is_word;

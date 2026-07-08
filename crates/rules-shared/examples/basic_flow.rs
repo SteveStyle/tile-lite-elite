@@ -65,7 +65,7 @@ fn main() {
     let generated = engine
         .enumerate_legal_moves(&state, &reply_rack)
         .collect::<Vec<_>>();
-    println!("generated legal single-tile replies: {}", generated.len());
+    println!("generated legal replies: {}", generated.len());
 
     match state.board.get(rules_shared::Position::new(7, 7)) {
         Some(BoardCell::Filled(_)) => println!("board updated"),

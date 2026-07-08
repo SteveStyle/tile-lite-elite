@@ -348,9 +348,11 @@ fn look_up_word() {
     if let Ok(word) = get_user_input_string_uppercase("Enter a word:  ", "0", true) {
         let result = is_word(&word);
         match result {
-        true => println!("{word} is a word.  Follow the link for the definition:  https://www.collinsdictionary.com/dictionary/english/{word}"),
-        false => println!("{} is not a word", word),
-    }
+            true => println!(
+                "{word} is a word.  Follow the link for the definition:  https://www.collinsdictionary.com/dictionary/english/{word}"
+            ),
+            false => println!("{} is not a word", word),
+        }
     }
 }
 

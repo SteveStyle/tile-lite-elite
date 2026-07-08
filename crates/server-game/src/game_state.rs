@@ -1,0 +1,560 @@
+use std::sync::Arc;
+
+use api::{
+    BoardCellDto, DirectionDto, EngineProfileDto, GameStateDto, GameStatus, MoveCandidateDto,
+    MoveRecordDto, ParticipantDto, PositionDto, PremiumDto, RackDto, SeatKind, TileDto,
+    TilePlacementDto,
+};
+use engine_core::{EngineAction, EngineMetadata, EngineRequest, GreedyEngine, ScrabbleEngine};
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use rules_shared::{
+    BoardCell, BoardState, Direction, FilledCell, GameState, Letter, MoveCandidate, Rack,
+    RulesEngine, SOWPODS, Tile, TilePlacement, VariantRules,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone)]
+pub struct EngineRegistry {
+    pub engines: Vec<Arc<dyn ScrabbleEngine>>,
+}
+
+impl Default for EngineRegistry {
+    fn default() -> Self {
+        Self {
+            engines: vec![Arc::new(GreedyEngine::new())],
+        }
+    }
+}
+
+impl EngineRegistry {
+    pub fn metadata(&self) -> Vec<EngineProfileDto> {
+        self.engines
+            .iter()
+            .map(|engine| engine_profile_from_metadata(engine.metadata()))
+            .collect()
+    }
+
+    pub fn find(&self, id: &str) -> Option<Arc<dyn ScrabbleEngine>> {
+        self.engines
+            .iter()
+            .find(|engine| engine.metadata().id == id)
+            .cloned()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveRecord {
+    pub move_number: i64,
+    pub seat_number: u8,
+    pub move_type: String,
+    pub main_word: Option<String>,
+    pub score_delta: i32,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantState {
+    pub seat_number: u8,
+    pub kind: SeatKind,
+    pub display_name: String,
+    pub player_id: Option<String>,
+    pub engine_id: Option<String>,
+    pub score: i32,
+    pub rack: Rack,
+    pub resigned: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GameSession {
+    pub id: String,
+    pub status: GameStatus,
+    pub variant: String,
+    pub language: String,
+    pub board_layout: String,
+    pub turn_number: i64,
+    pub current_seat: u8,
+    pub winner_seat: Option<u8>,
+    pub random_seed: u64,
+    pub rules: VariantRules,
+    pub state: GameState,
+    pub bag: Vec<Tile>,
+    pub participants: Vec<ParticipantState>,
+    pub moves: Vec<MoveRecord>,
+}
+
+impl GameSession {
+    pub fn new(
+        id: String,
+        participants: Vec<ParticipantState>,
+        random_seed: u64,
+        rules: VariantRules,
+    ) -> Self {
+        let state = GameState::new(&rules, &*SOWPODS);
+        let mut bag = build_bag(&rules);
+        shuffle_bag(&mut bag, random_seed);
+
+        Self {
+            id,
+            status: GameStatus::Waiting,
+            variant: "official".to_string(),
+            language: "sowpods".to_string(),
+            board_layout: "official".to_string(),
+            turn_number: 0,
+            current_seat: 0,
+            winner_seat: None,
+            random_seed,
+            rules,
+            state,
+            bag,
+            participants,
+            moves: Vec::new(),
+        }
+    }
+
+    pub fn start(&mut self) {
+        if self.status != GameStatus::Waiting {
+            return;
+        }
+
+        for participant in &mut self.participants {
+            refill_rack(&mut participant.rack, &mut self.bag, self.rules.rack_size);
+        }
+
+        self.status = GameStatus::Active;
+        self.turn_number = 1;
+        self.current_seat = 0;
+    }
+
+    pub fn to_dto(&self) -> GameStateDto {
+        GameStateDto {
+            id: self.id.clone(),
+            status: self.status.clone(),
+            variant: self.variant.clone(),
+            language: self.language.clone(),
+            board_layout: self.board_layout.clone(),
+            turn_number: self.turn_number,
+            current_seat: self.current_seat,
+            winner_seat: self.winner_seat,
+            bag_count: self.bag.len(),
+            participants: self
+                .participants
+                .iter()
+                .map(|participant| ParticipantDto {
+                    seat_number: participant.seat_number,
+                    kind: participant.kind.clone(),
+                    display_name: participant.display_name.clone(),
+                    player_id: participant.player_id.clone(),
+                    engine_id: participant.engine_id.clone(),
+                    score: participant.score,
+                })
+                .collect(),
+            board: board_to_dto(&self.state.board),
+            racks: self
+                .participants
+                .iter()
+                .map(|participant| RackDto {
+                    counts: participant.rack.counts,
+                    blanks: participant.rack.blanks,
+                })
+                .collect(),
+            moves: self
+                .moves
+                .iter()
+                .map(|record| MoveRecordDto {
+                    move_number: record.move_number,
+                    seat_number: record.seat_number,
+                    move_type: record.move_type.clone(),
+                    main_word: record.main_word.clone(),
+                    score_delta: record.score_delta,
+                    description: record.description.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn apply_place_move(
+        &mut self,
+        seat_number: u8,
+        candidate: MoveCandidate,
+    ) -> Result<(), String> {
+        ensure_active_turn(self, seat_number)?;
+        let rules_engine = RulesEngine {
+            rules: &self.rules,
+            dictionary: &*SOWPODS,
+        };
+        let participant = self
+            .participants
+            .get_mut(seat_number as usize)
+            .ok_or_else(|| format!("Unknown seat {seat_number}"))?;
+        let validated = rules_engine
+            .validate_game_move(&self.state, Some(&participant.rack), &candidate)
+            .map_err(|error| format!("{error:?}"))?;
+
+        for placement in &candidate.tiles {
+            if !participant.rack.consume_tile(placement.tile) {
+                return Err("Rack no longer matches move".to_string());
+            }
+        }
+
+        rules_engine
+            .apply_move_to_game(&mut self.state, &validated)
+            .map_err(|error| format!("{error:?}"))?;
+
+        participant.score += validated.score.total as i32;
+        refill_rack(&mut participant.rack, &mut self.bag, self.rules.rack_size);
+        self.moves.push(MoveRecord {
+            move_number: self.turn_number,
+            seat_number,
+            move_type: "place".to_string(),
+            main_word: Some(validated.preview.main_word.clone()),
+            score_delta: validated.score.total as i32,
+            description: format!(
+                "{} played {} for {}",
+                participant.display_name, validated.preview.main_word, validated.score.total
+            ),
+        });
+        self.advance_turn();
+        Ok(())
+    }
+
+    pub fn apply_pass(&mut self, seat_number: u8) -> Result<(), String> {
+        ensure_active_turn(self, seat_number)?;
+        let participant = self
+            .participants
+            .get(seat_number as usize)
+            .ok_or_else(|| format!("Unknown seat {seat_number}"))?;
+        self.moves.push(MoveRecord {
+            move_number: self.turn_number,
+            seat_number,
+            move_type: "pass".to_string(),
+            main_word: None,
+            score_delta: 0,
+            description: format!("{} passed", participant.display_name),
+        });
+        self.advance_turn();
+        Ok(())
+    }
+
+    pub fn apply_exchange(&mut self, seat_number: u8, tiles: Vec<Tile>) -> Result<(), String> {
+        ensure_active_turn(self, seat_number)?;
+        if self.bag.len() < tiles.len() {
+            return Err("Not enough tiles left in bag to exchange".to_string());
+        }
+        let participant = self
+            .participants
+            .get_mut(seat_number as usize)
+            .ok_or_else(|| format!("Unknown seat {seat_number}"))?;
+
+        for tile in &tiles {
+            if !participant.rack.consume_tile(*tile) {
+                return Err("Rack does not contain exchange tiles".to_string());
+            }
+        }
+
+        self.bag.extend(tiles.iter().copied().map(reset_blank_tile));
+        shuffle_bag(&mut self.bag, self.random_seed ^ self.turn_number as u64);
+        refill_rack(&mut participant.rack, &mut self.bag, self.rules.rack_size);
+
+        self.moves.push(MoveRecord {
+            move_number: self.turn_number,
+            seat_number,
+            move_type: "exchange".to_string(),
+            main_word: None,
+            score_delta: 0,
+            description: format!(
+                "{} exchanged {} tiles",
+                participant.display_name,
+                tiles.len()
+            ),
+        });
+        self.advance_turn();
+        Ok(())
+    }
+
+    pub fn apply_resign(&mut self, seat_number: u8) -> Result<(), String> {
+        ensure_active_turn(self, seat_number)?;
+        let participant = self
+            .participants
+            .get_mut(seat_number as usize)
+            .ok_or_else(|| format!("Unknown seat {seat_number}"))?;
+        participant.resigned = true;
+        self.moves.push(MoveRecord {
+            move_number: self.turn_number,
+            seat_number,
+            move_type: "resign".to_string(),
+            main_word: None,
+            score_delta: 0,
+            description: format!("{} resigned", participant.display_name),
+        });
+        self.winner_seat = self
+            .participants
+            .iter()
+            .find(|other| !other.resigned)
+            .map(|other| other.seat_number);
+        self.status = GameStatus::Finished;
+        Ok(())
+    }
+
+    pub fn maybe_run_engine_turn(&mut self, engines: &EngineRegistry) -> Result<bool, String> {
+        if self.status != GameStatus::Active {
+            return Ok(false);
+        }
+
+        let current = self
+            .participants
+            .get(self.current_seat as usize)
+            .ok_or_else(|| "Current seat missing".to_string())?;
+
+        if current.kind != SeatKind::Engine {
+            return Ok(false);
+        }
+
+        let engine_id = current
+            .engine_id
+            .clone()
+            .ok_or_else(|| "Engine seat missing engine id".to_string())?;
+        let engine = engines
+            .find(&engine_id)
+            .ok_or_else(|| format!("Unknown engine: {engine_id}"))?;
+        let rack = current.rack;
+        let response = engine.choose_action(EngineRequest {
+            state: &self.state,
+            seat_number: self.current_seat,
+            rack: &rack,
+            time_budget_ms: None,
+        });
+
+        match response.action {
+            EngineAction::Place(candidate) => {
+                self.apply_place_move(self.current_seat, candidate)?
+            }
+            EngineAction::Pass => self.apply_pass(self.current_seat)?,
+            EngineAction::Exchange(tiles) => self.apply_exchange(self.current_seat, tiles)?,
+            EngineAction::Resign => self.apply_resign(self.current_seat)?,
+        }
+
+        Ok(true)
+    }
+
+    fn advance_turn(&mut self) {
+        if self.status == GameStatus::Finished {
+            return;
+        }
+
+        let next_seat = ((self.current_seat as usize + 1) % self.participants.len()) as u8;
+        self.current_seat = next_seat;
+        self.turn_number += 1;
+
+        if self
+            .participants
+            .iter()
+            .filter(|participant| !participant.resigned)
+            .count()
+            <= 1
+        {
+            self.status = GameStatus::Finished;
+            self.winner_seat = self
+                .participants
+                .iter()
+                .find(|participant| !participant.resigned)
+                .map(|participant| participant.seat_number);
+        }
+    }
+}
+
+fn ensure_active_turn(session: &GameSession, seat_number: u8) -> Result<(), String> {
+    if session.status != GameStatus::Active {
+        return Err("Game is not active".to_string());
+    }
+    if session.current_seat != seat_number {
+        return Err(format!("It is not seat {seat_number}'s turn"));
+    }
+    Ok(())
+}
+
+fn build_bag(rules: &VariantRules) -> Vec<Tile> {
+    let mut bag = Vec::new();
+    for (index, count) in rules.tile_distribution.iter().copied().enumerate() {
+        for _ in 0..count {
+            bag.push(Tile::Letter(Letter::from(index as u8)));
+        }
+    }
+    for _ in 0..rules.blank_tiles {
+        bag.push(Tile::Blank { acting_as: None });
+    }
+    bag
+}
+
+fn shuffle_bag(bag: &mut [Tile], seed: u64) {
+    let mut rng = StdRng::seed_from_u64(seed);
+    for index in (1..bag.len()).rev() {
+        let swap_index = rng.gen_range(0..=index);
+        bag.swap(index, swap_index);
+    }
+}
+
+fn refill_rack(rack: &mut Rack, bag: &mut Vec<Tile>, rack_size: u8) {
+    while rack.count() < rack_size && !bag.is_empty() {
+        let tile = bag.pop().expect("checked non-empty bag");
+        match tile {
+            Tile::Letter(letter) => rack.add_letter(letter),
+            Tile::Blank { .. } => rack.blanks += 1,
+        }
+    }
+}
+
+fn reset_blank_tile(tile: Tile) -> Tile {
+    match tile {
+        Tile::Blank { .. } => Tile::Blank { acting_as: None },
+        Tile::Letter(letter) => Tile::Letter(letter),
+    }
+}
+
+fn board_to_dto(board: &BoardState) -> Vec<BoardCellDto> {
+    board
+        .cells
+        .iter()
+        .map(|cell| match cell {
+            BoardCell::Empty(empty) => BoardCellDto {
+                premium: premium_to_dto(empty.premium),
+                letter: None,
+                is_blank: false,
+            },
+            BoardCell::Filled(FilledCell { letter, is_blank }) => BoardCellDto {
+                premium: PremiumDto::Blank,
+                letter: Some(letter.as_char()),
+                is_blank: *is_blank,
+            },
+        })
+        .collect()
+}
+
+pub fn board_from_dto(cells: &[BoardCellDto]) -> Result<BoardState, String> {
+    if cells.len() != BoardState::WIDTH * BoardState::HEIGHT {
+        return Err(format!(
+            "Expected {} board cells, got {}",
+            BoardState::WIDTH * BoardState::HEIGHT,
+            cells.len()
+        ));
+    }
+
+    let mut board = BoardState::default();
+    for (index, cell) in cells.iter().enumerate() {
+        let x = (index % BoardState::WIDTH) as u8;
+        let y = (index / BoardState::WIDTH) as u8;
+        let pos = rules_shared::Position::new(x, y);
+        let board_cell = match cell.letter {
+            Some(letter) => BoardCell::Filled(FilledCell {
+                letter: Letter::from(letter),
+                is_blank: cell.is_blank,
+            }),
+            None => BoardCell::Empty(rules_shared::EmptyCell {
+                premium: premium_from_dto(cell.premium.clone()),
+            }),
+        };
+        board.set(pos, board_cell);
+    }
+
+    Ok(board)
+}
+
+fn premium_to_dto(premium: rules_shared::Premium) -> PremiumDto {
+    match premium {
+        rules_shared::Premium::Blank => PremiumDto::Blank,
+        rules_shared::Premium::DoubleLetter => PremiumDto::DoubleLetter,
+        rules_shared::Premium::TripleLetter => PremiumDto::TripleLetter,
+        rules_shared::Premium::DoubleWord => PremiumDto::DoubleWord,
+        rules_shared::Premium::TripleWord => PremiumDto::TripleWord,
+    }
+}
+
+fn premium_from_dto(premium: PremiumDto) -> rules_shared::Premium {
+    match premium {
+        PremiumDto::Blank => rules_shared::Premium::Blank,
+        PremiumDto::DoubleLetter => rules_shared::Premium::DoubleLetter,
+        PremiumDto::TripleLetter => rules_shared::Premium::TripleLetter,
+        PremiumDto::DoubleWord => rules_shared::Premium::DoubleWord,
+        PremiumDto::TripleWord => rules_shared::Premium::TripleWord,
+    }
+}
+
+pub fn move_candidate_from_dto(candidate: MoveCandidateDto) -> MoveCandidate {
+    MoveCandidate {
+        start: PositionDtoToRules::convert(candidate.start),
+        direction: match candidate.direction {
+            DirectionDto::Horizontal => Direction::Horizontal,
+            DirectionDto::Vertical => Direction::Vertical,
+        },
+        tiles: candidate
+            .tiles
+            .into_iter()
+            .map(|placement| TilePlacement {
+                offset: placement.offset,
+                tile: tile_from_dto(placement.tile),
+            })
+            .collect(),
+    }
+}
+
+pub fn move_candidate_to_dto(candidate: &MoveCandidate) -> MoveCandidateDto {
+    MoveCandidateDto {
+        start: PositionDto {
+            x: candidate.start.x,
+            y: candidate.start.y,
+        },
+        direction: match candidate.direction {
+            Direction::Horizontal => DirectionDto::Horizontal,
+            Direction::Vertical => DirectionDto::Vertical,
+        },
+        tiles: candidate
+            .tiles
+            .iter()
+            .map(|placement| TilePlacementDto {
+                offset: placement.offset,
+                tile: tile_to_dto(placement.tile),
+            })
+            .collect(),
+    }
+}
+
+pub fn tile_from_dto(tile: TileDto) -> Tile {
+    match tile {
+        TileDto::Letter { letter } => Tile::Letter(Letter::from(letter)),
+        TileDto::Blank { acting_as } => Tile::Blank {
+            acting_as: acting_as.map(Letter::from),
+        },
+    }
+}
+
+pub fn tile_to_dto(tile: Tile) -> TileDto {
+    match tile {
+        Tile::Letter(letter) => TileDto::Letter {
+            letter: letter.as_char(),
+        },
+        Tile::Blank { acting_as } => TileDto::Blank {
+            acting_as: acting_as.map(|letter| letter.as_char()),
+        },
+    }
+}
+
+fn engine_profile_from_metadata(metadata: &EngineMetadata) -> EngineProfileDto {
+    EngineProfileDto {
+        id: metadata.id.clone(),
+        name: metadata.name.clone(),
+        version: metadata.version.clone(),
+        author: metadata.author.clone(),
+        description: metadata.description.clone(),
+        supports_timed_play: metadata.capabilities.supports_timed_play,
+        supports_analysis: metadata.capabilities.supports_analysis,
+        supports_ranking: metadata.capabilities.supports_ranking,
+    }
+}
+
+struct PositionDtoToRules;
+
+impl PositionDtoToRules {
+    fn convert(position: PositionDto) -> rules_shared::Position {
+        rules_shared::Position::new(position.x, position.y)
+    }
+}

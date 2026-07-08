@@ -1,8 +1,9 @@
+use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
 use std::ops::Neg;
 use std::str::FromStr;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Direction {
     Horizontal,
     Vertical,
@@ -28,7 +29,7 @@ impl Display for Direction {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Position {
     pub x: u8,
     pub y: u8,
@@ -96,7 +97,7 @@ impl FromStr for Position {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Letter(pub u8);
 
 impl Letter {
@@ -162,7 +163,7 @@ pub const ALPHABET: [Letter; 26] = [
     Letter(25),
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tile {
     Letter(Letter),
     Blank { acting_as: Option<Letter> },
@@ -177,7 +178,7 @@ impl Tile {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Premium {
     Blank,
     DoubleLetter,
@@ -229,13 +230,21 @@ pub const fn mask_is_full(mask: LetterMask) -> bool {
     mask == FULL_LETTER_MASK
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Rack {
     pub counts: [u8; 26],
     pub blanks: u8,
 }
 
 impl Rack {
+    pub fn count(self) -> u8 {
+        self.counts.iter().sum::<u8>() + self.blanks
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.count() == 0
+    }
+
     pub fn contains_letter(self, letter: Letter) -> bool {
         self.counts[letter.as_usize()] > 0
     }
@@ -275,10 +284,13 @@ impl Rack {
 #[derive(Debug, Clone)]
 pub struct VariantRules {
     pub letter_values: [u8; 26],
+    pub tile_distribution: [u8; 26],
+    pub blank_tiles: u8,
     pub rack_size: u8,
     pub width: u8,
     pub height: u8,
     pub bingo_bonus: Score,
+    pub premiums: [Premium; 225],
 }
 
 impl VariantRules {
@@ -287,35 +299,76 @@ impl VariantRules {
             letter_values: [
                 1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3, 1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10,
             ],
+            tile_distribution: [
+                9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2, 6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1,
+            ],
+            blank_tiles: 2,
             rack_size: 7,
             width: 15,
             height: 15,
             bingo_bonus: 50,
+            premiums: official_premiums(),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+fn official_premiums() -> [Premium; 225] {
+    let mut premiums = [Premium::Blank; 225];
+
+    for (x, y, premium) in [
+        (0, 0, Premium::TripleWord),
+        (3, 0, Premium::DoubleLetter),
+        (7, 0, Premium::TripleWord),
+        (1, 1, Premium::DoubleWord),
+        (5, 1, Premium::TripleLetter),
+        (2, 2, Premium::DoubleWord),
+        (6, 2, Premium::DoubleLetter),
+        (0, 3, Premium::DoubleLetter),
+        (3, 3, Premium::DoubleWord),
+        (7, 3, Premium::DoubleLetter),
+        (4, 4, Premium::DoubleWord),
+        (1, 5, Premium::TripleLetter),
+        (5, 5, Premium::TripleLetter),
+        (2, 6, Premium::DoubleLetter),
+        (6, 6, Premium::DoubleLetter),
+        (0, 7, Premium::TripleWord),
+        (3, 7, Premium::DoubleLetter),
+        (7, 7, Premium::DoubleWord),
+    ] {
+        for (mx, my) in mirror_positions(x, y) {
+            premiums[(my as usize) * 15 + (mx as usize)] = premium;
+        }
+    }
+
+    premiums
+}
+
+fn mirror_positions(x: u8, y: u8) -> [(u8, u8); 4] {
+    let max = 14;
+    [(x, y), (max - x, y), (x, max - y), (max - x, max - y)]
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TilePlacement {
     pub offset: u8,
     pub tile: Tile,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoveCandidate {
     pub start: Position,
     pub direction: Direction,
     pub tiles: Vec<TilePlacement>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossWordPreview {
     pub pos: Position,
     pub word: String,
     pub score: Score,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MovePreview {
     pub legal: bool,
     pub main_word: String,
@@ -324,7 +377,7 @@ pub struct MovePreview {
     pub error: Option<MoveError>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MoveScore {
     pub total: Score,
     pub main_word_score: Score,
@@ -332,14 +385,14 @@ pub struct MoveScore {
     pub bingo_bonus: Score,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidatedMove {
     pub candidate: MoveCandidate,
     pub preview: MovePreview,
     pub score: MoveScore,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MoveError {
     InvalidMove,
     InvalidWord(String),

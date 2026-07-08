@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
+mod app;
 mod components;
+mod views;
 
 fn main() {
     #[cfg(feature = "desktop")]
@@ -30,9 +32,6 @@ fn main() {
 #[component]
 fn App() -> Element {
     rsx! {
-        div { class: "container",
-            h1 { "Scrabble App" }
-            components::scrabble_board::scrabble_board {}
-        }
+        app::RootApp {}
     }
 }

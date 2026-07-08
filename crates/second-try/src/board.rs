@@ -6,8 +6,8 @@ use std::fmt::Formatter;
 use crate::player::Direction;
 use crate::player::MoveError;
 use crate::pos::Position;
-use crate::tiles::Letter;
 use crate::tiles::ALPHABET;
+use crate::tiles::Letter;
 
 use crate::tiles::LetterSet;
 use crate::tiles::Tile;

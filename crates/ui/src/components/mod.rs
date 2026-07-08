@@ -1,2 +1,3 @@
-//! The components module contains all shared components for our app.
-pub mod scrabble_board;
+pub mod board_view;
+pub mod rack_view;
+pub mod sidebar;

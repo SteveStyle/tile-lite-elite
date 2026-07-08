@@ -1,0 +1,18 @@
+[package]
+name = "server-game"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+api = { path = "../api" }
+axum = { version = "0.8", features = ["ws", "macros"] }
+engine-core = { path = "../engine-core" }
+rand = "0.8"
+rules-shared = { path = "../rules-shared" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors"] }
+uuid = { version = "1", features = ["v4", "serde"] }

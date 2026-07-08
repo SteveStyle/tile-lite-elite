@@ -1,6 +1,9 @@
-use crate::board::BoardState;
+use std::collections::HashSet;
+
+use crate::board::{BoardCell, BoardState};
+use crate::cache::CrossCheck;
 use crate::dictionary::Dictionary;
-use crate::model::{Direction, Letter, MoveCandidate, Rack, Tile, TilePlacement};
+use crate::model::{Direction, Letter, MoveCandidate, Position, Rack, Tile, TilePlacement};
 use crate::validate::{GameState, RulesEngine};
 
 pub trait MoveGenerator<State, Rack> {
@@ -15,16 +18,36 @@ impl<D: Dictionary> RulesEngine<'_, D> {
         state: &GameState,
         rack: &Rack,
     ) -> Vec<MoveCandidate> {
+        self.enumerate_legal_moves_with_tile_limit(state, rack, 1)
+    }
+
+    pub fn enumerate_legal_multi_tile_moves(
+        &self,
+        state: &GameState,
+        rack: &Rack,
+    ) -> Vec<MoveCandidate> {
+        self.enumerate_legal_moves_with_tile_limit(state, rack, self.rules.rack_size)
+    }
+
+    fn enumerate_legal_moves_with_tile_limit(
+        &self,
+        state: &GameState,
+        rack: &Rack,
+        max_tiles: u8,
+    ) -> Vec<MoveCandidate> {
         let position = state.position_with_rack(rack);
         let mut moves = Vec::new();
+        let mut seen = HashSet::new();
+        let max_tiles = max_tiles.min(self.rules.rack_size) as usize;
+
+        if max_tiles == 0 {
+            return moves;
+        }
 
         for y in 0..self.rules.height {
             for x in 0..self.rules.width {
-                let start = crate::model::Position::new(x, y);
-                if !matches!(
-                    state.board.get(start),
-                    Some(crate::board::BoardCell::Empty(_))
-                ) {
+                let start = Position::new(x, y);
+                if !matches!(state.board.get(start), Some(BoardCell::Empty(_))) {
                     continue;
                 }
 
@@ -38,22 +61,125 @@ impl<D: Dictionary> RulesEngine<'_, D> {
                         continue;
                     }
 
-                    for tile in unique_rack_tiles(rack) {
-                        let candidate = MoveCandidate {
-                            start,
-                            direction,
-                            tiles: vec![TilePlacement { offset: 0, tile }],
-                        };
+                    let mut remaining = *rack;
+                    let mut placements = Vec::new();
+                    let next =
+                        start.try_step_forward(direction, self.rules.width, self.rules.height);
 
-                        if self.validate_move(&position, &candidate).is_ok() {
-                            moves.push(candidate);
-                        }
-                    }
+                    self.expand_lane(
+                        &position,
+                        state,
+                        start,
+                        direction,
+                        start,
+                        next,
+                        0,
+                        &mut remaining,
+                        &mut placements,
+                        max_tiles,
+                        &mut moves,
+                        &mut seen,
+                    );
                 }
             }
         }
 
         moves
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn expand_lane(
+        &self,
+        position: &crate::validate::RulesPosition<'_>,
+        state: &GameState,
+        start: Position,
+        direction: Direction,
+        current: Position,
+        next: Option<Position>,
+        offset: u8,
+        remaining: &mut Rack,
+        placements: &mut Vec<TilePlacement>,
+        max_tiles: usize,
+        moves: &mut Vec<MoveCandidate>,
+        seen: &mut HashSet<String>,
+    ) {
+        if !placements.is_empty() {
+            let candidate = MoveCandidate {
+                start,
+                direction,
+                tiles: placements.clone(),
+            };
+            if self.validate_move(position, &candidate).is_ok() {
+                let key = move_candidate_key(&candidate);
+                if seen.insert(key) {
+                    moves.push(candidate);
+                }
+            }
+        }
+
+        if placements.len() >= max_tiles {
+            return;
+        }
+
+        let cell = state.board.get(current);
+        match cell {
+            Some(BoardCell::Filled(_)) => {
+                if let Some(next_pos) = next {
+                    self.expand_lane(
+                        position,
+                        state,
+                        start,
+                        direction,
+                        next_pos,
+                        next_pos.try_step_forward(direction, self.rules.width, self.rules.height),
+                        offset + 1,
+                        remaining,
+                        placements,
+                        max_tiles,
+                        moves,
+                        seen,
+                    );
+                }
+            }
+            Some(BoardCell::Empty(_)) => {
+                let cached = &state.cache.cells[current.to_index(BoardState::WIDTH)];
+                let cross_check = match direction {
+                    Direction::Horizontal => cached.horizontal,
+                    Direction::Vertical => cached.vertical,
+                };
+
+                for tile in available_tiles_for_crosscheck(remaining, cross_check) {
+                    if !remaining.consume_tile(tile) {
+                        continue;
+                    }
+
+                    placements.push(TilePlacement { tile, offset });
+                    if let Some(next_pos) = next {
+                        self.expand_lane(
+                            position,
+                            state,
+                            start,
+                            direction,
+                            next_pos,
+                            next_pos.try_step_forward(
+                                direction,
+                                self.rules.width,
+                                self.rules.height,
+                            ),
+                            offset + 1,
+                            remaining,
+                            placements,
+                            max_tiles,
+                            moves,
+                            seen,
+                        );
+                    }
+                    placements.pop();
+                    put_tile_back(remaining, tile);
+                }
+            }
+            None => {}
+        }
     }
 }
 
@@ -61,29 +187,71 @@ impl<D: Dictionary> MoveGenerator<GameState, Rack> for RulesEngine<'_, D> {
     type Iter = std::vec::IntoIter<MoveCandidate>;
 
     fn enumerate_legal_moves(&self, state: &GameState, rack: &Rack) -> Self::Iter {
-        self.enumerate_legal_single_tile_moves(state, rack)
+        self.enumerate_legal_multi_tile_moves(state, rack)
             .into_iter()
     }
 }
 
-fn unique_rack_tiles(rack: &Rack) -> Vec<Tile> {
+fn available_tiles_for_crosscheck(rack: &Rack, cross_check: CrossCheck) -> Vec<Tile> {
     let mut tiles = Vec::new();
 
     for i in 0..26 {
-        if rack.counts[i] > 0 {
-            tiles.push(Tile::Letter(Letter::from(i as u8)));
+        let letter = Letter::from(i as u8);
+        if rack.counts[i] > 0 && cross_check.allows(letter) {
+            tiles.push(Tile::Letter(letter));
         }
     }
 
     if rack.blanks > 0 {
         for i in 0..26 {
+            let letter = Letter::from(i as u8);
+            if !cross_check.allows(letter) {
+                continue;
+            }
             tiles.push(Tile::Blank {
-                acting_as: Some(Letter::from(i as u8)),
+                acting_as: Some(letter),
             });
         }
     }
 
     tiles
+}
+
+fn put_tile_back(rack: &mut Rack, tile: Tile) {
+    match tile {
+        Tile::Letter(letter) => rack.add_letter(letter),
+        Tile::Blank { acting_as: Some(_) } => rack.blanks += 1,
+        Tile::Blank { acting_as: None } => {}
+    }
+}
+
+fn move_candidate_key(candidate: &MoveCandidate) -> String {
+    let dir = match candidate.direction {
+        Direction::Horizontal => 'H',
+        Direction::Vertical => 'V',
+    };
+    let mut key = format!("{}:{}:{}:", candidate.start.x, candidate.start.y, dir);
+
+    for placement in &candidate.tiles {
+        key.push_str(&placement.offset.to_string());
+        key.push('=');
+        match placement.tile {
+            Tile::Letter(letter) => {
+                key.push('L');
+                key.push(letter.as_char());
+            }
+            Tile::Blank {
+                acting_as: Some(letter),
+            } => {
+                key.push('B');
+                key.push(letter.as_char());
+            }
+            Tile::Blank { acting_as: None } => key.push_str("B?"),
+        }
+        key.push(';');
+    }
+
+    key
 }
 
 #[cfg(test)]
@@ -160,6 +328,30 @@ mod tests {
             candidate.direction == Direction::Horizontal
                 && candidate.tiles.len() == 1
                 && matches!(candidate.tiles[0].tile, Tile::Blank { acting_as: Some(letter) } if letter == Letter::from('A'))
+        }));
+    }
+
+    #[test]
+    fn generator_emits_multi_tile_opening_move() {
+        let rules = sample_rules();
+        let dictionary = TinyDictionary::new(["AT", "A", "T"]);
+        let engine = RulesEngine {
+            rules: &rules,
+            dictionary: &dictionary,
+        };
+
+        let state = GameState::new(&rules, &dictionary);
+        let mut rack = Rack::default();
+        rack.add_letter(Letter::from('A'));
+        rack.add_letter(Letter::from('T'));
+
+        let moves = engine.enumerate_legal_multi_tile_moves(&state, &rack);
+        assert!(moves.iter().any(|candidate| {
+            candidate.tiles.len() == 2
+                && engine
+                    .validate_game_move(&state, Some(&rack), candidate)
+                    .map(|validated| validated.preview.main_word == "AT")
+                    .unwrap_or(false)
         }));
     }
 }

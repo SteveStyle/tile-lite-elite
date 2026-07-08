@@ -36,6 +36,18 @@ impl BoardState {
     pub const WIDTH: usize = 15;
     pub const HEIGHT: usize = 15;
 
+    pub fn new(rules: &crate::model::VariantRules) -> Self {
+        let mut cells = [BoardCell::Empty(EmptyCell {
+            premium: Premium::Blank,
+        }); 225];
+
+        for (index, premium) in rules.premiums.iter().copied().enumerate() {
+            cells[index] = BoardCell::Empty(EmptyCell { premium });
+        }
+
+        Self { cells }
+    }
+
     pub fn get(&self, pos: Position) -> Option<&BoardCell> {
         let index = pos.to_index(Self::WIDTH);
         self.cells.get(index)

@@ -25,7 +25,7 @@ impl Default for GameState {
 
 impl GameState {
     pub fn new<D: Dictionary>(rules: &VariantRules, dictionary: &D) -> Self {
-        Self::from_board(BoardState::default(), rules, dictionary)
+        Self::from_board(BoardState::new(rules), rules, dictionary)
     }
 
     pub fn from_board<D: Dictionary>(
@@ -521,15 +521,7 @@ mod tests {
     };
 
     fn sample_rules() -> VariantRules {
-        VariantRules {
-            letter_values: [
-                1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3, 1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10,
-            ],
-            rack_size: 7,
-            width: 15,
-            height: 15,
-            bingo_bonus: 50,
-        }
+        VariantRules::official()
     }
 
     #[test]
