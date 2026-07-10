@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::{
     BoardCellDto, DirectionDto, EngineProfileDto, GameStateDto, GameStatus, MoveCandidateDto,
@@ -296,7 +297,20 @@ impl GameSession {
         Ok(())
     }
 
-    pub fn maybe_run_engine_turn(&mut self, engines: &EngineRegistry) -> Result<bool, String> {
+    /// Runs the current seat's engine (if any) and applies its chosen action
+    /// through exactly the same `apply_*` methods a human client's HTTP
+    /// action would go through, so the server stays authoritative over
+    /// engine-originated moves as much as human ones.
+    ///
+    /// The engine runs on a blocking-friendly thread pool (via
+    /// `spawn_blocking`, since move search is CPU-bound, not I/O-bound) and
+    /// is subject to `engine_timeout`. If the engine hasn't responded by
+    /// then, the seat auto-passes rather than stalling the game.
+    pub async fn maybe_run_engine_turn(
+        &mut self,
+        engines: &EngineRegistry,
+        engine_timeout: Duration,
+    ) -> Result<bool, String> {
         if self.status != GameStatus::Active {
             return Ok(false);
         }
@@ -318,12 +332,39 @@ impl GameSession {
             .find(&engine_id)
             .ok_or_else(|| format!("Unknown engine: {engine_id}"))?;
         let rack = current.rack;
-        let response = engine.choose_action(EngineRequest {
-            state: &self.state,
-            seat_number: self.current_seat,
-            rack: &rack,
-            time_budget_ms: None,
-        });
+        let seat_number = self.current_seat;
+        let state_snapshot = self.state.clone();
+        let time_budget_ms = engine_timeout.as_millis() as u64;
+
+        let outcome = tokio::time::timeout(
+            engine_timeout,
+            tokio::task::spawn_blocking(move || {
+                engine.choose_action(EngineRequest {
+                    state: &state_snapshot,
+                    seat_number,
+                    rack: &rack,
+                    time_budget_ms: Some(time_budget_ms),
+                })
+            }),
+        )
+        .await;
+
+        let response = match outcome {
+            Ok(Ok(response)) => response,
+            Ok(Err(join_error)) => {
+                return Err(format!(
+                    "Engine '{engine_id}' panicked while choosing a move: {join_error}"
+                ));
+            }
+            Err(_elapsed) => {
+                eprintln!(
+                    "engine '{engine_id}' exceeded {}ms budget on seat {seat_number}; auto-passing",
+                    engine_timeout.as_millis()
+                );
+                self.apply_pass(seat_number)?;
+                return Ok(true);
+            }
+        };
 
         match response.action {
             EngineAction::Place(candidate) => {

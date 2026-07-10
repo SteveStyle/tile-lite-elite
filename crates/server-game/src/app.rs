@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use api::{
     ApiError, CreateGameRequest, GameActionRequest, GameEventDto, GameInvitationDto,
@@ -160,7 +161,7 @@ async fn start_game(
             .get_mut(&game_id)
             .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
         game.start();
-        run_engine_turns(game, &state.engines)?;
+        run_engine_turns(game, &state.engines).await?;
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
@@ -203,7 +204,7 @@ async fn submit_action(
                 .map_err(ApiProblem::bad_request)?,
         }
 
-        run_engine_turns(game, &state.engines)?;
+        run_engine_turns(game, &state.engines).await?;
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
@@ -336,7 +337,7 @@ async fn suggest_move(
             None => game.apply_pass(seat).map_err(ApiProblem::bad_request)?,
         }
 
-        run_engine_turns(game, &state.engines)?;
+        run_engine_turns(game, &state.engines).await?;
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
@@ -634,10 +635,15 @@ fn now_iso() -> String {
     seconds.to_string()
 }
 
-fn run_engine_turns(game: &mut GameSession, engines: &EngineRegistry) -> Result<(), ApiProblem> {
+/// How long an engine gets to choose an action before the seat auto-passes.
+/// Hobby-project default; not yet configurable per engine or per game.
+const ENGINE_TURN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn run_engine_turns(game: &mut GameSession, engines: &EngineRegistry) -> Result<(), ApiProblem> {
     for _ in 0..game.participants.len() {
         let advanced = game
-            .maybe_run_engine_turn(engines)
+            .maybe_run_engine_turn(engines, ENGINE_TURN_TIMEOUT)
+            .await
             .map_err(ApiProblem::bad_request)?;
         if !advanced {
             break;

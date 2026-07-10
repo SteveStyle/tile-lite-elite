@@ -11,7 +11,7 @@ This document is a first-pass technology shortlist for the project, shaped by th
 | Server framework | Axum | Modern, async-first, good fit for typed APIs | You assemble more infrastructure yourself |
 | API style | HTTP + WebSocket hybrid | Good fit for live game updates and client compatibility | More design work than a single protocol |
 | Persistence | SQLite first | Simple, local-friendly, low ops burden, free to run | Less scalable than PostgreSQL |
-| Engine boundary | Separate process via proxy | Safer isolation, easier to support multiple engines | More IPC complexity and latency |
+| Engine boundary | In-process trait (`ScrabbleEngine`), compiled in | Type-safe, no IPC, engine output flows through the same validation path as a human client's actions; async-wrapped with a timeout so a slow engine can't stall the server | Engines aren't sandboxed from the server process; revisit if untrusted third-party engines are ever supported |
 | Shared rules | Pure shared Rust crate | Same legality and scoring logic everywhere | Requires strict dependency discipline |
 | Word lists | Embedded per language | Fast, deterministic, offline-friendly | Larger binaries and less flexible updates |
 | Message format | Typed Rust model with serialized wire format | Strong contracts and maintainability | Needs versioned serialization from the start |
