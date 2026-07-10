@@ -3,7 +3,6 @@ name = "server-game"
 version = "0.1.0"
 edition.workspace=true
 
-
 [dependencies]
 api = { path = "../api" }
 axum = { version = "0.8", features = ["ws", "macros"] }
