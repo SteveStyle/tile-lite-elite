@@ -4,6 +4,9 @@ This folder collects the project plan and architecture notes for the final versi
 
 ## Documents
 
+- [Operations Guide](operations.md)
+- [Authentication and Game Invitations](authentication-and-invitations.md)
+  - [Quick Start Examples](authentication-examples.md)
 - [Project History](history.md)
 - [Roadmap](roadmap.md)
 - [Architecture](architecture.md)

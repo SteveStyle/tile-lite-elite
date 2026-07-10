@@ -145,6 +145,22 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "create table if not exists game_invitations (
+            id text primary key,
+            game_id text not null,
+            invited_player_id text not null,
+            inviting_player_id text not null,
+            seat_number integer not null,
+            status text not null,
+            created_at text not null,
+            responded_at text,
+            unique(game_id, invited_player_id, seat_number)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -341,6 +357,260 @@ pub async fn upsert_engine_profiles(
         .await?;
     }
 
+    Ok(())
+}
+
+// ========== Authentication Functions ==========
+
+#[derive(Debug, Clone)]
+pub struct PlayerRecord {
+    pub id: String,
+    pub display_name: String,
+    pub email: String,
+    pub recovery_secret_hash: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub last_seen_at: Option<String>,
+}
+
+pub async fn create_player(
+    pool: &Pool<Sqlite>,
+    id: &str,
+    display_name: &str,
+    email: &str,
+    recovery_secret_hash: &str,
+) -> Result<PlayerRecord, sqlx::Error> {
+    let now = now_iso();
+    sqlx::query(
+        "insert into players (id, display_name, email, recovery_secret_hash, created_at, updated_at)
+         values (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(id)
+    .bind(display_name)
+    .bind(email)
+    .bind(recovery_secret_hash)
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+
+    Ok(PlayerRecord {
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        email: email.to_string(),
+        recovery_secret_hash: recovery_secret_hash.to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        last_seen_at: None,
+    })
+}
+
+pub async fn get_player_by_name(
+    pool: &Pool<Sqlite>,
+    display_name: &str,
+) -> Result<Option<PlayerRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        "select id, display_name, email, recovery_secret_hash, created_at, updated_at, last_seen_at
+         from players where display_name = ?1",
+    )
+    .bind(display_name)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| PlayerRecord {
+        id: r.get(0),
+        display_name: r.get(1),
+        email: r.get(2),
+        recovery_secret_hash: r.get(3),
+        created_at: r.get(4),
+        updated_at: r.get(5),
+        last_seen_at: r.get(6),
+    }))
+}
+
+pub async fn get_player_by_id(
+    pool: &Pool<Sqlite>,
+    id: &str,
+) -> Result<Option<PlayerRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        "select id, display_name, email, recovery_secret_hash, created_at, updated_at, last_seen_at
+         from players where id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| PlayerRecord {
+        id: r.get(0),
+        display_name: r.get(1),
+        email: r.get(2),
+        recovery_secret_hash: r.get(3),
+        created_at: r.get(4),
+        updated_at: r.get(5),
+        last_seen_at: r.get(6),
+    }))
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRecord {
+    pub id: String,
+    pub player_id: String,
+    pub token_hash: Option<String>,
+    pub created_at: String,
+    pub last_seen_at: String,
+    pub expires_at: Option<String>,
+}
+
+pub async fn create_session(
+    pool: &Pool<Sqlite>,
+    id: &str,
+    player_id: &str,
+    token_hash: &str,
+    expires_at: Option<&str>,
+) -> Result<SessionRecord, sqlx::Error> {
+    let now = now_iso();
+    sqlx::query(
+        "insert into sessions (id, player_id, token_hash, created_at, last_seen_at, expires_at)
+         values (?1, ?2, ?3, ?4, ?5, ?6)",
+    )
+    .bind(id)
+    .bind(player_id)
+    .bind(token_hash)
+    .bind(&now)
+    .bind(&now)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+
+    Ok(SessionRecord {
+        id: id.to_string(),
+        player_id: player_id.to_string(),
+        token_hash: Some(token_hash.to_string()),
+        created_at: now.clone(),
+        last_seen_at: now,
+        expires_at: expires_at.map(|s| s.to_string()),
+    })
+}
+
+pub async fn get_session_by_id(
+    pool: &Pool<Sqlite>,
+    id: &str,
+) -> Result<Option<SessionRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        "select id, player_id, token_hash, created_at, last_seen_at, expires_at
+         from sessions where id = ?1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| SessionRecord {
+        id: r.get(0),
+        player_id: r.get(1),
+        token_hash: r.get(2),
+        created_at: r.get(3),
+        last_seen_at: r.get(4),
+        expires_at: r.get(5),
+    }))
+}
+
+pub async fn update_session_last_seen(pool: &Pool<Sqlite>, id: &str) -> Result<(), sqlx::Error> {
+    let now = now_iso();
+    sqlx::query("update sessions set last_seen_at = ?1 where id = ?2")
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ========== Game Invitation Functions ==========
+
+#[derive(Debug, Clone)]
+pub struct InvitationRecord {
+    pub id: String,
+    pub game_id: String,
+    pub invited_player_id: String,
+    pub inviting_player_id: String,
+    pub seat_number: u8,
+    pub status: String,
+    pub created_at: String,
+    pub responded_at: Option<String>,
+}
+
+pub async fn create_invitation(
+    pool: &Pool<Sqlite>,
+    id: &str,
+    game_id: &str,
+    invited_player_id: &str,
+    inviting_player_id: &str,
+    seat_number: u8,
+) -> Result<InvitationRecord, sqlx::Error> {
+    let now = now_iso();
+    sqlx::query(
+        "insert into game_invitations (id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at)
+         values (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+    )
+    .bind(id)
+    .bind(game_id)
+    .bind(invited_player_id)
+    .bind(inviting_player_id)
+    .bind(seat_number as i64)
+    .bind(&now)
+    .execute(pool)
+    .await?;
+
+    Ok(InvitationRecord {
+        id: id.to_string(),
+        game_id: game_id.to_string(),
+        invited_player_id: invited_player_id.to_string(),
+        inviting_player_id: inviting_player_id.to_string(),
+        seat_number,
+        status: "pending".to_string(),
+        created_at: now,
+        responded_at: None,
+    })
+}
+
+pub async fn get_invitations_for_player(
+    pool: &Pool<Sqlite>,
+    player_id: &str,
+) -> Result<Vec<InvitationRecord>, sqlx::Error> {
+    let rows = sqlx::query(
+        "select id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, responded_at
+         from game_invitations where invited_player_id = ?1",
+    )
+    .bind(player_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| InvitationRecord {
+            id: r.get(0),
+            game_id: r.get(1),
+            invited_player_id: r.get(2),
+            inviting_player_id: r.get(3),
+            seat_number: r.get::<i64, _>(4) as u8,
+            status: r.get(5),
+            created_at: r.get(6),
+            responded_at: r.get(7),
+        })
+        .collect())
+}
+
+pub async fn update_invitation_status(
+    pool: &Pool<Sqlite>,
+    id: &str,
+    status: &str,
+) -> Result<(), sqlx::Error> {
+    let now = now_iso();
+    sqlx::query("update game_invitations set status = ?1, responded_at = ?2 where id = ?3")
+        .bind(status)
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

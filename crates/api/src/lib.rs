@@ -168,3 +168,89 @@ pub enum GameEventDto {
 pub struct ApiError {
     pub message: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreviewMoveRequest {
+    pub seat_number: u8,
+    pub candidate: MoveCandidateDto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PreviewMoveResponse {
+    pub is_legal: bool,
+    pub headline: String,
+    pub detail: String,
+    pub score: Option<i16>,
+}
+
+// ========== Authentication ==========
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegisterPlayerRequest {
+    pub display_name: String,
+    pub email: String,
+    pub recovery_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlayerSessionDto {
+    pub player_id: String,
+    pub session_token: String,
+    pub display_name: String,
+    pub email: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LoginPlayerRequest {
+    pub display_name: String,
+    pub recovery_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ValidateSessionRequest {
+    pub session_token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlayerDto {
+    pub id: String,
+    pub display_name: String,
+    pub email: String,
+    pub created_at: String,
+    pub last_seen_at: Option<String>,
+}
+
+// ========== Game Invitations ==========
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvitationStatus {
+    Pending,
+    Accepted,
+    Rejected,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameInvitationDto {
+    pub id: String,
+    pub game_id: String,
+    pub invited_player_id: String,
+    pub inviting_player_id: String,
+    pub seat_number: u8,
+    pub status: InvitationStatus,
+    pub created_at: String,
+    pub responded_at: Option<String>,
+    pub inviting_player_display_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvitePlayerRequest {
+    pub invited_display_name: String,
+    pub seat_number: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvitationResponseRequest {
+    pub accept: bool,
+}

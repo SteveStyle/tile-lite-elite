@@ -2,7 +2,7 @@ use crate::{
     app::{MovePreviewView, RackTileView, StagedPlacementView},
     components::{board_view::BoardView, rack_view::RackView, sidebar::Sidebar},
 };
-use api::GameStateDto;
+use api::{GameStateDto, TileDto};
 use dioxus::prelude::*;
 
 #[component]
@@ -14,80 +14,40 @@ pub fn Home(
     info_message: Option<String>,
     error_message: Option<String>,
     rack_tiles: Vec<RackTileView>,
-    selected_rack_tile_id: Option<usize>,
     staged_placements: Vec<StagedPlacementView>,
     can_stage_moves: bool,
-    placement_direction: api::DirectionDto,
-    inferred_direction: api::DirectionDto,
-    on_board_cell_click: EventHandler<usize>,
-    on_rack_tile_click: EventHandler<usize>,
+    on_drag_rack_tile: EventHandler<usize>,
+    on_drag_end_rack_tile: EventHandler<()>,
+    on_drop_board_cell: EventHandler<usize>,
     on_clear_staged: EventHandler<()>,
     on_remove_staged: EventHandler<usize>,
-    on_set_horizontal: EventHandler<()>,
-    on_set_vertical: EventHandler<()>,
     on_set_blank_letter: EventHandler<char>,
     selected_blank_letter: Option<char>,
-    selected_rack_tile_is_blank: bool,
     staged_preview: Option<MovePreviewView>,
 ) -> Element {
     let first_rack = game.racks.first().cloned();
-    let direction_label = match placement_direction {
-        api::DirectionDto::Horizontal => "Horizontal",
-        api::DirectionDto::Vertical => "Vertical",
-    };
-    let inferred_direction_label = match inferred_direction {
-        api::DirectionDto::Horizontal => "Horizontal",
-        api::DirectionDto::Vertical => "Vertical",
-    };
-    let selected_tile_label = selected_rack_tile_id.and_then(|selected_id| {
-        rack_tiles
-            .iter()
-            .find(|tile| tile.id == selected_id)
-            .map(|tile| tile.display)
-    });
-    let selected_tile_text = selected_tile_label
-        .map(|tile| tile.to_string())
-        .unwrap_or_else(|| "none".to_string());
+
+    // Show blank picker when there is a staged blank tile still needing a letter.
+    let has_unresolved_blank = staged_placements
+        .iter()
+        .any(|p| matches!(p.tile, TileDto::Blank { acting_as: None }));
+
     let selected_blank_text = selected_blank_letter
-        .map(|letter| letter.to_string())
+        .map(|l| l.to_string())
         .unwrap_or_else(|| "choose a letter".to_string());
+
     let blank_letter_buttons = ('A'..='Z').map(|letter| {
         let class_name = if selected_blank_letter == Some(letter) {
             "blank-letter-button blank-letter-button-active"
         } else {
             "blank-letter-button"
         };
-
         rsx! {
             button {
                 key: "{letter}",
                 class: "{class_name}",
                 onclick: move |_| on_set_blank_letter.call(letter),
                 "{letter}"
-            }
-        }
-    });
-    let ordered_staged = {
-        let mut ordered = staged_placements.clone();
-        ordered.sort_by_key(|placement| placement.board_index);
-        ordered
-    };
-    let staged_rows = ordered_staged.clone().into_iter().map(|placement| {
-        let row = placement.board_index / 15 + 1;
-        let col = (placement.board_index % 15) as u8;
-        let label = format!("{}{}", (b'A' + col) as char, row);
-
-        rsx! {
-            div { key: "{placement.board_index}", class: "staged-item",
-                div {
-                    span { class: "staged-badge", "{label}" }
-                    span { class: "staged-letter", "{placement.display}" }
-                }
-                button {
-                    class: "staged-remove-button",
-                    onclick: move |_| on_remove_staged.call(placement.board_index),
-                    "Remove"
-                }
             }
         }
     });
@@ -142,7 +102,8 @@ pub fn Home(
                         board: game.board.clone(),
                         staged_placements: staged_placements.clone(),
                         can_stage_moves,
-                        on_cell_click: on_board_cell_click,
+                        on_drop_tile: on_drop_board_cell,
+                        on_remove_staged,
                     }
                 }
 
@@ -150,50 +111,28 @@ pub fn Home(
                     div { class: "rack-panel",
                         div { class: "panel-header",
                             div {
-                                h2 { "Rack Preview" }
+                                h2 { "Rack" }
                                 p {
-                                    "The local client can show previews without owning canonical state."
+                                    if can_stage_moves {
+                                        "Drag a tile onto the board. Right-click a staged tile to remove it."
+                                    } else {
+                                        "Manual placement is enabled only for an active human turn."
+                                    }
                                 }
                             }
-                        }
-                        div { class: "composer-toolbar",
-                            div { class: "composer-group",
+                            if !staged_placements.is_empty() {
                                 button {
-                                    class: if placement_direction == api::DirectionDto::Horizontal { "direction-button direction-button-active" } else { "direction-button" },
-                                    disabled: !can_stage_moves,
-                                    onclick: move |_| on_set_horizontal.call(()),
-                                    "Horizontal"
-                                }
-                                button {
-                                    class: if placement_direction == api::DirectionDto::Vertical { "direction-button direction-button-active" } else { "direction-button" },
-                                    disabled: !can_stage_moves,
-                                    onclick: move |_| on_set_vertical.call(()),
-                                    "Vertical"
+                                    class: "direction-button direction-button-muted",
+                                    onclick: move |_| on_clear_staged.call(()),
+                                    "Clear"
                                 }
                             }
-                            button {
-                                class: "direction-button direction-button-muted",
-                                disabled: staged_placements.is_empty(),
-                                onclick: move |_| on_clear_staged.call(()),
-                                "Clear"
-                            }
                         }
-                        p { class: "composer-copy",
-                            "Direction: {direction_label}. Selected tile: {selected_tile_text}."
-                        }
-                        p { class: "composer-copy",
-                            "Current move orientation: {inferred_direction_label}. Single-tile plays infer from nearby board tiles when possible."
-                        }
-                        p { class: "composer-copy",
-                            if can_stage_moves {
-                                "Click a rack tile, then click empty board squares to stage a move. Click a staged square again to remove it."
-                            } else {
-                                "Manual placement is enabled only for an active human turn."
-                            }
-                        }
-                        if selected_rack_tile_is_blank {
+                        if has_unresolved_blank {
                             div { class: "blank-picker",
-                                p { class: "composer-copy", "Blank assignment: {selected_blank_text}" }
+                                p { class: "composer-copy",
+                                    "Blank tile — choose a letter: {selected_blank_text}"
+                                }
                                 div { class: "blank-picker-grid", {blank_letter_buttons} }
                             }
                         }
@@ -203,18 +142,11 @@ pub fn Home(
                                 p { class: "composer-copy", "{preview.detail}" }
                             }
                         }
-                        if !ordered_staged.is_empty() {
-                            div { class: "staged-list",
-                                h3 { class: "preview-title", "Staged Placements" }
-                                {staged_rows}
-                            }
-                        }
                         RackView {
-                            rack,
                             tiles: rack_tiles,
-                            selected_rack_tile_id,
-                            on_tile_click: on_rack_tile_click,
                             can_stage_moves,
+                            on_drag_start: on_drag_rack_tile,
+                            on_drag_end: on_drag_end_rack_tile,
                         }
                     }
                 }

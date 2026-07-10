@@ -5,10 +5,6 @@ use api::{
 };
 use dioxus::prelude::*;
 use futures_util::StreamExt;
-use rules_shared::{
-    BoardCell, BoardState, Direction, EmptyCell, FilledCell, GameState, Letter, MoveGenerator,
-    Rack, RulesEngine, SOWPODS, Tile, VariantRules,
-};
 
 #[cfg(target_arch = "wasm32")]
 use gloo_net::{
@@ -23,6 +19,8 @@ use crate::views::Home;
 
 const MAIN_CSS: Asset = asset!("/assets/styling/main.css");
 const DEFAULT_ENGINE_ID: &str = "greedy-v1";
+const BOARD_WIDTH: usize = 15;
+const BOARD_HEIGHT: usize = 15;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RackTileView {
@@ -64,9 +62,8 @@ pub fn RootApp() -> Element {
     let mut error_message = use_signal(|| None::<String>);
     let mut bootstrapped = use_signal(|| false);
     let mut websocket_game_id = use_signal(|| None::<String>);
-    let mut selected_rack_tile_id = use_signal(|| None::<usize>);
+    let mut dragging_tile_id = use_signal(|| None::<usize>);
     let mut staged_placements = use_signal(Vec::<StagedPlacementView>::new);
-    let mut placement_direction = use_signal(|| DirectionDto::Horizontal);
     let mut selected_blank_letter = use_signal(|| None::<char>);
 
     if !bootstrapped() {
@@ -78,7 +75,7 @@ pub fn RootApp() -> Element {
             match load_latest_game(&server_url).await {
                 Ok(Some(loaded)) => {
                     info_message.set(Some(format!("Loaded game {}", loaded.id)));
-                    selected_rack_tile_id.set(None);
+                    dragging_tile_id.set(None);
                     selected_blank_letter.set(None);
                     staged_placements.set(Vec::new());
                     game.set(Some(loaded));
@@ -121,15 +118,31 @@ pub fn RootApp() -> Element {
                 .is_some_and(|participant| participant.kind == SeatKind::Human)
     });
     let rack_tiles = current_rack_tiles(&game_for_view, &staged_placements());
-    let selected_rack_tile = selected_rack_tile_id()
-        .and_then(|id| rack_tiles.iter().find(|tile| tile.id == id).cloned());
     let can_submit_manual_action = can_submit_human_action && !staged_placements().is_empty();
-    let staged_preview = preview_staged_move(
-        &game_for_view,
-        &staged_placements(),
-        placement_direction(),
-        can_submit_human_action,
-    );
+
+    let mut staged_preview: Signal<Option<MovePreviewView>> = use_signal(|| None);
+    {
+        let server_url_for_preview = server_url.clone();
+        use_effect(move || {
+            let staged = staged_placements();
+            let game_val = game();
+            let direction = DirectionDto::Horizontal;
+            let is_human_turn = can_submit_human_action;
+            let server_url = server_url_for_preview.clone();
+            spawn(async move {
+                if !is_human_turn || staged.is_empty() {
+                    staged_preview.set(None);
+                    return;
+                }
+                if let Some(game) = game_val {
+                    let preview =
+                        fetch_server_preview(&server_url, &game, &staged, direction).await;
+                    staged_preview.set(preview);
+                }
+            });
+        });
+    }
+    let staged_preview = staged_preview();
     let server_url_for_create = server_url.clone();
     let server_url_for_reload = server_url.clone();
     let server_url_for_start = server_url.clone();
@@ -138,9 +151,7 @@ pub fn RootApp() -> Element {
     let server_url_for_manual = server_url.clone();
     let server_url_for_view = server_url.clone();
     let game_for_home = game_for_view.clone();
-    let game_for_inferred_direction = game_for_view.clone();
-    let game_for_board_click = game_for_view.clone();
-    let game_for_rack_click = game_for_view.clone();
+    let game_for_board_drop = game_for_view.clone();
 
     rsx! {
         document::Link { rel: "stylesheet", href: MAIN_CSS }
@@ -163,7 +174,7 @@ pub fn RootApp() -> Element {
                                 match create_default_game(&server_url).await {
                                     Ok(created) => {
                                         info_message.set(Some(format!("Created game {}", created.id)));
-                                        selected_rack_tile_id.set(None);
+                                        dragging_tile_id.set(None);
                                         selected_blank_letter.set(None);
                                         staged_placements.set(Vec::new());
                                         websocket_game_id.set(None);
@@ -187,7 +198,7 @@ pub fn RootApp() -> Element {
                                 match load_latest_game(&server_url).await {
                                     Ok(Some(loaded)) => {
                                         info_message.set(Some(format!("Reloaded game {}", loaded.id)));
-                                        selected_rack_tile_id.set(None);
+                                        dragging_tile_id.set(None);
                                         selected_blank_letter.set(None);
                                         staged_placements.set(Vec::new());
                                         websocket_game_id.set(None);
@@ -217,7 +228,7 @@ pub fn RootApp() -> Element {
                                     match start_game(&server_url, &current_game.id).await {
                                         Ok(updated) => {
                                             info_message.set(Some(format!("Started game {}", updated.id)));
-                                            selected_rack_tile_id.set(None);
+                                            dragging_tile_id.set(None);
                                             selected_blank_letter.set(None);
                                             staged_placements.set(Vec::new());
                                             game.set(Some(updated));
@@ -243,7 +254,7 @@ pub fn RootApp() -> Element {
                                     match submit_suggested_move(&server_url, &current_game).await {
                                         Ok(updated) => {
                                             info_message.set(Some("Submitted suggested move.".to_string()));
-                                            selected_rack_tile_id.set(None);
+                                            dragging_tile_id.set(None);
                                             selected_blank_letter.set(None);
                                             staged_placements.set(Vec::new());
                                             game.set(Some(updated));
@@ -269,7 +280,7 @@ pub fn RootApp() -> Element {
                                     match submit_pass(&server_url, &current_game).await {
                                         Ok(updated) => {
                                             info_message.set(Some("Submitted pass action.".to_string()));
-                                            selected_rack_tile_id.set(None);
+                                            dragging_tile_id.set(None);
                                             selected_blank_letter.set(None);
                                             staged_placements.set(Vec::new());
                                             game.set(Some(updated));
@@ -289,17 +300,21 @@ pub fn RootApp() -> Element {
                             let server_url = server_url_for_manual.clone();
                             let current_game = game().clone();
                             let staged = staged_placements().clone();
-                            let direction = placement_direction();
                             if let Some(current_game) = current_game {
                                 spawn(async move {
                                     is_loading.set(true);
                                     error_message.set(None);
-                                    match submit_manual_move(&server_url, &current_game, &staged, direction)
+                                    match submit_manual_move(
+                                            &server_url,
+                                            &current_game,
+                                            &staged,
+                                            DirectionDto::Horizontal,
+                                        )
                                         .await
                                     {
                                         Ok(updated) => {
                                             info_message.set(Some("Submitted staged move.".to_string()));
-                                            selected_rack_tile_id.set(None);
+                                            dragging_tile_id.set(None);
                                             selected_blank_letter.set(None);
                                             staged_placements.set(Vec::new());
                                             game.set(Some(updated));
@@ -323,76 +338,43 @@ pub fn RootApp() -> Element {
                 info_message: info_message().clone(),
                 error_message: error_message().clone(),
                 rack_tiles,
-                selected_rack_tile_id: selected_rack_tile_id(),
                 staged_placements: staged_placements().clone(),
                 can_stage_moves: can_submit_human_action,
-                placement_direction: placement_direction(),
-                inferred_direction: infer_current_direction(
-                    &game_for_inferred_direction,
-                    &staged_placements(),
-                    placement_direction(),
-                ),
-                on_board_cell_click: move |board_index| {
+                on_drag_rack_tile: move |tile_id| {
+                    dragging_tile_id.set(Some(tile_id));
+                },
+                on_drag_end_rack_tile: move |_| {
+                    dragging_tile_id.set(None);
+                },
+                on_drop_board_cell: move |board_index| {
                     if !can_submit_human_action {
-                        error_message.set(Some("It is not a human-controlled turn.".to_string()));
                         return;
                     }
-
-                    if game_for_board_click
+                    if game_for_board_drop
                         .board
                         .get(board_index)
                         .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
                     {
                         return;
                     }
-
                     if staged_placements()
                         .iter()
-                        .any(|placement| placement.board_index == board_index)
+                        .any(|p| p.board_index == board_index)
                     {
-                        staged_placements
-                            .with_mut(|placements| {
-                                placements.retain(|placement| placement.board_index != board_index);
-                            });
                         return;
                     }
-                    let Some(selected_id) = selected_rack_tile_id() else {
-                        info_message
-                            .set(
-                                Some(
-                                    "Select a rack tile before placing it on the board.".to_string(),
-                                ),
-                            );
+                    let Some(tile_id) = dragging_tile_id() else {
                         return;
                     };
-                    let Some(tile) = current_rack_tiles(&game_for_board_click, &staged_placements())
+                    let Some(tile) = current_rack_tiles(&game_for_board_drop, &staged_placements())
                         .into_iter()
-                        .find(|tile| tile.id == selected_id) else {
-                        error_message
-                            .set(Some("Selected rack tile is no longer available.".to_string()));
-                        selected_rack_tile_id.set(None);
+                        .find(|t| t.id == tile_id)
+                        else {
+                        dragging_tile_id.set(None);
                         return;
                     };
                     let (tile_for_board, display_for_board) = match tile.tile.clone() {
-                        TileDto::Blank { .. } => {
-                            let Some(blank_letter) = selected_blank_letter() else {
-                                info_message
-                                    .set(
-                                        Some(
-                                            "Choose a letter for the selected blank tile before placing it."
-                                                .to_string(),
-                                        ),
-                                    );
-
-                                return;
-                            };
-                            (
-                                TileDto::Blank {
-                                    acting_as: Some(blank_letter),
-                                },
-                                blank_letter.to_ascii_lowercase(),
-                            )
-                        }
+                        TileDto::Blank { .. } => (TileDto::Blank { acting_as: None }, '?'),
                         other => (other, tile.display),
                     };
                     staged_placements
@@ -405,47 +387,10 @@ pub fn RootApp() -> Element {
                                     tile: tile_for_board,
                                 });
                         });
-                    selected_rack_tile_id.set(None);
-                    selected_blank_letter.set(None);
-                },
-                on_rack_tile_click: move |tile_id| {
-                    if !can_submit_human_action {
-                        return;
-                    }
-
-                    let Some(tile) = current_rack_tiles(&game_for_rack_click, &staged_placements())
-                        .into_iter()
-                        .find(|tile| tile.id == tile_id)
-                        else {
-                        return;
-                    };
-
-                    if tile.is_used {
-                        return;
-                    }
-
-                    if selected_rack_tile_id() == Some(tile_id) {
-                        selected_rack_tile_id.set(None);
-                        selected_blank_letter.set(None);
-                    } else {
-                        selected_rack_tile_id.set(Some(tile_id));
-                        if tile.is_blank() {
-                            selected_blank_letter.set(None);
-                            info_message
-                                .set(
-                                    Some(
-                                        "Selected blank tile. Choose its letter, then place it on the board."
-                                            .to_string(),
-                                    ),
-                                );
-                        } else {
-                            selected_blank_letter.set(None);
-                            info_message.set(Some(format!("Selected tile {}", tile.display)));
-                        }
-                    }
+                    dragging_tile_id.set(None);
                 },
                 on_clear_staged: move |_| {
-                    selected_rack_tile_id.set(None);
+                    dragging_tile_id.set(None);
                     selected_blank_letter.set(None);
                     staged_placements.set(Vec::new());
                     info_message.set(Some("Cleared staged placements.".to_string()));
@@ -453,25 +398,30 @@ pub fn RootApp() -> Element {
                 on_remove_staged: move |board_index| {
                     staged_placements
                         .with_mut(|placements| {
-                            placements.retain(|placement| placement.board_index != board_index);
+                            placements.retain(|p| p.board_index != board_index);
                         });
                 },
-                on_set_horizontal: move |_| placement_direction.set(DirectionDto::Horizontal),
-                on_set_vertical: move |_| placement_direction.set(DirectionDto::Vertical),
                 on_set_blank_letter: move |letter| {
                     selected_blank_letter.set(Some(letter));
-                    info_message.set(Some(format!("Blank tile will act as {}.", letter)));
+                    staged_placements
+                        .with_mut(|placements| {
+                            if let Some(placement) = placements
+                                .iter_mut()
+                                .find(|p| matches!(p.tile, TileDto::Blank { acting_as: None }))
+                            {
+                                placement.tile = TileDto::Blank {
+                                    acting_as: Some(letter),
+                                };
+                                placement.display = letter.to_ascii_lowercase();
+                            }
+                        });
                 },
                 selected_blank_letter: selected_blank_letter(),
-                selected_rack_tile_is_blank: selected_rack_tile
-                                                                                                                                                                                                                                                    .as_ref()
-                                                                                                                                                                                                                                                    .is_some_and(RackTileView::is_blank),
                 staged_preview,
             }
         }
     }
 }
-
 fn empty_live_game() -> GameStateDto {
     GameStateDto {
         id: "not-connected".to_string(),
@@ -602,8 +552,7 @@ async fn submit_suggested_move(
     server_url: &str,
     game: &GameStateDto,
 ) -> Result<GameStateDto, String> {
-    let request = build_suggested_move_request(game)?;
-    post_json(&format!("{server_url}/games/{}/actions", game.id), &request).await
+    post_json::<(), _>(&format!("{server_url}/games/{}/suggest", game.id), &()).await
 }
 
 async fn submit_manual_move(
@@ -629,16 +578,20 @@ async fn get_json<R>(url: &str) -> Result<R, String>
 where
     R: serde::de::DeserializeOwned,
 {
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .get(url)
         .send()
         .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<R>()
-        .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        let msg = response
+            .json::<api::ApiError>()
+            .await
+            .map(|e| e.message)
+            .unwrap_or_else(|_| "Request failed".to_string());
+        return Err(msg);
+    }
+    response.json::<R>().await.map_err(|e| e.to_string())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -651,11 +604,12 @@ where
         .await
         .map_err(|error| error.to_string())?;
     if !response.ok() {
-        return Err(format!(
-            "HTTP {} {}",
-            response.status(),
-            response.status_text()
-        ));
+        let msg = response
+            .json::<api::ApiError>()
+            .await
+            .map(|e| e.message)
+            .unwrap_or_else(|_| format!("HTTP {} {}", response.status(), response.status_text()));
+        return Err(msg);
     }
     response
         .json::<R>()
@@ -669,17 +623,21 @@ where
     T: serde::Serialize + ?Sized,
     R: serde::de::DeserializeOwned,
 {
-    reqwest::Client::new()
+    let response = reqwest::Client::new()
         .post(url)
         .json(payload)
         .send()
         .await
-        .map_err(|error| error.to_string())?
-        .error_for_status()
-        .map_err(|error| error.to_string())?
-        .json::<R>()
-        .await
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        let msg = response
+            .json::<api::ApiError>()
+            .await
+            .map(|e| e.message)
+            .unwrap_or_else(|_| "Request failed".to_string());
+        return Err(msg);
+    }
+    response.json::<R>().await.map_err(|e| e.to_string())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -695,11 +653,12 @@ where
         .await
         .map_err(|error| error.to_string())?;
     if !response.ok() {
-        return Err(format!(
-            "HTTP {} {}",
-            response.status(),
-            response.status_text()
-        ));
+        let msg = response
+            .json::<api::ApiError>()
+            .await
+            .map(|e| e.message)
+            .unwrap_or_else(|_| format!("HTTP {} {}", response.status(), response.status_text()));
+        return Err(msg);
     }
     response
         .json::<R>()
@@ -788,164 +747,11 @@ fn websocket_url(server_url: &str, game_id: &str) -> Result<String, String> {
     Err(format!("Unsupported server url: {server_url}"))
 }
 
-fn build_suggested_move_request(game: &GameStateDto) -> Result<GameActionRequest, String> {
-    if game.status != GameStatus::Active {
-        return Err("Game is not active".to_string());
-    }
-
-    let participant = game
-        .participants
-        .get(game.current_seat as usize)
-        .ok_or_else(|| "Current seat is missing".to_string())?;
-    if participant.kind != SeatKind::Human {
-        return Err("Current seat is not human-controlled".to_string());
-    }
-
-    let rack = game
-        .racks
-        .get(game.current_seat as usize)
-        .ok_or_else(|| "Current rack is missing".to_string())?;
-    let rules = VariantRules::official();
-    let board = board_from_dto(&game.board)?;
-    let state = GameState::from_board(board, &rules, &*SOWPODS);
-    let rack = rack_from_dto(rack);
-    let engine = RulesEngine {
-        rules: &rules,
-        dictionary: &*SOWPODS,
-    };
-
-    let mut best_candidate = None;
-    let mut best_score = i16::MIN;
-    for candidate in engine.enumerate_legal_moves(&state, &rack) {
-        if let Ok(validated) = engine.validate_game_move(&state, Some(&rack), &candidate) {
-            if validated.score.total > best_score {
-                best_score = validated.score.total;
-                best_candidate = Some(candidate);
-            }
-        }
-    }
-
-    let action = match best_candidate {
-        Some(candidate) => api::PlayerActionDto::Place {
-            candidate: move_candidate_to_dto(candidate),
-        },
-        None => api::PlayerActionDto::Pass,
-    };
-
-    Ok(GameActionRequest {
-        seat_number: game.current_seat,
-        action,
-    })
-}
-
-fn preview_staged_move(
-    game: &GameStateDto,
-    staged: &[StagedPlacementView],
-    direction_hint: DirectionDto,
-    can_stage_moves: bool,
-) -> Option<MovePreviewView> {
-    if !can_stage_moves || staged.is_empty() {
-        return None;
-    }
-
-    match build_manual_move_candidate(game, staged, direction_hint) {
-        Ok(candidate) => {
-            let rules = VariantRules::official();
-            let board = match board_from_dto(&game.board) {
-                Ok(board) => board,
-                Err(error) => {
-                    return Some(MovePreviewView {
-                        is_legal: false,
-                        headline: "Preview unavailable".to_string(),
-                        detail: error,
-                    });
-                }
-            };
-            let rack = match game.racks.get(game.current_seat as usize) {
-                Some(rack) => rack_from_dto(rack),
-                None => {
-                    return Some(MovePreviewView {
-                        is_legal: false,
-                        headline: "Preview unavailable".to_string(),
-                        detail: "Current rack is missing.".to_string(),
-                    });
-                }
-            };
-            let state = GameState::from_board(board, &rules, &*SOWPODS);
-            let engine = RulesEngine {
-                rules: &rules,
-                dictionary: &*SOWPODS,
-            };
-
-            match engine.validate_game_move(&state, Some(&rack), &candidate) {
-                Ok(validated) => Some(MovePreviewView {
-                    is_legal: true,
-                    headline: format!(
-                        "Legal preview: {} for {} points",
-                        validated.preview.main_word, validated.score.total
-                    ),
-                    detail: if validated.preview.cross_words.is_empty() {
-                        "No cross words created.".to_string()
-                    } else {
-                        format!(
-                            "Cross words: {}",
-                            validated
-                                .preview
-                                .cross_words
-                                .iter()
-                                .map(|word| word.word.clone())
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    },
-                }),
-                Err(error) => Some(MovePreviewView {
-                    is_legal: false,
-                    headline: "Move is not currently legal".to_string(),
-                    detail: format_move_error(&error),
-                }),
-            }
-        }
-        Err(error) => Some(MovePreviewView {
-            is_legal: false,
-            headline: "Move is not currently legal".to_string(),
-            detail: error,
-        }),
-    }
-}
-
-fn infer_current_direction(
-    game: &GameStateDto,
-    staged: &[StagedPlacementView],
-    direction_hint: DirectionDto,
-) -> DirectionDto {
-    if staged.len() != 1 {
-        return direction_hint;
-    }
-
-    infer_single_tile_direction(game, staged[0].board_index, direction_hint)
-}
-
 fn build_manual_move_request(
     game: &GameStateDto,
     staged: &[StagedPlacementView],
     direction_hint: DirectionDto,
 ) -> Result<GameActionRequest, String> {
-    let candidate = build_manual_move_candidate(game, staged, direction_hint)?;
-
-    Ok(GameActionRequest {
-        seat_number: game.current_seat,
-        action: api::PlayerActionDto::Place {
-            candidate: move_candidate_to_dto(candidate),
-        },
-    })
-}
-
-fn build_manual_move_candidate(
-    game: &GameStateDto,
-    staged: &[StagedPlacementView],
-    direction_hint: DirectionDto,
-) -> Result<rules_shared::MoveCandidate, String> {
     if game.status != GameStatus::Active {
         return Err("Game is not active".to_string());
     }
@@ -958,10 +764,10 @@ fn build_manual_move_candidate(
 
     let positions: Vec<(u8, u8)> = placements
         .iter()
-        .map(|placement| {
+        .map(|p| {
             (
-                (placement.board_index % BoardState::WIDTH) as u8,
-                (placement.board_index / BoardState::WIDTH) as u8,
+                (p.board_index % BOARD_WIDTH) as u8,
+                (p.board_index / BOARD_WIDTH) as u8,
             )
         })
         .collect();
@@ -990,31 +796,75 @@ fn build_manual_move_candidate(
         }
     };
 
-    let mut tiles = placements
+    let mut tile_placements = placements
         .into_iter()
-        .map(|placement| {
-            let x = (placement.board_index % BoardState::WIDTH) as u8;
-            let y = (placement.board_index / BoardState::WIDTH) as u8;
+        .map(|p| {
+            let x = (p.board_index % BOARD_WIDTH) as u8;
+            let y = (p.board_index / BOARD_WIDTH) as u8;
             let offset = match direction {
                 DirectionDto::Horizontal => x - start_x,
                 DirectionDto::Vertical => y - start_y,
             };
-            rules_shared::TilePlacement {
+            TilePlacementDto {
                 offset,
-                tile: tile_from_dto(&placement.tile),
+                tile: p.tile,
             }
         })
         .collect::<Vec<_>>();
-    tiles.sort_by_key(|placement| placement.offset);
+    tile_placements.sort_by_key(|p| p.offset);
 
-    Ok(rules_shared::MoveCandidate {
-        start: rules_shared::Position::new(start_x, start_y),
-        direction: match direction {
-            DirectionDto::Horizontal => Direction::Horizontal,
-            DirectionDto::Vertical => Direction::Vertical,
+    Ok(GameActionRequest {
+        seat_number: game.current_seat,
+        action: api::PlayerActionDto::Place {
+            candidate: MoveCandidateDto {
+                start: PositionDto {
+                    x: start_x,
+                    y: start_y,
+                },
+                direction,
+                tiles: tile_placements,
+            },
         },
-        tiles,
     })
+}
+
+async fn fetch_server_preview(
+    server_url: &str,
+    game: &GameStateDto,
+    staged: &[StagedPlacementView],
+    direction_hint: DirectionDto,
+) -> Option<MovePreviewView> {
+    let request = match build_manual_move_request(game, staged, direction_hint) {
+        Ok(r) => r,
+        Err(detail) => {
+            return Some(MovePreviewView {
+                is_legal: false,
+                headline: "Cannot preview this arrangement".to_string(),
+                detail,
+            });
+        }
+    };
+    let candidate = match request.action {
+        api::PlayerActionDto::Place { candidate } => candidate,
+        _ => return None,
+    };
+    let preview_request = api::PreviewMoveRequest {
+        seat_number: request.seat_number,
+        candidate,
+    };
+    match post_json::<_, api::PreviewMoveResponse>(
+        &format!("{server_url}/games/{}/preview", game.id),
+        &preview_request,
+    )
+    .await
+    {
+        Ok(response) => Some(MovePreviewView {
+            is_legal: response.is_legal,
+            headline: response.headline,
+            detail: response.detail,
+        }),
+        Err(_) => None,
+    }
 }
 
 fn infer_single_tile_direction(
@@ -1022,15 +872,15 @@ fn infer_single_tile_direction(
     board_index: usize,
     direction_hint: DirectionDto,
 ) -> DirectionDto {
-    let x = board_index % BoardState::WIDTH;
-    let y = board_index / BoardState::WIDTH;
+    let x = board_index % BOARD_WIDTH;
+    let y = board_index / BOARD_WIDTH;
 
     let has_horizontal_neighbor = (x > 0
         && game
             .board
             .get(board_index - 1)
             .is_some_and(board_cell_has_letter))
-        || (x + 1 < BoardState::WIDTH
+        || (x + 1 < BOARD_WIDTH
             && game
                 .board
                 .get(board_index + 1)
@@ -1038,12 +888,12 @@ fn infer_single_tile_direction(
     let has_vertical_neighbor = (y > 0
         && game
             .board
-            .get(board_index - BoardState::WIDTH)
+            .get(board_index - BOARD_WIDTH)
             .is_some_and(board_cell_has_letter))
-        || (y + 1 < BoardState::HEIGHT
+        || (y + 1 < BOARD_HEIGHT
             && game
                 .board
-                .get(board_index + BoardState::WIDTH)
+                .get(board_index + BOARD_WIDTH)
                 .is_some_and(board_cell_has_letter));
 
     match (has_horizontal_neighbor, has_vertical_neighbor) {
@@ -1094,109 +944,4 @@ fn current_rack_tiles(game: &GameStateDto, staged: &[StagedPlacementView]) -> Ve
     }
 
     tiles
-}
-
-fn board_from_dto(cells: &[BoardCellDto]) -> Result<BoardState, String> {
-    if cells.len() != BoardState::WIDTH * BoardState::HEIGHT {
-        return Err(format!(
-            "Expected {} board cells, got {}",
-            BoardState::WIDTH * BoardState::HEIGHT,
-            cells.len()
-        ));
-    }
-
-    let mut board = BoardState::default();
-    for (index, cell) in cells.iter().enumerate() {
-        let x = (index % BoardState::WIDTH) as u8;
-        let y = (index / BoardState::WIDTH) as u8;
-        let pos = rules_shared::Position::new(x, y);
-        let board_cell = match cell.letter {
-            Some(letter) => BoardCell::Filled(FilledCell {
-                letter: Letter::from(letter),
-                is_blank: cell.is_blank,
-            }),
-            None => BoardCell::Empty(EmptyCell {
-                premium: premium_from_dto(&cell.premium),
-            }),
-        };
-        board.set(pos, board_cell);
-    }
-
-    Ok(board)
-}
-
-fn premium_from_dto(premium: &PremiumDto) -> rules_shared::Premium {
-    match premium {
-        PremiumDto::Blank => rules_shared::Premium::Blank,
-        PremiumDto::DoubleLetter => rules_shared::Premium::DoubleLetter,
-        PremiumDto::TripleLetter => rules_shared::Premium::TripleLetter,
-        PremiumDto::DoubleWord => rules_shared::Premium::DoubleWord,
-        PremiumDto::TripleWord => rules_shared::Premium::TripleWord,
-    }
-}
-
-fn rack_from_dto(rack: &RackDto) -> Rack {
-    Rack {
-        counts: rack.counts,
-        blanks: rack.blanks,
-    }
-}
-
-fn move_candidate_to_dto(candidate: rules_shared::MoveCandidate) -> MoveCandidateDto {
-    MoveCandidateDto {
-        start: PositionDto {
-            x: candidate.start.x,
-            y: candidate.start.y,
-        },
-        direction: match candidate.direction {
-            Direction::Horizontal => DirectionDto::Horizontal,
-            Direction::Vertical => DirectionDto::Vertical,
-        },
-        tiles: candidate
-            .tiles
-            .into_iter()
-            .map(|tile| TilePlacementDto {
-                offset: tile.offset,
-                tile: tile_to_dto(tile.tile),
-            })
-            .collect(),
-    }
-}
-
-fn tile_from_dto(tile: &TileDto) -> Tile {
-    match tile {
-        TileDto::Letter { letter } => Tile::Letter(Letter::from(*letter)),
-        TileDto::Blank { acting_as } => Tile::Blank {
-            acting_as: acting_as.map(Letter::from),
-        },
-    }
-}
-
-fn format_move_error(error: &rules_shared::MoveError) -> String {
-    match error {
-        rules_shared::MoveError::InvalidMove => "Invalid move shape.".to_string(),
-        rules_shared::MoveError::InvalidWord(word) => format!("Invalid word: {word}"),
-        rules_shared::MoveError::InvalidPosition => "Tile placement is off the board.".to_string(),
-        rules_shared::MoveError::InvalidDirection => "Invalid move direction.".to_string(),
-        rules_shared::MoveError::TilesDoNotFit => {
-            "The selected tiles do not fit the current rack or span.".to_string()
-        }
-        rules_shared::MoveError::TilesDoNotConnect => {
-            "The move does not connect to the board correctly.".to_string()
-        }
-        rules_shared::MoveError::LetterNotAllowedInPosition => {
-            "A staged tile is not allowed at one of the chosen squares.".to_string()
-        }
-    }
-}
-
-fn tile_to_dto(tile: Tile) -> TileDto {
-    match tile {
-        Tile::Letter(letter) => TileDto::Letter {
-            letter: letter.as_char(),
-        },
-        Tile::Blank { acting_as } => TileDto::Blank {
-            acting_as: acting_as.map(|letter| letter.as_char()),
-        },
-    }
 }

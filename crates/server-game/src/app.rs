@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use api::{
-    ApiError, CreateGameRequest, GameActionRequest, GameEventDto, PlayerActionDto, StartGameRequest,
+    ApiError, CreateGameRequest, GameActionRequest, GameEventDto, GameInvitationDto,
+    InvitationStatus, InvitePlayerRequest, LoginPlayerRequest, PlayerActionDto, PlayerDto,
+    PlayerSessionDto, PreviewMoveRequest, RegisterPlayerRequest, StartGameRequest,
+    ValidateSessionRequest,
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{Path, State, WebSocketUpgrade};
@@ -56,11 +59,32 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/engines", get(list_engines))
+        // Authentication
+        .route("/auth/register", post(register_player))
+        .route("/auth/login", post(login_player))
+        .route("/auth/validate", post(validate_session))
+        // Games
         .route("/games", post(create_game).get(list_games))
         .route("/games/{game_id}", get(get_game))
         .route("/games/{game_id}/start", post(start_game))
         .route("/games/{game_id}/actions", post(submit_action))
+        .route("/games/{game_id}/preview", post(preview_move))
+        .route("/games/{game_id}/suggest", post(suggest_move))
         .route("/games/{game_id}/events", get(game_events))
+        // Game Invitations
+        .route("/games/{game_id}/invite", post(invite_player_to_game))
+        .route(
+            "/players/{player_id}/invitations",
+            get(list_player_invitations),
+        )
+        .route(
+            "/invitations/{invitation_id}/accept",
+            post(accept_invitation),
+        )
+        .route(
+            "/invitations/{invitation_id}/reject",
+            post(reject_invitation),
+        )
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -197,6 +221,157 @@ async fn submit_action(
     Ok(Json(dto))
 }
 
+async fn preview_move(
+    Path(game_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PreviewMoveRequest>,
+) -> Result<Json<api::PreviewMoveResponse>, ApiProblem> {
+    let games = state.games.read().await;
+    let game = games
+        .get(&game_id)
+        .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+    if game.status != api::GameStatus::Active {
+        return Ok(Json(api::PreviewMoveResponse {
+            is_legal: false,
+            headline: "Game is not active".to_string(),
+            detail: String::new(),
+            score: None,
+        }));
+    }
+
+    let rack = game
+        .participants
+        .get(request.seat_number as usize)
+        .map(|p| p.rack)
+        .unwrap_or_default();
+
+    let candidate = move_candidate_from_dto(request.candidate);
+    let engine = rules_shared::RulesEngine {
+        rules: &game.rules,
+        dictionary: &*rules_shared::SOWPODS,
+    };
+
+    let response = match engine.validate_game_move(&game.state, Some(&rack), &candidate) {
+        Ok(validated) => api::PreviewMoveResponse {
+            is_legal: true,
+            headline: format!(
+                "{} for {} points",
+                validated.preview.main_word, validated.score.total
+            ),
+            detail: if validated.preview.cross_words.is_empty() {
+                "No cross words.".to_string()
+            } else {
+                format!(
+                    "Cross words: {}",
+                    validated
+                        .preview
+                        .cross_words
+                        .iter()
+                        .map(|w| w.word.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+            score: Some(validated.score.total),
+        },
+        Err(error) => api::PreviewMoveResponse {
+            is_legal: false,
+            headline: "Move is not currently legal".to_string(),
+            detail: format_move_error(&error),
+            score: None,
+        },
+    };
+
+    Ok(Json(response))
+}
+
+async fn suggest_move(
+    Path(game_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let dto = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+        if game.status != api::GameStatus::Active {
+            return Err(ApiProblem::bad_request("Game is not active"));
+        }
+        let current_seat = game.current_seat as usize;
+        let participant = game
+            .participants
+            .get(current_seat)
+            .ok_or_else(|| ApiProblem::bad_request("Current seat missing"))?;
+        if participant.kind != api::SeatKind::Human {
+            return Err(ApiProblem::bad_request(
+                "Current seat is not human-controlled",
+            ));
+        }
+
+        let rack = participant.rack;
+        let engine = rules_shared::RulesEngine {
+            rules: &game.rules,
+            dictionary: &*rules_shared::SOWPODS,
+        };
+
+        use rules_shared::MoveGenerator as _;
+        let mut best_candidate = None;
+        let mut best_score = i16::MIN;
+        for candidate in engine.enumerate_legal_moves(&game.state, &rack) {
+            if let Ok(validated) = engine.validate_game_move(&game.state, Some(&rack), &candidate) {
+                if validated.score.total > best_score {
+                    best_score = validated.score.total;
+                    best_candidate = Some(candidate);
+                }
+            }
+        }
+
+        let seat = game.current_seat;
+        match best_candidate {
+            Some(candidate) => game
+                .apply_place_move(seat, candidate)
+                .map_err(ApiProblem::bad_request)?,
+            None => game.apply_pass(seat).map_err(ApiProblem::bad_request)?,
+        }
+
+        run_engine_turns(game, &state.engines)?;
+        let dto = game.to_dto();
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        dto
+    };
+
+    let event = if dto.status == api::GameStatus::Finished {
+        GameEventDto::GameFinished { game: dto.clone() }
+    } else {
+        GameEventDto::StateUpdated { game: dto.clone() }
+    };
+    let _ = state.events.send(event);
+
+    Ok(Json(dto))
+}
+
+fn format_move_error(error: &rules_shared::MoveError) -> String {
+    match error {
+        rules_shared::MoveError::InvalidMove => "Invalid move shape.".to_string(),
+        rules_shared::MoveError::InvalidWord(word) => format!("Invalid word: {word}"),
+        rules_shared::MoveError::InvalidPosition => "Tile placement is off the board.".to_string(),
+        rules_shared::MoveError::InvalidDirection => "Invalid move direction.".to_string(),
+        rules_shared::MoveError::TilesDoNotFit => {
+            "The tiles do not fit the rack or span.".to_string()
+        }
+        rules_shared::MoveError::TilesDoNotConnect => {
+            "The move does not connect to the board correctly.".to_string()
+        }
+        rules_shared::MoveError::LetterNotAllowedInPosition => {
+            "A tile is not allowed at one of the chosen squares.".to_string()
+        }
+    }
+}
+
 async fn game_events(
     Path(_game_id): Path<String>,
     State(state): State<AppState>,
@@ -216,6 +391,247 @@ async fn stream_events(mut socket: WebSocket, mut rx: broadcast::Receiver<GameEv
             break;
         }
     }
+}
+
+// ========== Authentication Handlers ==========
+
+async fn register_player(
+    State(state): State<AppState>,
+    Json(request): Json<RegisterPlayerRequest>,
+) -> Result<Json<PlayerSessionDto>, ApiProblem> {
+    // Hash the recovery secret
+    let secret_hash = hash_secret(&request.recovery_secret);
+
+    let player_id = Uuid::new_v4().to_string();
+    let session_token = Uuid::new_v4().to_string();
+    let session_token_hash = hash_secret(&session_token);
+
+    // Create player
+    let _ = persistence::create_player(
+        &state.db,
+        &player_id,
+        &request.display_name,
+        &request.email,
+        &secret_hash,
+    )
+    .await
+    .map_err(|_| ApiProblem::bad_request("Failed to create player"))?;
+
+    // Create session
+    let _ = persistence::create_session(
+        &state.db,
+        &Uuid::new_v4().to_string(),
+        &player_id,
+        &session_token_hash,
+        None,
+    )
+    .await
+    .map_err(|_| ApiProblem::bad_request("Failed to create session"))?;
+
+    Ok(Json(PlayerSessionDto {
+        player_id,
+        session_token,
+        display_name: request.display_name,
+        email: request.email,
+    }))
+}
+
+async fn login_player(
+    State(state): State<AppState>,
+    Json(request): Json<LoginPlayerRequest>,
+) -> Result<Json<PlayerSessionDto>, ApiProblem> {
+    // Look up player by display name
+    let player = persistence::get_player_by_name(&state.db, &request.display_name)
+        .await
+        .map_err(|_| ApiProblem::bad_request("Database error"))?
+        .ok_or_else(|| ApiProblem::not_found("Player not found"))?;
+
+    // Verify recovery secret
+    let secret_hash = hash_secret(&request.recovery_secret);
+    if secret_hash != player.recovery_secret_hash {
+        return Err(ApiProblem::bad_request("Invalid recovery secret"));
+    }
+
+    // Create session
+    let session_token = Uuid::new_v4().to_string();
+    let session_token_hash = hash_secret(&session_token);
+    let _ = persistence::create_session(
+        &state.db,
+        &Uuid::new_v4().to_string(),
+        &player.id,
+        &session_token_hash,
+        None,
+    )
+    .await
+    .map_err(|_| ApiProblem::bad_request("Failed to create session"))?;
+
+    Ok(Json(PlayerSessionDto {
+        player_id: player.id,
+        session_token,
+        display_name: player.display_name,
+        email: player.email,
+    }))
+}
+
+async fn validate_session(
+    State(_state): State<AppState>,
+    Json(request): Json<ValidateSessionRequest>,
+) -> Result<Json<PlayerDto>, ApiProblem> {
+    let _session_token_hash = hash_secret(&request.session_token);
+
+    // Find session by token hash
+    // Note: In a real system, you'd want an index on token_hash for performance
+    // For now, we'll need to query differently or use a different approach
+    // This is a simplification - in production, store sessions in a faster cache
+
+    Err(ApiProblem::bad_request(
+        "Session validation not yet implemented",
+    ))
+}
+
+// ========== Game Invitation Handlers ==========
+
+async fn invite_player_to_game(
+    Path(game_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<InvitePlayerRequest>,
+) -> Result<Json<GameInvitationDto>, ApiProblem> {
+    // Get the game
+    let games = state.games.read().await;
+    let game = games
+        .get(&game_id)
+        .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+    // Verify the game is still in waiting state
+    if game.status != api::GameStatus::Waiting {
+        return Err(ApiProblem::bad_request(
+            "Game must be in waiting state to invite players",
+        ));
+    }
+
+    // Find the invited player
+    let invited_player = persistence::get_player_by_name(&state.db, &request.invited_display_name)
+        .await
+        .map_err(|_| ApiProblem::bad_request("Database error"))?
+        .ok_or_else(|| ApiProblem::not_found("Invited player not found"))?;
+
+    // For now, assume the first participant is the inviting player
+    let inviting_player_id = game
+        .participants
+        .first()
+        .and_then(|p| p.player_id.clone())
+        .ok_or_else(|| ApiProblem::bad_request("Cannot determine inviting player"))?;
+
+    // Create the invitation
+    let invitation_id = Uuid::new_v4().to_string();
+    let _ = persistence::create_invitation(
+        &state.db,
+        &invitation_id,
+        &game_id,
+        &invited_player.id,
+        &inviting_player_id,
+        request.seat_number,
+    )
+    .await
+    .map_err(|_| ApiProblem::bad_request("Failed to create invitation"))?;
+
+    Ok(Json(GameInvitationDto {
+        id: invitation_id,
+        game_id,
+        invited_player_id: invited_player.id,
+        inviting_player_id,
+        seat_number: request.seat_number,
+        status: InvitationStatus::Pending,
+        created_at: now_iso(),
+        responded_at: None,
+        inviting_player_display_name: game.participants[0].display_name.clone(),
+    }))
+}
+
+async fn list_player_invitations(
+    Path(player_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<GameInvitationDto>>, ApiProblem> {
+    let invitations = persistence::get_invitations_for_player(&state.db, &player_id)
+        .await
+        .map_err(|_| ApiProblem::bad_request("Database error"))?;
+
+    let mut result = Vec::new();
+    for inv in invitations {
+        let inviting_player = persistence::get_player_by_id(&state.db, &inv.inviting_player_id)
+            .await
+            .map_err(|_| ApiProblem::bad_request("Database error"))?;
+
+        if let Some(inviter) = inviting_player {
+            let status = match inv.status.as_str() {
+                "accepted" => InvitationStatus::Accepted,
+                "rejected" => InvitationStatus::Rejected,
+                "cancelled" => InvitationStatus::Cancelled,
+                _ => InvitationStatus::Pending,
+            };
+
+            result.push(GameInvitationDto {
+                id: inv.id,
+                game_id: inv.game_id,
+                invited_player_id: inv.invited_player_id,
+                inviting_player_id: inv.inviting_player_id,
+                seat_number: inv.seat_number,
+                status,
+                created_at: inv.created_at,
+                responded_at: inv.responded_at,
+                inviting_player_display_name: inviter.display_name,
+            });
+        }
+    }
+
+    Ok(Json(result))
+}
+
+async fn accept_invitation(
+    Path(invitation_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiProblem> {
+    persistence::update_invitation_status(&state.db, &invitation_id, "accepted")
+        .await
+        .map_err(|_| ApiProblem::bad_request("Failed to update invitation"))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "accepted"
+    })))
+}
+
+async fn reject_invitation(
+    Path(invitation_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiProblem> {
+    persistence::update_invitation_status(&state.db, &invitation_id, "rejected")
+        .await
+        .map_err(|_| ApiProblem::bad_request("Failed to update invitation"))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "rejected"
+    })))
+}
+
+// ========== Helper Functions ==========
+
+fn hash_secret(secret: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    secret.hash(&mut hasher);
+    format!("{:x}", hasher.finish())
+}
+
+fn now_iso() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_secs();
+    seconds.to_string()
 }
 
 fn run_engine_turns(game: &mut GameSession, engines: &EngineRegistry) -> Result<(), ApiProblem> {

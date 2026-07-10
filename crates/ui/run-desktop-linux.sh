@@ -33,7 +33,10 @@ run_web() {
 
     echo "Starting web UI on http://127.0.0.1:${WEB_PORT} ..."
     cd "${UI_DIR}"
-    SCRABBLE_PX_API_BASE_URL="${API_BASE_URL}" "${DIOXUS_DX}" serve --platform web --port "${WEB_PORT}"
+    # RUSTC_WRAPPER="" bypasses sccache (incompatible with WASM builds).
+    # CARGO_INCREMENTAL=0 prevents sccache errors if cargo sets it implicitly.
+    SCRABBLE_PX_API_BASE_URL="${API_BASE_URL}" RUSTC_WRAPPER="" CARGO_INCREMENTAL=0 \
+        "${DIOXUS_DX}" serve --platform web --port "${WEB_PORT}"
 }
 
 case "${MODE}" in

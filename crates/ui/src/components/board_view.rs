@@ -7,42 +7,61 @@ pub fn BoardView(
     board: Vec<BoardCellDto>,
     staged_placements: Vec<StagedPlacementView>,
     can_stage_moves: bool,
-    on_cell_click: EventHandler<usize>,
+    on_drop_tile: EventHandler<usize>,
+    on_remove_staged: EventHandler<usize>,
 ) -> Element {
     let cells = board.iter().enumerate().map(|(index, cell)| {
         let staged = staged_placements
             .iter()
             .find(|placement| placement.board_index == index);
-        let class_name = if cell.letter.is_some() {
+        let has_letter = cell.letter.is_some();
+        let is_staged = staged.is_some();
+        let can_drop = can_stage_moves && !has_letter && !is_staged;
+
+        let class_name = if has_letter {
             format!(
                 "board-cell {} board-cell-filled",
                 premium_class(&cell.premium)
             )
-        } else if staged.is_some() {
+        } else if is_staged {
             format!(
                 "board-cell {} board-cell-staged",
+                premium_class(&cell.premium)
+            )
+        } else if can_drop {
+            format!(
+                "board-cell {} board-cell-droptarget",
                 premium_class(&cell.premium)
             )
         } else {
             format!("board-cell {}", premium_class(&cell.premium))
         };
-        let is_clickable = can_stage_moves && cell.letter.is_none();
-        let button_class = if is_clickable {
-            format!("{class_name} board-cell-clickable")
-        } else {
-            class_name
-        };
 
         rsx! {
-            button {
+            div {
                 key: "{index}",
-                class: "{button_class}",
-                disabled: !is_clickable,
-                onclick: move |_| on_cell_click.call(index),
+                class: "{class_name}",
+                ondragover: move |event| {
+                    if can_drop {
+                        event.prevent_default();
+                    }
+                },
+                ondrop: move |event| {
+                    event.prevent_default();
+                    if can_drop {
+                        on_drop_tile.call(index);
+                    }
+                },
+                oncontextmenu: move |event| {
+                    if is_staged {
+                        event.prevent_default();
+                        on_remove_staged.call(index);
+                    }
+                },
                 if let Some(letter) = cell.letter {
                     div { class: "tile-face", "{letter}" }
                 } else if let Some(staged) = staged {
-                    div { class: "tile-face", "{staged.display}" }
+                    div { class: "tile-face tile-face-staged", "{staged.display}" }
                 } else {
                     div { class: "premium-label", "{premium_label(&cell.premium)}" }
                 }

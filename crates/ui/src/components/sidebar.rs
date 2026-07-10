@@ -30,11 +30,30 @@ pub fn Sidebar(
     });
 
     let history_items = moves.iter().map(|record| {
+        let word_link = record.main_word.as_deref().map(|word| {
+            let url = format!(
+                "https://www.collinsdictionary.com/dictionary/english/{}",
+                word.to_lowercase()
+            );
+            rsx! {
+                a {
+                    class: "history-word-link",
+                    href: "{url}",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "{word}"
+                }
+            }
+        });
+
         rsx! {
             div { key: "{record.move_number}", class: "history-item",
                 div { class: "history-row",
                     span { class: "history-badge", "#{record.move_number}" }
                     span { class: "history-type", "{record.move_type}" }
+                    if let Some(link) = word_link {
+                        {link}
+                    }
                 }
                 p { class: "history-copy", "{record.description}" }
             }

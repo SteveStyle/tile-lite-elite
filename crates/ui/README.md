@@ -1,198 +1,98 @@
-# 🎯 Scrabble Web & Desktop App
+# scrabble-ui
 
-A modern Scrabble game implementation built with **Dioxus** (Rust) that runs both as a web application and native desktop app.
+Dioxus-based client for the Scrabble PX server. Compiles to both a web WASM app and a native desktop app from the same source.
 
-## ✨ Features
+See [docs/operations.md](../../docs/operations.md) for full setup instructions.
 
-- 🎲 **Full 15x15 Scrabble Board** with authentic premium squares
-- 🎨 **Multiple Board Layouts**:
-  - Traditional Scrabble (US/UK/International standard)
-  - Wordfeud variant (more double letter squares)
-- 🖱️ **Interactive Gameplay** - Click tiles to place letters
-- 📱 **Responsive Design** - Works on desktop and mobile browsers
-- 🖥️ **Native Desktop App** - True Windows .exe application
-- 🎯 **Premium Square Highlighting** - Visual indicators for special squares
+## Quick Start
 
-## 🚀 Quick Start
+The UI is a thin client — **use the scripts in the root `scripts/` folder** to manage backend and clients.
 
-### Web Version
-```bash
-# Install Dioxus CLI
-cargo install dioxus-cli
+### Easiest Way (Scripts)
 
-# Run development server
-dx serve --port 3000
-
-# Open browser to http://127.0.0.1:3000
-```
-
-### Desktop Version (Windows)
-```bash
-# Build for desktop
-cargo build --release --features desktop
-
-# Run desktop app
-./target/release/scrabble-px
-```
-
-## 🛠️ Development
-
-### Project Structure
-```
-scrabble-px/
-├─ assets/                     # Static assets and styling
-│  ├─ favicon.ico
-│  ├─ header.svg
-│  └─ styling/                # CSS files
-│     ├─ main.css            # Main application styles
-│     ├─ navbar.css
-│     └─ echo.css
-├─ src/
-│  ├─ main.rs                # Application entry point
-│  ├─ components/            # Reusable UI components
-│  │  ├─ mod.rs
-│  │  ├─ scrabble_board.rs   # Main game board component
-│  │  ├─ hero.rs
-│  │  └─ echo.rs
-│  └─ views/                 # Page views
-│     ├─ mod.rs
-│     ├─ home.rs
-│     ├─ blog.rs
-│     └─ navbar.rs
-├─ Cargo.toml               # Dependencies and configuration
-├─ Dioxus.toml             # Dioxus framework configuration
-└─ build-windows.sh        # Windows build helper script
-```
-
-### Technologies Used
-
-- **[Dioxus](https://dioxuslabs.com/)** - Rust-based UI framework
-- **WebView2** - Native Windows desktop rendering
-- **CSS Grid/Flexbox** - Responsive board layout
-- **Rust/WebAssembly** - High-performance game logic
-
-### Board Layout Implementation
-
-The game implements authentic Scrabble board layouts with precise premium square positioning:
-
-- **Triple Word Score** (red): Corners and center cross
-- **Double Word Score** (pink): Diagonal pattern from center
-- **Triple Letter Score** (blue): Strategic positions for high-value letters  
-- **Double Letter Score** (light blue): Common letter multiplier positions
-
-## 🎮 How to Play
-
-1. **Select Board Layout**: Choose between Traditional or Wordfeud
-2. **Place Tiles**: Click on board squares to place letter tiles
-3. **Premium Squares**: Take advantage of multiplier squares for higher scores
-4. **Interactive**: Full click-to-place tile system
-
-## 🔧 Configuration
-
-### Web Features
-```toml
-[features]
-default = ["web"]
-web = ["dioxus/web"]
-```
-
-### Desktop Features  
-```toml
-[features]
-default = ["desktop"]
-desktop = ["dioxus/desktop"]
-```
-
-## 📦 Building for Distribution
-
-### Web Build
-```bash
-dx build --release
-# Files output to dist/ directory
-```
-
-### Windows Desktop Build
-```bash
-# Use the provided script for Windows-ready build
-./build-windows.sh
-
-# Or manually:
-cargo build --release --features desktop
-```
-
-## 🚀 Deployment
-
-### Web Deployment
-The web version can be deployed to any static hosting service:
-- GitHub Pages
-- Netlify  
-- Vercel
-- Apache/Nginx
-
-### Desktop Distribution
-The Windows desktop version creates a standalone `.exe` file that can be:
-- Distributed directly to users
-- Added to Windows Start Menu
-- Packaged with an installer
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🎯 Roadmap
-
-- [ ] Score calculation system
-- [ ] Dictionary validation
-- [ ] Multiplayer support
-- [ ] Game save/load functionality
-- [ ] AI opponent
-- [ ] Custom tile sets
-- [ ] Sound effects
-- [ ] Game history tracking
-
-## 🐛 Known Issues
-
-- None currently reported
-
-## 📞 Support
-
-If you encounter any issues or have questions:
-1. Check the [Issues](../../issues) page
-2. Create a new issue with detailed information
-3. Include your OS, browser, and Rust version
-
----
-
-**Built with ❤️ using Rust and Dioxus**
-│  ├─ components/
-│  │  ├─ mod.rs # Defines the components module
-│  │  ├─ hero.rs # The Hero component for use in the home page
-│  │  ├─ echo.rs # The echo component uses server functions to communicate with the server
-│  ├─ views/ # The views each route will render in the app.
-│  │  ├─ mod.rs # Defines the module for the views route and re-exports the components for each route
-│  │  ├─ blog.rs # The component that will render at the /blog/:id route
-│  │  ├─ home.rs # The component that will render at the / route
-├─ Cargo.toml # The Cargo.toml file defines the dependencies and feature flags for your project
-```
-
-### Serving Your App
-
-Run the following command in the root of your project to start developing with the default platform:
+From the workspace root:
 
 ```bash
-dx serve --platform web
+# Start backend server + web client (background)
+./scripts/services.sh start
+
+# Launch a desktop client (can run multiple times)
+./scripts/desktop.sh
+
+# Check status
+./scripts/services.sh status
+
+# Stop all
+./scripts/services.sh stop
 ```
 
-To run for a different platform, use the `--platform platform` flag. E.g.
+### Manual Startup
+
+If you prefer manual control:
+
+#### 1. Start the backend (from workspace root)
+
 ```bash
-dx serve --platform desktop
+cargo run -p server-game
+# Listening on http://127.0.0.1:3000
 ```
+
+### 2a. Web client (manual)
+
+```bash
+RUSTC_WRAPPER="" CARGO_INCREMENTAL=0 ~/.cargo/bin/dx serve --platform web --port 8080
+# Open http://127.0.0.1:8080
+```
+
+### 2b. Desktop client (manual)
+
+```bash
+SCRABBLE_PX_API_BASE_URL=http://127.0.0.1:3000 cargo run -p scrabble-ui --features desktop
+```
+
+## How to Play
+
+1. Click **New Human vs Engine** to create a game, then **Start**.
+2. **Drag** a tile from the rack onto an empty board square to stage it.
+3. **Right-click** a staged tile on the board to remove it.
+4. The preview banner shows legality and score as you stage tiles.
+5. Click **Submit Staged Move** to play, or **Play Suggested Move** to let the engine choose.
+6. Words in the move history are linked to the Collins Dictionary.
+
+## Project Structure
+
+```
+crates/ui/
+├── assets/styling/main.css   # All CSS
+├── src/
+│   ├── app.rs                # Root component, all state signals, event handlers
+│   ├── main.rs               # Dioxus entry point
+│   ├── components/
+│   │   ├── board_view.rs     # 15×15 board with drag-and-drop
+│   │   ├── rack_view.rs      # Draggable tile rack
+│   │   └── sidebar.rs        # Scores, move history, Collins links
+│   └── views/
+│       └── home.rs           # Main game layout
+├── Cargo.toml
+├── Dioxus.toml
+├── run-desktop-linux.sh      # Launch helper (web or desktop)
+└── build-windows.sh          # Cross-compile for Windows
+```
+
+## Dependencies
+
+| Crate | Purpose |
+|---|---|
+| `dioxus` | UI framework (web + desktop from shared code) |
+| `api` | Shared DTOs with the server |
+| `gloo-net` | HTTP + WebSocket for WASM target |
+| `reqwest` | HTTP client for native desktop target |
+| `tokio-tungstenite` | WebSocket for native desktop target |
+
+## Build Notes
+
+- Web builds require `RUSTC_WRAPPER=""` to bypass sccache (sccache and WASM targets conflict).
+- `+reference-types,+multivalue` WASM target features are set in `.cargo/config.toml` — required by wasm-bindgen 0.2.103.
+- `wasm-bindgen-cli` must match the version in `Cargo.lock`: `cargo install wasm-bindgen-cli --version 0.2.103`.
+
 

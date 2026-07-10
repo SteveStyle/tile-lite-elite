@@ -1,11 +1,10 @@
 [build]
 # Use compiler cache to speed up repeated local builds (including wasm dev builds).
-rustc-wrapper = "sccache"
-
-[env]
-# Keep incremental artifacts for dev loops.
-CARGO_INCREMENTAL = "1"
+rustc-wrapper = "/home/steve/.cargo/bin/sccache"
 
 [target.x86_64-pc-windows-gnu]
 linker = "x86_64-w64-mingw32-gcc"
 ar = "x86_64-w64-mingw32-ar"
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+reference-types,+multivalue"]
