@@ -1,1 +1,0 @@
-/home/vagrant/scrabble-px/target/wasm32-unknown-unknown/wasm-dev/scrabble-px.wasm: /home/vagrant/scrabble-px/src/components/mod.rs /home/vagrant/scrabble-px/src/components/scrabble_board.rs /home/vagrant/scrabble-px/src/main.rs
