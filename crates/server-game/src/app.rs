@@ -98,9 +98,25 @@ async fn list_engines(State(state): State<AppState>) -> Json<Vec<api::EngineProf
     Json(state.engines.metadata())
 }
 
-async fn list_games(State(state): State<AppState>) -> Json<Vec<String>> {
+async fn list_games(State(state): State<AppState>) -> Result<Json<Vec<api::GameSummaryDto>>, ApiProblem> {
+    let last_activity = persistence::last_activity_by_game(&state.db)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
     let games = state.games.read().await;
-    Json(games.keys().cloned().collect())
+    let mut summaries: Vec<api::GameSummaryDto> = games
+        .values()
+        .map(|game| {
+            let last_activity_at = last_activity
+                .get(&game.id)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string());
+            game.to_summary_dto(last_activity_at)
+        })
+        .collect();
+    summaries.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+
+    Ok(Json(summaries))
 }
 
 async fn create_game(
@@ -813,8 +829,18 @@ mod tests {
 
         let listed_response = send_empty(app.clone(), Method::GET, "/games").await;
         assert_eq!(listed_response.status(), StatusCode::OK);
-        let listed: Vec<String> = read_json(listed_response).await;
-        assert!(listed.contains(&created.id));
+        let listed: Vec<api::GameSummaryDto> = read_json(listed_response).await;
+        let summary = listed
+            .iter()
+            .find(|summary| summary.id == created.id)
+            .expect("created game should appear in the summary list");
+        assert_eq!(summary.status, api::GameStatus::Waiting);
+        assert_eq!(summary.participants.len(), 2);
+        assert!(
+            !summary.last_activity_at.is_empty() && summary.last_activity_at != "unknown",
+            "expected a real timestamp, got {:?}",
+            summary.last_activity_at
+        );
 
         let fetched_response =
             send_empty(app, Method::GET, &format!("/games/{}", created.id)).await;

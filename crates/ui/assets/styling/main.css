@@ -49,10 +49,6 @@ button:disabled {
 }
 
 .topbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: end;
-    gap: 16px;
     margin-bottom: 20px;
 }
 
@@ -103,8 +99,9 @@ button:disabled {
 
 .workspace-shell {
     display: grid;
-    grid-template-columns: minmax(0, 1.8fr) minmax(320px, 0.9fr);
+    grid-template-columns: minmax(220px, 0.7fr) minmax(0, 1.7fr) minmax(260px, 0.85fr);
     gap: 20px;
+    align-items: start;
 }
 
 .workspace-main {
@@ -115,6 +112,7 @@ button:disabled {
 .hero-panel,
 .board-panel,
 .rack-panel,
+.games-panel,
 .sidebar-card {
     background: var(--panel);
     backdrop-filter: blur(8px);
@@ -172,6 +170,20 @@ button:disabled {
 .board-panel,
 .rack-panel {
     padding: 22px;
+}
+
+.status-strip {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.turn-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 16px;
 }
 
 .panel-header {
@@ -437,15 +449,97 @@ button:disabled {
     background: linear-gradient(160deg, rgba(138, 160, 123, 0.24), rgba(255, 251, 243, 0.92));
 }
 
+.games-panel {
+    padding: 22px;
+}
+
+.games-panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.games-panel-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.games-panel-actions .toggle-button,
+.games-panel-actions .toggle-button-muted {
+    padding: 8px 14px;
+    font-size: 0.85rem;
+}
+
+.games-list {
+    display: grid;
+    gap: 10px;
+}
+
+.game-row {
+    display: block;
+    width: 100%;
+    text-align: left;
+    border: 1px solid rgba(111, 75, 44, 0.1);
+    border-radius: 16px;
+    padding: 12px 14px;
+    background: rgba(255, 255, 255, 0.6);
+    cursor: pointer;
+}
+
+.game-row-active {
+    background: rgba(212, 162, 58, 0.22);
+    border-color: rgba(212, 162, 58, 0.4);
+}
+
+.game-row-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+}
+
+.game-row-time {
+    font-size: 0.78rem;
+    color: rgba(35, 25, 15, 0.6);
+}
+
+.game-row-participants {
+    margin-top: 8px;
+    font-size: 0.88rem;
+    color: rgba(35, 25, 15, 0.78);
+}
+
+.game-status-badge {
+    border-radius: 999px;
+    padding: 4px 10px;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.game-status-waiting {
+    background: rgba(157, 198, 216, 0.4);
+}
+
+.game-status-active {
+    background: rgba(138, 160, 123, 0.35);
+}
+
+.game-status-finished {
+    background: rgba(111, 75, 44, 0.14);
+}
+
 .seat-list,
-.history-list {
+.recent-move-list {
     display: grid;
     gap: 12px;
     margin-top: 14px;
 }
 
 .seat-card,
-.history-item {
+.recent-move-row {
     border-radius: 18px;
     background: rgba(255, 255, 255, 0.66);
     border: 1px solid rgba(111, 75, 44, 0.08);
@@ -459,34 +553,47 @@ button:disabled {
 
 .seat-heading,
 .seat-meta,
-.history-row {
+.recent-move-row {
     display: flex;
     justify-content: space-between;
     gap: 12px;
     align-items: center;
 }
 
-.seat-meta,
-.history-type {
+.seat-meta {
     font-size: 0.88rem;
     color: rgba(35, 25, 15, 0.7);
 }
 
-.history-copy {
-    margin-top: 8px;
+.recent-move-row-muted {
+    background: rgba(217, 143, 139, 0.14);
+    border-color: rgba(217, 143, 139, 0.3);
+    color: rgba(138, 45, 30, 0.85);
+    font-style: italic;
 }
 
-.history-word-link {
+.recent-move-player {
+    font-weight: 700;
+}
+
+.recent-move-score {
+    font-weight: 700;
+    color: rgba(35, 25, 15, 0.75);
+}
+
+.recent-move-note {
+    font-size: 0.88rem;
+}
+
+.recent-move-word {
     font-weight: 600;
     color: rgba(35, 25, 15, 0.85);
     text-decoration: underline;
     text-decoration-color: rgba(212, 162, 58, 0.7);
     text-underline-offset: 2px;
-    font-size: 0.9rem;
-    letter-spacing: 0.03em;
 }
 
-.history-word-link:hover {
+.recent-move-word:hover {
     color: rgba(160, 90, 10, 1);
     text-decoration-color: rgba(160, 90, 10, 0.8);
 }

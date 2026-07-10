@@ -15,6 +15,8 @@ use gloo_net::{
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::connect_async;
 
+use crate::components::games_panel::GamesPanel;
+use crate::components::sidebar::Sidebar;
 use crate::views::Home;
 
 const MAIN_CSS: Asset = asset!("/assets/styling/main.css");
@@ -57,8 +59,9 @@ pub fn RootApp() -> Element {
         .unwrap_or("http://127.0.0.1:3000")
         .to_string();
     let mut game = use_signal(|| None::<GameStateDto>);
+    let mut game_summaries = use_signal(Vec::<api::GameSummaryDto>::new);
     let mut is_loading = use_signal(|| false);
-    let mut info_message = use_signal(|| Some("Loading latest game from server...".to_string()));
+    let mut info_message = use_signal(|| Some("Loading games from server...".to_string()));
     let mut error_message = use_signal(|| None::<String>);
     let mut bootstrapped = use_signal(|| false);
     let mut websocket_game_id = use_signal(|| None::<String>);
@@ -72,18 +75,27 @@ pub fn RootApp() -> Element {
         spawn(async move {
             is_loading.set(true);
             error_message.set(None);
-            match load_latest_game(&server_url).await {
-                Ok(Some(loaded)) => {
-                    info_message.set(Some(format!("Loaded game {}", loaded.id)));
-                    dragging_tile_id.set(None);
-                    selected_blank_letter.set(None);
-                    staged_placements.set(Vec::new());
-                    game.set(Some(loaded));
-                }
-                Ok(None) => {
-                    info_message.set(Some(
-                        "No server game loaded yet. Create one to begin.".to_string(),
-                    ));
+            match load_game_summaries(&server_url).await {
+                Ok(summaries) => {
+                    let most_recent_id = summaries.first().map(|summary| summary.id.clone());
+                    game_summaries.set(summaries);
+                    match most_recent_id {
+                        Some(game_id) => match load_game_by_id(&server_url, &game_id).await {
+                            Ok(loaded) => {
+                                info_message.set(Some(format!("Loaded game {}", loaded.id)));
+                                dragging_tile_id.set(None);
+                                selected_blank_letter.set(None);
+                                staged_placements.set(Vec::new());
+                                game.set(Some(loaded));
+                            }
+                            Err(error) => error_message.set(Some(error)),
+                        },
+                        None => {
+                            info_message.set(Some(
+                                "No games yet. Create one to begin.".to_string(),
+                            ));
+                        }
+                    }
                 }
                 Err(error) => {
                     error_message.set(Some(error));
@@ -144,12 +156,12 @@ pub fn RootApp() -> Element {
     }
     let staged_preview = staged_preview();
     let server_url_for_create = server_url.clone();
-    let server_url_for_reload = server_url.clone();
+    let server_url_for_refresh = server_url.clone();
+    let server_url_for_select = server_url.clone();
     let server_url_for_start = server_url.clone();
     let server_url_for_suggested = server_url.clone();
     let server_url_for_pass = server_url.clone();
     let server_url_for_manual = server_url.clone();
-    let server_url_for_view = server_url.clone();
     let game_for_home = game_for_view.clone();
     let game_for_board_drop = game_for_view.clone();
 
@@ -158,266 +170,259 @@ pub fn RootApp() -> Element {
 
         div { class: "app-shell",
             header { class: "topbar",
-                div {
-                    p { class: "topbar-kicker", "Scrabble PX" }
-                    h1 { class: "topbar-title", "Thin client surface for the authoritative server" }
-                }
-                div { class: "topbar-actions",
-                    button {
-                        class: "toggle-button",
-                        disabled: is_loading(),
-                        onclick: move |_| {
-                            let server_url = server_url_for_create.clone();
-                            spawn(async move {
-                                is_loading.set(true);
-                                error_message.set(None);
-                                match create_default_game(&server_url).await {
-                                    Ok(created) => {
-                                        info_message.set(Some(format!("Created game {}", created.id)));
-                                        dragging_tile_id.set(None);
-                                        selected_blank_letter.set(None);
-                                        staged_placements.set(Vec::new());
-                                        websocket_game_id.set(None);
-                                        game.set(Some(created));
-                                    }
-                                    Err(error) => error_message.set(Some(error)),
-                                }
-                                is_loading.set(false);
-                            });
-                        },
-                        "New Human vs Engine"
-                    }
-                    button {
-                        class: "toggle-button toggle-button-muted",
-                        disabled: is_loading(),
-                        onclick: move |_| {
-                            let server_url = server_url_for_reload.clone();
-                            spawn(async move {
-                                is_loading.set(true);
-                                error_message.set(None);
-                                match load_latest_game(&server_url).await {
-                                    Ok(Some(loaded)) => {
-                                        info_message.set(Some(format!("Reloaded game {}", loaded.id)));
-                                        dragging_tile_id.set(None);
-                                        selected_blank_letter.set(None);
-                                        staged_placements.set(Vec::new());
-                                        websocket_game_id.set(None);
-                                        game.set(Some(loaded));
-                                    }
-                                    Ok(None) => {
-                                        info_message.set(Some("No games found on the server.".to_string()));
-                                        game.set(None);
-                                    }
-                                    Err(error) => error_message.set(Some(error)),
-                                }
-                                is_loading.set(false);
-                            });
-                        },
-                        "Reload"
-                    }
-                    button {
-                        class: "toggle-button toggle-button-muted",
-                        disabled: is_loading() || !can_start,
-                        onclick: move |_| {
-                            let server_url = server_url_for_start.clone();
-                            let current_game = game().clone();
-                            if let Some(current_game) = current_game {
-                                spawn(async move {
-                                    is_loading.set(true);
-                                    error_message.set(None);
-                                    match start_game(&server_url, &current_game.id).await {
-                                        Ok(updated) => {
-                                            info_message.set(Some(format!("Started game {}", updated.id)));
-                                            dragging_tile_id.set(None);
-                                            selected_blank_letter.set(None);
-                                            staged_placements.set(Vec::new());
-                                            game.set(Some(updated));
-                                        }
-                                        Err(error) => error_message.set(Some(error)),
-                                    }
-                                    is_loading.set(false);
-                                });
-                            }
-                        },
-                        "Start"
-                    }
-                    button {
-                        class: "toggle-button toggle-button-muted",
-                        disabled: is_loading() || !can_submit_human_action,
-                        onclick: move |_| {
-                            let server_url = server_url_for_suggested.clone();
-                            let current_game = game().clone();
-                            if let Some(current_game) = current_game {
-                                spawn(async move {
-                                    is_loading.set(true);
-                                    error_message.set(None);
-                                    match submit_suggested_move(&server_url, &current_game).await {
-                                        Ok(updated) => {
-                                            info_message.set(Some("Submitted suggested move.".to_string()));
-                                            dragging_tile_id.set(None);
-                                            selected_blank_letter.set(None);
-                                            staged_placements.set(Vec::new());
-                                            game.set(Some(updated));
-                                        }
-                                        Err(error) => error_message.set(Some(error)),
-                                    }
-                                    is_loading.set(false);
-                                });
-                            }
-                        },
-                        "Play Suggested Move"
-                    }
-                    button {
-                        class: "toggle-button toggle-button-muted",
-                        disabled: is_loading() || !can_submit_human_action,
-                        onclick: move |_| {
-                            let server_url = server_url_for_pass.clone();
-                            let current_game = game().clone();
-                            if let Some(current_game) = current_game {
-                                spawn(async move {
-                                    is_loading.set(true);
-                                    error_message.set(None);
-                                    match submit_pass(&server_url, &current_game).await {
-                                        Ok(updated) => {
-                                            info_message.set(Some("Submitted pass action.".to_string()));
-                                            dragging_tile_id.set(None);
-                                            selected_blank_letter.set(None);
-                                            staged_placements.set(Vec::new());
-                                            game.set(Some(updated));
-                                        }
-                                        Err(error) => error_message.set(Some(error)),
-                                    }
-                                    is_loading.set(false);
-                                });
-                            }
-                        },
-                        "Pass"
-                    }
-                    button {
-                        class: "toggle-button toggle-button-muted",
-                        disabled: is_loading() || !can_submit_manual_action,
-                        onclick: move |_| {
-                            let server_url = server_url_for_manual.clone();
-                            let current_game = game().clone();
-                            let staged = staged_placements().clone();
-                            if let Some(current_game) = current_game {
-                                spawn(async move {
-                                    is_loading.set(true);
-                                    error_message.set(None);
-                                    match submit_manual_move(
-                                            &server_url,
-                                            &current_game,
-                                            &staged,
-                                            DirectionDto::Horizontal,
-                                        )
-                                        .await
-                                    {
-                                        Ok(updated) => {
-                                            info_message.set(Some("Submitted staged move.".to_string()));
-                                            dragging_tile_id.set(None);
-                                            selected_blank_letter.set(None);
-                                            staged_placements.set(Vec::new());
-                                            game.set(Some(updated));
-                                        }
-                                        Err(error) => error_message.set(Some(error)),
-                                    }
-                                    is_loading.set(false);
-                                });
-                            }
-                        },
-                        "Submit Staged Move"
-                    }
-                }
+                p { class: "topbar-kicker", "Scrabble PX" }
             }
 
-            Home {
-                game: game_for_home,
-                server_url: server_url_for_view,
-                is_live: game().is_some(),
-                is_loading: is_loading(),
-                info_message: info_message().clone(),
-                error_message: error_message().clone(),
-                rack_tiles,
-                staged_placements: staged_placements().clone(),
-                can_stage_moves: can_submit_human_action,
-                on_drag_rack_tile: move |tile_id| {
-                    dragging_tile_id.set(Some(tile_id));
-                },
-                on_drag_end_rack_tile: move |_| {
-                    dragging_tile_id.set(None);
-                },
-                on_drop_board_cell: move |board_index| {
-                    if !can_submit_human_action {
-                        return;
-                    }
-                    if game_for_board_drop
-                        .board
-                        .get(board_index)
-                        .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
-                    {
-                        return;
-                    }
-                    if staged_placements()
-                        .iter()
-                        .any(|p| p.board_index == board_index)
-                    {
-                        return;
-                    }
-                    let Some(tile_id) = dragging_tile_id() else {
-                        return;
-                    };
-                    let Some(tile) = current_rack_tiles(&game_for_board_drop, &staged_placements())
-                        .into_iter()
-                        .find(|t| t.id == tile_id)
-                        else {
-                        dragging_tile_id.set(None);
-                        return;
-                    };
-                    let (tile_for_board, display_for_board) = match tile.tile.clone() {
-                        TileDto::Blank { .. } => (TileDto::Blank { acting_as: None }, '?'),
-                        other => (other, tile.display),
-                    };
-                    staged_placements
-                        .with_mut(|placements| {
-                            placements
-                                .push(StagedPlacementView {
-                                    board_index,
-                                    rack_tile_id: tile.id,
-                                    display: display_for_board,
-                                    tile: tile_for_board,
-                                });
-                        });
-                    dragging_tile_id.set(None);
-                },
-                on_clear_staged: move |_| {
-                    dragging_tile_id.set(None);
-                    selected_blank_letter.set(None);
-                    staged_placements.set(Vec::new());
-                    info_message.set(Some("Cleared staged placements.".to_string()));
-                },
-                on_remove_staged: move |board_index| {
-                    staged_placements
-                        .with_mut(|placements| {
-                            placements.retain(|p| p.board_index != board_index);
-                        });
-                },
-                on_set_blank_letter: move |letter| {
-                    selected_blank_letter.set(Some(letter));
-                    staged_placements
-                        .with_mut(|placements| {
-                            if let Some(placement) = placements
-                                .iter_mut()
-                                .find(|p| matches!(p.tile, TileDto::Blank { acting_as: None }))
-                            {
-                                placement.tile = TileDto::Blank {
-                                    acting_as: Some(letter),
-                                };
-                                placement.display = letter.to_ascii_lowercase();
+            div { class: "workspace-shell",
+                GamesPanel {
+                    summaries: game_summaries().clone(),
+                    selected_id: game().as_ref().map(|current| current.id.clone()),
+                    is_loading: is_loading(),
+                    on_select: move |game_id: String| {
+                        let server_url = server_url_for_select.clone();
+                        spawn(async move {
+                            is_loading.set(true);
+                            error_message.set(None);
+                            match load_game_by_id(&server_url, &game_id).await {
+                                Ok(loaded) => {
+                                    info_message.set(Some(format!("Loaded game {}", loaded.id)));
+                                    dragging_tile_id.set(None);
+                                    selected_blank_letter.set(None);
+                                    staged_placements.set(Vec::new());
+                                    websocket_game_id.set(None);
+                                    game.set(Some(loaded));
+                                }
+                                Err(error) => error_message.set(Some(error)),
                             }
+                            is_loading.set(false);
                         });
-                },
-                selected_blank_letter: selected_blank_letter(),
-                staged_preview,
+                    },
+                    on_new_game: move |_| {
+                        let server_url = server_url_for_create.clone();
+                        spawn(async move {
+                            is_loading.set(true);
+                            error_message.set(None);
+                            match create_default_game(&server_url).await {
+                                Ok(created) => {
+                                    info_message.set(Some(format!("Created game {}", created.id)));
+                                    dragging_tile_id.set(None);
+                                    selected_blank_letter.set(None);
+                                    staged_placements.set(Vec::new());
+                                    websocket_game_id.set(None);
+                                    game.set(Some(created));
+                                    if let Ok(summaries) = load_game_summaries(&server_url).await {
+                                        game_summaries.set(summaries);
+                                    }
+                                }
+                                Err(error) => error_message.set(Some(error)),
+                            }
+                            is_loading.set(false);
+                        });
+                    },
+                    on_refresh: move |_| {
+                        let server_url = server_url_for_refresh.clone();
+                        spawn(async move {
+                            is_loading.set(true);
+                            error_message.set(None);
+                            match load_game_summaries(&server_url).await {
+                                Ok(summaries) => game_summaries.set(summaries),
+                                Err(error) => error_message.set(Some(error)),
+                            }
+                            is_loading.set(false);
+                        });
+                    },
+                }
+
+                Home {
+                    game: game_for_home,
+                    is_live: game().is_some(),
+                    is_loading: is_loading(),
+                    info_message: info_message().clone(),
+                    error_message: error_message().clone(),
+                    rack_tiles,
+                    staged_placements: staged_placements().clone(),
+                    can_stage_moves: can_submit_human_action,
+                    on_drag_rack_tile: move |tile_id| {
+                        dragging_tile_id.set(Some(tile_id));
+                    },
+                    on_drag_end_rack_tile: move |_| {
+                        dragging_tile_id.set(None);
+                    },
+                    on_drop_board_cell: move |board_index| {
+                        if !can_submit_human_action {
+                            return;
+                        }
+                        if game_for_board_drop
+                            .board
+                            .get(board_index)
+                            .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
+                        {
+                            return;
+                        }
+                        if staged_placements()
+                            .iter()
+                            .any(|p| p.board_index == board_index)
+                        {
+                            return;
+                        }
+                        let Some(tile_id) = dragging_tile_id() else {
+                            return;
+                        };
+                        let Some(tile) = current_rack_tiles(&game_for_board_drop, &staged_placements())
+                            .into_iter()
+                            .find(|t| t.id == tile_id)
+                            else {
+                            dragging_tile_id.set(None);
+                            return;
+                        };
+                        let (tile_for_board, display_for_board) = match tile.tile.clone() {
+                            TileDto::Blank { .. } => (TileDto::Blank { acting_as: None }, '?'),
+                            other => (other, tile.display),
+                        };
+                        staged_placements
+                            .with_mut(|placements| {
+                                placements
+                                    .push(StagedPlacementView {
+                                        board_index,
+                                        rack_tile_id: tile.id,
+                                        display: display_for_board,
+                                        tile: tile_for_board,
+                                    });
+                            });
+                        dragging_tile_id.set(None);
+                    },
+                    on_clear_staged: move |_| {
+                        dragging_tile_id.set(None);
+                        selected_blank_letter.set(None);
+                        staged_placements.set(Vec::new());
+                        info_message.set(Some("Cleared staged placements.".to_string()));
+                    },
+                    on_remove_staged: move |board_index| {
+                        staged_placements
+                            .with_mut(|placements| {
+                                placements.retain(|p| p.board_index != board_index);
+                            });
+                    },
+                    on_set_blank_letter: move |letter| {
+                        selected_blank_letter.set(Some(letter));
+                        staged_placements
+                            .with_mut(|placements| {
+                                if let Some(placement) = placements
+                                    .iter_mut()
+                                    .find(|p| matches!(p.tile, TileDto::Blank { acting_as: None }))
+                                {
+                                    placement.tile = TileDto::Blank {
+                                        acting_as: Some(letter),
+                                    };
+                                    placement.display = letter.to_ascii_lowercase();
+                                }
+                            });
+                    },
+                    selected_blank_letter: selected_blank_letter(),
+                    staged_preview,
+                    can_start,
+                    on_start: move |_| {
+                        let server_url = server_url_for_start.clone();
+                        let current_game = game().clone();
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match start_game(&server_url, &current_game.id).await {
+                                    Ok(updated) => {
+                                        info_message.set(Some(format!("Started game {}", updated.id)));
+                                        dragging_tile_id.set(None);
+                                        selected_blank_letter.set(None);
+                                        staged_placements.set(Vec::new());
+                                        game.set(Some(updated));
+                                    }
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    can_submit_suggested: can_submit_human_action,
+                    on_submit_suggested: move |_| {
+                        let server_url = server_url_for_suggested.clone();
+                        let current_game = game().clone();
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match submit_suggested_move(&server_url, &current_game).await {
+                                    Ok(updated) => {
+                                        info_message.set(Some("Submitted suggested move.".to_string()));
+                                        dragging_tile_id.set(None);
+                                        selected_blank_letter.set(None);
+                                        staged_placements.set(Vec::new());
+                                        game.set(Some(updated));
+                                    }
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    can_pass: can_submit_human_action,
+                    on_pass: move |_| {
+                        let server_url = server_url_for_pass.clone();
+                        let current_game = game().clone();
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match submit_pass(&server_url, &current_game).await {
+                                    Ok(updated) => {
+                                        info_message.set(Some("Submitted pass action.".to_string()));
+                                        dragging_tile_id.set(None);
+                                        selected_blank_letter.set(None);
+                                        staged_placements.set(Vec::new());
+                                        game.set(Some(updated));
+                                    }
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    can_submit_manual: can_submit_manual_action,
+                    on_submit_manual: move |_| {
+                        let server_url = server_url_for_manual.clone();
+                        let current_game = game().clone();
+                        let staged = staged_placements().clone();
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match submit_manual_move(
+                                        &server_url,
+                                        &current_game,
+                                        &staged,
+                                        DirectionDto::Horizontal,
+                                    )
+                                    .await
+                                {
+                                    Ok(updated) => {
+                                        info_message.set(Some("Submitted staged move.".to_string()));
+                                        dragging_tile_id.set(None);
+                                        selected_blank_letter.set(None);
+                                        staged_placements.set(Vec::new());
+                                        game.set(Some(updated));
+                                    }
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                }
+
+                Sidebar {
+                    participants: game_for_view.participants.clone(),
+                    moves: game_for_view.moves.clone(),
+                    current_seat: game_for_view.current_seat,
+                }
             }
         }
     }
@@ -493,16 +498,12 @@ fn mirrored_positions(x: u8, y: u8) -> [(u8, u8); 4] {
     [(x, y), (max - x, y), (x, max - y), (max - x, max - y)]
 }
 
-async fn load_latest_game(server_url: &str) -> Result<Option<GameStateDto>, String> {
-    let ids = get_json::<Vec<String>>(&format!("{server_url}/games")).await?;
+async fn load_game_summaries(server_url: &str) -> Result<Vec<api::GameSummaryDto>, String> {
+    get_json::<Vec<api::GameSummaryDto>>(&format!("{server_url}/games")).await
+}
 
-    let Some(game_id) = ids.first() else {
-        return Ok(None);
-    };
-
-    let game = get_json::<GameStateDto>(&format!("{server_url}/games/{game_id}")).await?;
-
-    Ok(Some(game))
+async fn load_game_by_id(server_url: &str, game_id: &str) -> Result<GameStateDto, String> {
+    get_json::<GameStateDto>(&format!("{server_url}/games/{game_id}")).await
 }
 
 async fn create_default_game(server_url: &str) -> Result<GameStateDto, String> {

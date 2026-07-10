@@ -127,6 +127,30 @@ impl GameSession {
         self.current_seat = 0;
     }
 
+    /// A lightweight summary for games-list views. `last_activity_at` is
+    /// supplied by the caller since move timestamps live in the persistence
+    /// layer, not on `GameSession` itself.
+    pub fn to_summary_dto(&self, last_activity_at: String) -> api::GameSummaryDto {
+        api::GameSummaryDto {
+            id: self.id.clone(),
+            status: self.status.clone(),
+            current_seat: self.current_seat,
+            participants: self
+                .participants
+                .iter()
+                .map(|participant| ParticipantDto {
+                    seat_number: participant.seat_number,
+                    kind: participant.kind.clone(),
+                    display_name: participant.display_name.clone(),
+                    player_id: participant.player_id.clone(),
+                    engine_id: participant.engine_id.clone(),
+                    score: participant.score,
+                })
+                .collect(),
+            last_activity_at,
+        }
+    }
+
     pub fn to_dto(&self) -> GameStateDto {
         GameStateDto {
             id: self.id.clone(),

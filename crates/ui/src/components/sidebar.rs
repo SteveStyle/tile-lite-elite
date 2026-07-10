@@ -1,13 +1,12 @@
-use api::{GameStatus, MoveRecordDto, ParticipantDto};
+use api::{MoveRecordDto, ParticipantDto};
 use dioxus::prelude::*;
 
+/// Only the most recent moves are shown — this is a live-play glance, not
+/// a full game log.
+const RECENT_MOVES_LIMIT: usize = 8;
+
 #[component]
-pub fn Sidebar(
-    participants: Vec<ParticipantDto>,
-    moves: Vec<MoveRecordDto>,
-    current_seat: u8,
-    status: GameStatus,
-) -> Element {
+pub fn Sidebar(participants: Vec<ParticipantDto>, moves: Vec<MoveRecordDto>, current_seat: u8) -> Element {
     let seat_cards = participants.iter().map(|participant| {
         let class_name = if participant.seat_number == current_seat {
             "seat-card seat-card-active"
@@ -29,33 +28,42 @@ pub fn Sidebar(
         }
     });
 
-    let history_items = moves.iter().map(|record| {
-        let word_link = record.main_word.as_deref().map(|word| {
+    let recent_moves = moves.iter().rev().take(RECENT_MOVES_LIMIT).map(|record| {
+        let player_name = participant_name(&participants, record.seat_number);
+        let is_scoring_play = record.move_type == "place";
+        let row_class = if is_scoring_play {
+            "recent-move-row"
+        } else {
+            "recent-move-row recent-move-row-muted"
+        };
+
+        let detail = if is_scoring_play {
+            let word = record.main_word.clone().unwrap_or_default();
             let url = format!(
                 "https://www.collinsdictionary.com/dictionary/english/{}",
                 word.to_lowercase()
             );
             rsx! {
+                span { class: "recent-move-score", "{record.score_delta}" }
                 a {
-                    class: "history-word-link",
+                    class: "recent-move-word",
                     href: "{url}",
                     target: "_blank",
                     rel: "noopener noreferrer",
                     "{word}"
                 }
             }
-        });
+        } else {
+            let note = action_note(record);
+            rsx! {
+                span { class: "recent-move-note", "{note}" }
+            }
+        };
 
         rsx! {
-            div { key: "{record.move_number}", class: "history-item",
-                div { class: "history-row",
-                    span { class: "history-badge", "#{record.move_number}" }
-                    span { class: "history-type", "{record.move_type}" }
-                    if let Some(link) = word_link {
-                        {link}
-                    }
-                }
-                p { class: "history-copy", "{record.description}" }
+            div { key: "{record.move_number}", class: "{row_class}",
+                span { class: "recent-move-player", "{player_name}" }
+                {detail}
             }
         }
     });
@@ -63,31 +71,46 @@ pub fn Sidebar(
     rsx! {
         aside { class: "workspace-sidebar",
             section { class: "sidebar-card",
-                p { class: "sidebar-kicker", "Match State" }
-                h2 { "Seats" }
                 div { class: "seat-list", {seat_cards} }
             }
 
             section { class: "sidebar-card",
-                p { class: "sidebar-kicker", "Server Decisions" }
-                h2 { "Move History" }
+                h2 { "Recent Moves" }
                 if moves.is_empty() {
-                    p { class: "empty-copy",
-                        "No moves yet. Create a game, assign seats, then start from the authoritative server."
-                    }
+                    p { class: "empty-copy", "No moves yet." }
                 } else {
-                    div { class: "history-list", {history_items} }
-                }
-            }
-
-            section { class: "sidebar-card sidebar-card-accent",
-                p { class: "sidebar-kicker", "Contract" }
-                h2 { "Client Role" }
-                p { class: "empty-copy",
-                    "Status: {status_label(&status)}. This UI renders API-shaped state and leaves legality, scoring, and persistence to the server."
+                    div { class: "recent-move-list", {recent_moves} }
                 }
             }
         }
+    }
+}
+
+fn participant_name(participants: &[ParticipantDto], seat_number: u8) -> String {
+    participants
+        .iter()
+        .find(|participant| participant.seat_number == seat_number)
+        .map(|participant| participant.display_name.clone())
+        .unwrap_or_else(|| format!("Seat {seat_number}"))
+}
+
+/// Pass/exchange/resign rows have no word or score, so this builds the
+/// short note shown in that slot instead. Exchange's tile count is parsed
+/// out of the existing `description` text (e.g. "Alice exchanged 3 tiles")
+/// rather than adding a new field, since the server already formats it.
+fn action_note(record: &MoveRecordDto) -> String {
+    match record.move_type.as_str() {
+        "pass" => "passed".to_string(),
+        "resign" => "resigned".to_string(),
+        "exchange" => {
+            let count = record
+                .description
+                .split_whitespace()
+                .find_map(|token| token.parse::<u32>().ok())
+                .unwrap_or(0);
+            format!("exchanged {count} letter{}", if count == 1 { "" } else { "s" })
+        }
+        other => other.to_string(),
     }
 }
 
@@ -95,13 +118,5 @@ fn seat_kind_label(kind: &api::SeatKind) -> &'static str {
     match kind {
         api::SeatKind::Human => "Human",
         api::SeatKind::Engine => "Engine",
-    }
-}
-
-fn status_label(status: &GameStatus) -> &'static str {
-    match status {
-        GameStatus::Waiting => "Waiting",
-        GameStatus::Active => "Active",
-        GameStatus::Finished => "Finished",
     }
 }

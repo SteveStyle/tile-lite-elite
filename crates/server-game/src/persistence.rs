@@ -320,6 +320,31 @@ pub async fn list_game_ids(pool: &Pool<Sqlite>) -> Result<Vec<String>, sqlx::Err
         .collect())
 }
 
+/// Last-activity timestamp per game id: the most recent move's `created_at`,
+/// falling back to the game's own `created_at` if no moves have been made
+/// yet. Used to power the games-list panel without needing a dedicated
+/// `updated_at` column on `games`.
+pub async fn last_activity_by_game(
+    pool: &Pool<Sqlite>,
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let rows = sqlx::query(
+        "select
+            g.id,
+            coalesce(
+                (select max(m.created_at) from game_moves m where m.game_id = g.id),
+                g.created_at
+            ) as last_activity_at
+         from games g",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get::<String, _>(0), row.get::<String, _>(1)))
+        .collect())
+}
+
 pub async fn upsert_engine_profiles(
     pool: &Pool<Sqlite>,
     profiles: &[api::EngineProfileDto],

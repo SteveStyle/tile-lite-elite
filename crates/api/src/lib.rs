@@ -116,6 +116,21 @@ pub struct ParticipantDto {
     pub score: i32,
 }
 
+/// A lightweight summary of a game, cheap enough to fetch in bulk for a
+/// games list. Deliberately excludes the board/rack/move-log detail that
+/// `GameStateDto` carries — fetch the full game by id once it's selected.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GameSummaryDto {
+    pub id: String,
+    pub status: GameStatus,
+    pub current_seat: u8,
+    pub participants: Vec<ParticipantDto>,
+    /// Seconds since the Unix epoch (as a string, matching the server's
+    /// storage format) of the most recent move, or the game's creation
+    /// time if no moves have been made yet.
+    pub last_activity_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BoardCellDto {
     pub premium: PremiumDto,

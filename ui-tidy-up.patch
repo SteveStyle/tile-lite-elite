@@ -1,0 +1,1516 @@
+diff --git a/crates/api/src/lib.rs b/crates/api/src/lib.rs
+index ffcca6a..631a72a 100644
+--- a/crates/api/src/lib.rs
++++ b/crates/api/src/lib.rs
+@@ -116,6 +116,21 @@ pub struct ParticipantDto {
+     pub score: i32,
+ }
+ 
++/// A lightweight summary of a game, cheap enough to fetch in bulk for a
++/// games list. Deliberately excludes the board/rack/move-log detail that
++/// `GameStateDto` carries — fetch the full game by id once it's selected.
++#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
++pub struct GameSummaryDto {
++    pub id: String,
++    pub status: GameStatus,
++    pub current_seat: u8,
++    pub participants: Vec<ParticipantDto>,
++    /// Seconds since the Unix epoch (as a string, matching the server's
++    /// storage format) of the most recent move, or the game's creation
++    /// time if no moves have been made yet.
++    pub last_activity_at: String,
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct BoardCellDto {
+     pub premium: PremiumDto,
+diff --git a/crates/server-game/src/app.rs b/crates/server-game/src/app.rs
+index 15e7259..35a4f45 100644
+--- a/crates/server-game/src/app.rs
++++ b/crates/server-game/src/app.rs
+@@ -98,9 +98,25 @@ async fn list_engines(State(state): State<AppState>) -> Json<Vec<api::EngineProf
+     Json(state.engines.metadata())
+ }
+ 
+-async fn list_games(State(state): State<AppState>) -> Json<Vec<String>> {
++async fn list_games(State(state): State<AppState>) -> Result<Json<Vec<api::GameSummaryDto>>, ApiProblem> {
++    let last_activity = persistence::last_activity_by_game(&state.db)
++        .await
++        .map_err(ApiProblem::from_sqlx)?;
++
+     let games = state.games.read().await;
+-    Json(games.keys().cloned().collect())
++    let mut summaries: Vec<api::GameSummaryDto> = games
++        .values()
++        .map(|game| {
++            let last_activity_at = last_activity
++                .get(&game.id)
++                .cloned()
++                .unwrap_or_else(|| "unknown".to_string());
++            game.to_summary_dto(last_activity_at)
++        })
++        .collect();
++    summaries.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
++
++    Ok(Json(summaries))
+ }
+ 
+ async fn create_game(
+@@ -813,8 +829,18 @@ mod tests {
+ 
+         let listed_response = send_empty(app.clone(), Method::GET, "/games").await;
+         assert_eq!(listed_response.status(), StatusCode::OK);
+-        let listed: Vec<String> = read_json(listed_response).await;
+-        assert!(listed.contains(&created.id));
++        let listed: Vec<api::GameSummaryDto> = read_json(listed_response).await;
++        let summary = listed
++            .iter()
++            .find(|summary| summary.id == created.id)
++            .expect("created game should appear in the summary list");
++        assert_eq!(summary.status, api::GameStatus::Waiting);
++        assert_eq!(summary.participants.len(), 2);
++        assert!(
++            !summary.last_activity_at.is_empty() && summary.last_activity_at != "unknown",
++            "expected a real timestamp, got {:?}",
++            summary.last_activity_at
++        );
+ 
+         let fetched_response =
+             send_empty(app, Method::GET, &format!("/games/{}", created.id)).await;
+diff --git a/crates/server-game/src/game_state.rs b/crates/server-game/src/game_state.rs
+index f7bc225..f295bb0 100644
+--- a/crates/server-game/src/game_state.rs
++++ b/crates/server-game/src/game_state.rs
+@@ -127,6 +127,30 @@ impl GameSession {
+         self.current_seat = 0;
+     }
+ 
++    /// A lightweight summary for games-list views. `last_activity_at` is
++    /// supplied by the caller since move timestamps live in the persistence
++    /// layer, not on `GameSession` itself.
++    pub fn to_summary_dto(&self, last_activity_at: String) -> api::GameSummaryDto {
++        api::GameSummaryDto {
++            id: self.id.clone(),
++            status: self.status.clone(),
++            current_seat: self.current_seat,
++            participants: self
++                .participants
++                .iter()
++                .map(|participant| ParticipantDto {
++                    seat_number: participant.seat_number,
++                    kind: participant.kind.clone(),
++                    display_name: participant.display_name.clone(),
++                    player_id: participant.player_id.clone(),
++                    engine_id: participant.engine_id.clone(),
++                    score: participant.score,
++                })
++                .collect(),
++            last_activity_at,
++        }
++    }
++
+     pub fn to_dto(&self) -> GameStateDto {
+         GameStateDto {
+             id: self.id.clone(),
+diff --git a/crates/server-game/src/persistence.rs b/crates/server-game/src/persistence.rs
+index 4ae5e1e..de318d3 100644
+--- a/crates/server-game/src/persistence.rs
++++ b/crates/server-game/src/persistence.rs
+@@ -320,6 +320,31 @@ pub async fn list_game_ids(pool: &Pool<Sqlite>) -> Result<Vec<String>, sqlx::Err
+         .collect())
+ }
+ 
++/// Last-activity timestamp per game id: the most recent move's `created_at`,
++/// falling back to the game's own `created_at` if no moves have been made
++/// yet. Used to power the games-list panel without needing a dedicated
++/// `updated_at` column on `games`.
++pub async fn last_activity_by_game(
++    pool: &Pool<Sqlite>,
++) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
++    let rows = sqlx::query(
++        "select
++            g.id,
++            coalesce(
++                (select max(m.created_at) from game_moves m where m.game_id = g.id),
++                g.created_at
++            ) as last_activity_at
++         from games g",
++    )
++    .fetch_all(pool)
++    .await?;
++
++    Ok(rows
++        .into_iter()
++        .map(|row| (row.get::<String, _>(0), row.get::<String, _>(1)))
++        .collect())
++}
++
+ pub async fn upsert_engine_profiles(
+     pool: &Pool<Sqlite>,
+     profiles: &[api::EngineProfileDto],
+diff --git a/crates/ui/Cargo.toml b/crates/ui/Cargo.toml
+index 22e92ae..bed4b55 100644
+--- a/crates/ui/Cargo.toml
++++ b/crates/ui/Cargo.toml
+@@ -21,6 +21,7 @@ tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+ 
+ [target.'cfg(target_arch = "wasm32")'.dependencies]
+ gloo-net = { version = "0.6", features = ["http", "websocket"] }
++js-sys = "0.3"
+ 
+ [features]
+ default = ["web"]
+diff --git a/crates/ui/assets/styling/main.css b/crates/ui/assets/styling/main.css
+index 67c98e0..9e38ed8 100644
+--- a/crates/ui/assets/styling/main.css
++++ b/crates/ui/assets/styling/main.css
+@@ -49,10 +49,6 @@ button:disabled {
+ }
+ 
+ .topbar {
+-    display: flex;
+-    justify-content: space-between;
+-    align-items: end;
+-    gap: 16px;
+     margin-bottom: 20px;
+ }
+ 
+@@ -103,8 +99,9 @@ button:disabled {
+ 
+ .workspace-shell {
+     display: grid;
+-    grid-template-columns: minmax(0, 1.8fr) minmax(320px, 0.9fr);
++    grid-template-columns: minmax(220px, 0.7fr) minmax(0, 1.7fr) minmax(260px, 0.85fr);
+     gap: 20px;
++    align-items: start;
+ }
+ 
+ .workspace-main {
+@@ -115,6 +112,7 @@ button:disabled {
+ .hero-panel,
+ .board-panel,
+ .rack-panel,
++.games-panel,
+ .sidebar-card {
+     background: var(--panel);
+     backdrop-filter: blur(8px);
+@@ -174,6 +172,20 @@ button:disabled {
+     padding: 22px;
+ }
+ 
++.status-strip {
++    display: flex;
++    gap: 10px;
++    flex-wrap: wrap;
++    align-items: center;
++}
++
++.turn-actions {
++    display: flex;
++    gap: 10px;
++    flex-wrap: wrap;
++    margin-top: 16px;
++}
++
+ .panel-header {
+     display: flex;
+     justify-content: space-between;
+@@ -437,15 +449,97 @@ button:disabled {
+     background: linear-gradient(160deg, rgba(138, 160, 123, 0.24), rgba(255, 251, 243, 0.92));
+ }
+ 
++.games-panel {
++    padding: 22px;
++}
++
++.games-panel-header {
++    display: flex;
++    justify-content: space-between;
++    align-items: center;
++    gap: 12px;
++    margin-bottom: 16px;
++}
++
++.games-panel-actions {
++    display: flex;
++    gap: 8px;
++}
++
++.games-panel-actions .toggle-button,
++.games-panel-actions .toggle-button-muted {
++    padding: 8px 14px;
++    font-size: 0.85rem;
++}
++
++.games-list {
++    display: grid;
++    gap: 10px;
++}
++
++.game-row {
++    display: block;
++    width: 100%;
++    text-align: left;
++    border: 1px solid rgba(111, 75, 44, 0.1);
++    border-radius: 16px;
++    padding: 12px 14px;
++    background: rgba(255, 255, 255, 0.6);
++    cursor: pointer;
++}
++
++.game-row-active {
++    background: rgba(212, 162, 58, 0.22);
++    border-color: rgba(212, 162, 58, 0.4);
++}
++
++.game-row-top {
++    display: flex;
++    justify-content: space-between;
++    align-items: center;
++    gap: 10px;
++}
++
++.game-row-time {
++    font-size: 0.78rem;
++    color: rgba(35, 25, 15, 0.6);
++}
++
++.game-row-participants {
++    margin-top: 8px;
++    font-size: 0.88rem;
++    color: rgba(35, 25, 15, 0.78);
++}
++
++.game-status-badge {
++    border-radius: 999px;
++    padding: 4px 10px;
++    font-size: 0.72rem;
++    text-transform: uppercase;
++    letter-spacing: 0.05em;
++}
++
++.game-status-waiting {
++    background: rgba(157, 198, 216, 0.4);
++}
++
++.game-status-active {
++    background: rgba(138, 160, 123, 0.35);
++}
++
++.game-status-finished {
++    background: rgba(111, 75, 44, 0.14);
++}
++
+ .seat-list,
+-.history-list {
++.recent-move-list {
+     display: grid;
+     gap: 12px;
+     margin-top: 14px;
+ }
+ 
+ .seat-card,
+-.history-item {
++.recent-move-row {
+     border-radius: 18px;
+     background: rgba(255, 255, 255, 0.66);
+     border: 1px solid rgba(111, 75, 44, 0.08);
+@@ -459,34 +553,47 @@ button:disabled {
+ 
+ .seat-heading,
+ .seat-meta,
+-.history-row {
++.recent-move-row {
+     display: flex;
+     justify-content: space-between;
+     gap: 12px;
+     align-items: center;
+ }
+ 
+-.seat-meta,
+-.history-type {
++.seat-meta {
+     font-size: 0.88rem;
+     color: rgba(35, 25, 15, 0.7);
+ }
+ 
+-.history-copy {
+-    margin-top: 8px;
++.recent-move-row-muted {
++    background: rgba(217, 143, 139, 0.14);
++    border-color: rgba(217, 143, 139, 0.3);
++    color: rgba(138, 45, 30, 0.85);
++    font-style: italic;
++}
++
++.recent-move-player {
++    font-weight: 700;
++}
++
++.recent-move-score {
++    font-weight: 700;
++    color: rgba(35, 25, 15, 0.75);
++}
++
++.recent-move-note {
++    font-size: 0.88rem;
+ }
+ 
+-.history-word-link {
++.recent-move-word {
+     font-weight: 600;
+     color: rgba(35, 25, 15, 0.85);
+     text-decoration: underline;
+     text-decoration-color: rgba(212, 162, 58, 0.7);
+     text-underline-offset: 2px;
+-    font-size: 0.9rem;
+-    letter-spacing: 0.03em;
+ }
+ 
+-.history-word-link:hover {
++.recent-move-word:hover {
+     color: rgba(160, 90, 10, 1);
+     text-decoration-color: rgba(160, 90, 10, 0.8);
+ }
+diff --git a/crates/ui/src/app.rs b/crates/ui/src/app.rs
+index 083a6ab..50cbade 100644
+--- a/crates/ui/src/app.rs
++++ b/crates/ui/src/app.rs
+@@ -15,6 +15,8 @@ use gloo_net::{
+ #[cfg(not(target_arch = "wasm32"))]
+ use tokio_tungstenite::connect_async;
+ 
++use crate::components::games_panel::GamesPanel;
++use crate::components::sidebar::Sidebar;
+ use crate::views::Home;
+ 
+ const MAIN_CSS: Asset = asset!("/assets/styling/main.css");
+@@ -57,8 +59,9 @@ pub fn RootApp() -> Element {
+         .unwrap_or("http://127.0.0.1:3000")
+         .to_string();
+     let mut game = use_signal(|| None::<GameStateDto>);
++    let mut game_summaries = use_signal(Vec::<api::GameSummaryDto>::new);
+     let mut is_loading = use_signal(|| false);
+-    let mut info_message = use_signal(|| Some("Loading latest game from server...".to_string()));
++    let mut info_message = use_signal(|| Some("Loading games from server...".to_string()));
+     let mut error_message = use_signal(|| None::<String>);
+     let mut bootstrapped = use_signal(|| false);
+     let mut websocket_game_id = use_signal(|| None::<String>);
+@@ -72,18 +75,27 @@ pub fn RootApp() -> Element {
+         spawn(async move {
+             is_loading.set(true);
+             error_message.set(None);
+-            match load_latest_game(&server_url).await {
+-                Ok(Some(loaded)) => {
+-                    info_message.set(Some(format!("Loaded game {}", loaded.id)));
+-                    dragging_tile_id.set(None);
+-                    selected_blank_letter.set(None);
+-                    staged_placements.set(Vec::new());
+-                    game.set(Some(loaded));
+-                }
+-                Ok(None) => {
+-                    info_message.set(Some(
+-                        "No server game loaded yet. Create one to begin.".to_string(),
+-                    ));
++            match load_game_summaries(&server_url).await {
++                Ok(summaries) => {
++                    let most_recent_id = summaries.first().map(|summary| summary.id.clone());
++                    game_summaries.set(summaries);
++                    match most_recent_id {
++                        Some(game_id) => match load_game_by_id(&server_url, &game_id).await {
++                            Ok(loaded) => {
++                                info_message.set(Some(format!("Loaded game {}", loaded.id)));
++                                dragging_tile_id.set(None);
++                                selected_blank_letter.set(None);
++                                staged_placements.set(Vec::new());
++                                game.set(Some(loaded));
++                            }
++                            Err(error) => error_message.set(Some(error)),
++                        },
++                        None => {
++                            info_message.set(Some(
++                                "No games yet. Create one to begin.".to_string(),
++                            ));
++                        }
++                    }
+                 }
+                 Err(error) => {
+                     error_message.set(Some(error));
+@@ -144,12 +156,12 @@ pub fn RootApp() -> Element {
+     }
+     let staged_preview = staged_preview();
+     let server_url_for_create = server_url.clone();
+-    let server_url_for_reload = server_url.clone();
++    let server_url_for_refresh = server_url.clone();
++    let server_url_for_select = server_url.clone();
+     let server_url_for_start = server_url.clone();
+     let server_url_for_suggested = server_url.clone();
+     let server_url_for_pass = server_url.clone();
+     let server_url_for_manual = server_url.clone();
+-    let server_url_for_view = server_url.clone();
+     let game_for_home = game_for_view.clone();
+     let game_for_board_drop = game_for_view.clone();
+ 
+@@ -158,266 +170,259 @@ pub fn RootApp() -> Element {
+ 
+         div { class: "app-shell",
+             header { class: "topbar",
+-                div {
+-                    p { class: "topbar-kicker", "Scrabble PX" }
+-                    h1 { class: "topbar-title", "Thin client surface for the authoritative server" }
++                p { class: "topbar-kicker", "Scrabble PX" }
++            }
++
++            div { class: "workspace-shell",
++                GamesPanel {
++                    summaries: game_summaries().clone(),
++                    selected_id: game().as_ref().map(|current| current.id.clone()),
++                    is_loading: is_loading(),
++                    on_select: move |game_id: String| {
++                        let server_url = server_url_for_select.clone();
++                        spawn(async move {
++                            is_loading.set(true);
++                            error_message.set(None);
++                            match load_game_by_id(&server_url, &game_id).await {
++                                Ok(loaded) => {
++                                    info_message.set(Some(format!("Loaded game {}", loaded.id)));
++                                    dragging_tile_id.set(None);
++                                    selected_blank_letter.set(None);
++                                    staged_placements.set(Vec::new());
++                                    websocket_game_id.set(None);
++                                    game.set(Some(loaded));
++                                }
++                                Err(error) => error_message.set(Some(error)),
++                            }
++                            is_loading.set(false);
++                        });
++                    },
++                    on_new_game: move |_| {
++                        let server_url = server_url_for_create.clone();
++                        spawn(async move {
++                            is_loading.set(true);
++                            error_message.set(None);
++                            match create_default_game(&server_url).await {
++                                Ok(created) => {
++                                    info_message.set(Some(format!("Created game {}", created.id)));
++                                    dragging_tile_id.set(None);
++                                    selected_blank_letter.set(None);
++                                    staged_placements.set(Vec::new());
++                                    websocket_game_id.set(None);
++                                    game.set(Some(created));
++                                    if let Ok(summaries) = load_game_summaries(&server_url).await {
++                                        game_summaries.set(summaries);
++                                    }
++                                }
++                                Err(error) => error_message.set(Some(error)),
++                            }
++                            is_loading.set(false);
++                        });
++                    },
++                    on_refresh: move |_| {
++                        let server_url = server_url_for_refresh.clone();
++                        spawn(async move {
++                            is_loading.set(true);
++                            error_message.set(None);
++                            match load_game_summaries(&server_url).await {
++                                Ok(summaries) => game_summaries.set(summaries),
++                                Err(error) => error_message.set(Some(error)),
++                            }
++                            is_loading.set(false);
++                        });
++                    },
+                 }
+-                div { class: "topbar-actions",
+-                    button {
+-                        class: "toggle-button",
+-                        disabled: is_loading(),
+-                        onclick: move |_| {
+-                            let server_url = server_url_for_create.clone();
++
++                Home {
++                    game: game_for_home,
++                    is_live: game().is_some(),
++                    is_loading: is_loading(),
++                    info_message: info_message().clone(),
++                    error_message: error_message().clone(),
++                    rack_tiles,
++                    staged_placements: staged_placements().clone(),
++                    can_stage_moves: can_submit_human_action,
++                    on_drag_rack_tile: move |tile_id| {
++                        dragging_tile_id.set(Some(tile_id));
++                    },
++                    on_drag_end_rack_tile: move |_| {
++                        dragging_tile_id.set(None);
++                    },
++                    on_drop_board_cell: move |board_index| {
++                        if !can_submit_human_action {
++                            return;
++                        }
++                        if game_for_board_drop
++                            .board
++                            .get(board_index)
++                            .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
++                        {
++                            return;
++                        }
++                        if staged_placements()
++                            .iter()
++                            .any(|p| p.board_index == board_index)
++                        {
++                            return;
++                        }
++                        let Some(tile_id) = dragging_tile_id() else {
++                            return;
++                        };
++                        let Some(tile) = current_rack_tiles(&game_for_board_drop, &staged_placements())
++                            .into_iter()
++                            .find(|t| t.id == tile_id)
++                            else {
++                            dragging_tile_id.set(None);
++                            return;
++                        };
++                        let (tile_for_board, display_for_board) = match tile.tile.clone() {
++                            TileDto::Blank { .. } => (TileDto::Blank { acting_as: None }, '?'),
++                            other => (other, tile.display),
++                        };
++                        staged_placements
++                            .with_mut(|placements| {
++                                placements
++                                    .push(StagedPlacementView {
++                                        board_index,
++                                        rack_tile_id: tile.id,
++                                        display: display_for_board,
++                                        tile: tile_for_board,
++                                    });
++                            });
++                        dragging_tile_id.set(None);
++                    },
++                    on_clear_staged: move |_| {
++                        dragging_tile_id.set(None);
++                        selected_blank_letter.set(None);
++                        staged_placements.set(Vec::new());
++                        info_message.set(Some("Cleared staged placements.".to_string()));
++                    },
++                    on_remove_staged: move |board_index| {
++                        staged_placements
++                            .with_mut(|placements| {
++                                placements.retain(|p| p.board_index != board_index);
++                            });
++                    },
++                    on_set_blank_letter: move |letter| {
++                        selected_blank_letter.set(Some(letter));
++                        staged_placements
++                            .with_mut(|placements| {
++                                if let Some(placement) = placements
++                                    .iter_mut()
++                                    .find(|p| matches!(p.tile, TileDto::Blank { acting_as: None }))
++                                {
++                                    placement.tile = TileDto::Blank {
++                                        acting_as: Some(letter),
++                                    };
++                                    placement.display = letter.to_ascii_lowercase();
++                                }
++                            });
++                    },
++                    selected_blank_letter: selected_blank_letter(),
++                    staged_preview,
++                    can_start,
++                    on_start: move |_| {
++                        let server_url = server_url_for_start.clone();
++                        let current_game = game().clone();
++                        if let Some(current_game) = current_game {
+                             spawn(async move {
+                                 is_loading.set(true);
+                                 error_message.set(None);
+-                                match create_default_game(&server_url).await {
+-                                    Ok(created) => {
+-                                        info_message.set(Some(format!("Created game {}", created.id)));
++                                match start_game(&server_url, &current_game.id).await {
++                                    Ok(updated) => {
++                                        info_message.set(Some(format!("Started game {}", updated.id)));
+                                         dragging_tile_id.set(None);
+                                         selected_blank_letter.set(None);
+                                         staged_placements.set(Vec::new());
+-                                        websocket_game_id.set(None);
+-                                        game.set(Some(created));
++                                        game.set(Some(updated));
+                                     }
+                                     Err(error) => error_message.set(Some(error)),
+                                 }
+                                 is_loading.set(false);
+                             });
+-                        },
+-                        "New Human vs Engine"
+-                    }
+-                    button {
+-                        class: "toggle-button toggle-button-muted",
+-                        disabled: is_loading(),
+-                        onclick: move |_| {
+-                            let server_url = server_url_for_reload.clone();
++                        }
++                    },
++                    can_submit_suggested: can_submit_human_action,
++                    on_submit_suggested: move |_| {
++                        let server_url = server_url_for_suggested.clone();
++                        let current_game = game().clone();
++                        if let Some(current_game) = current_game {
+                             spawn(async move {
+                                 is_loading.set(true);
+                                 error_message.set(None);
+-                                match load_latest_game(&server_url).await {
+-                                    Ok(Some(loaded)) => {
+-                                        info_message.set(Some(format!("Reloaded game {}", loaded.id)));
++                                match submit_suggested_move(&server_url, &current_game).await {
++                                    Ok(updated) => {
++                                        info_message.set(Some("Submitted suggested move.".to_string()));
+                                         dragging_tile_id.set(None);
+                                         selected_blank_letter.set(None);
+                                         staged_placements.set(Vec::new());
+-                                        websocket_game_id.set(None);
+-                                        game.set(Some(loaded));
+-                                    }
+-                                    Ok(None) => {
+-                                        info_message.set(Some("No games found on the server.".to_string()));
+-                                        game.set(None);
++                                        game.set(Some(updated));
+                                     }
+                                     Err(error) => error_message.set(Some(error)),
+                                 }
+                                 is_loading.set(false);
+                             });
+-                        },
+-                        "Reload"
+-                    }
+-                    button {
+-                        class: "toggle-button toggle-button-muted",
+-                        disabled: is_loading() || !can_start,
+-                        onclick: move |_| {
+-                            let server_url = server_url_for_start.clone();
+-                            let current_game = game().clone();
+-                            if let Some(current_game) = current_game {
+-                                spawn(async move {
+-                                    is_loading.set(true);
+-                                    error_message.set(None);
+-                                    match start_game(&server_url, &current_game.id).await {
+-                                        Ok(updated) => {
+-                                            info_message.set(Some(format!("Started game {}", updated.id)));
+-                                            dragging_tile_id.set(None);
+-                                            selected_blank_letter.set(None);
+-                                            staged_placements.set(Vec::new());
+-                                            game.set(Some(updated));
+-                                        }
+-                                        Err(error) => error_message.set(Some(error)),
+-                                    }
+-                                    is_loading.set(false);
+-                                });
+-                            }
+-                        },
+-                        "Start"
+-                    }
+-                    button {
+-                        class: "toggle-button toggle-button-muted",
+-                        disabled: is_loading() || !can_submit_human_action,
+-                        onclick: move |_| {
+-                            let server_url = server_url_for_suggested.clone();
+-                            let current_game = game().clone();
+-                            if let Some(current_game) = current_game {
+-                                spawn(async move {
+-                                    is_loading.set(true);
+-                                    error_message.set(None);
+-                                    match submit_suggested_move(&server_url, &current_game).await {
+-                                        Ok(updated) => {
+-                                            info_message.set(Some("Submitted suggested move.".to_string()));
+-                                            dragging_tile_id.set(None);
+-                                            selected_blank_letter.set(None);
+-                                            staged_placements.set(Vec::new());
+-                                            game.set(Some(updated));
+-                                        }
+-                                        Err(error) => error_message.set(Some(error)),
+-                                    }
+-                                    is_loading.set(false);
+-                                });
+-                            }
+-                        },
+-                        "Play Suggested Move"
+-                    }
+-                    button {
+-                        class: "toggle-button toggle-button-muted",
+-                        disabled: is_loading() || !can_submit_human_action,
+-                        onclick: move |_| {
+-                            let server_url = server_url_for_pass.clone();
+-                            let current_game = game().clone();
+-                            if let Some(current_game) = current_game {
+-                                spawn(async move {
+-                                    is_loading.set(true);
+-                                    error_message.set(None);
+-                                    match submit_pass(&server_url, &current_game).await {
+-                                        Ok(updated) => {
+-                                            info_message.set(Some("Submitted pass action.".to_string()));
+-                                            dragging_tile_id.set(None);
+-                                            selected_blank_letter.set(None);
+-                                            staged_placements.set(Vec::new());
+-                                            game.set(Some(updated));
+-                                        }
+-                                        Err(error) => error_message.set(Some(error)),
++                        }
++                    },
++                    can_pass: can_submit_human_action,
++                    on_pass: move |_| {
++                        let server_url = server_url_for_pass.clone();
++                        let current_game = game().clone();
++                        if let Some(current_game) = current_game {
++                            spawn(async move {
++                                is_loading.set(true);
++                                error_message.set(None);
++                                match submit_pass(&server_url, &current_game).await {
++                                    Ok(updated) => {
++                                        info_message.set(Some("Submitted pass action.".to_string()));
++                                        dragging_tile_id.set(None);
++                                        selected_blank_letter.set(None);
++                                        staged_placements.set(Vec::new());
++                                        game.set(Some(updated));
+                                     }
+-                                    is_loading.set(false);
+-                                });
+-                            }
+-                        },
+-                        "Pass"
+-                    }
+-                    button {
+-                        class: "toggle-button toggle-button-muted",
+-                        disabled: is_loading() || !can_submit_manual_action,
+-                        onclick: move |_| {
+-                            let server_url = server_url_for_manual.clone();
+-                            let current_game = game().clone();
+-                            let staged = staged_placements().clone();
+-                            if let Some(current_game) = current_game {
+-                                spawn(async move {
+-                                    is_loading.set(true);
+-                                    error_message.set(None);
+-                                    match submit_manual_move(
+-                                            &server_url,
+-                                            &current_game,
+-                                            &staged,
+-                                            DirectionDto::Horizontal,
+-                                        )
+-                                        .await
+-                                    {
+-                                        Ok(updated) => {
+-                                            info_message.set(Some("Submitted staged move.".to_string()));
+-                                            dragging_tile_id.set(None);
+-                                            selected_blank_letter.set(None);
+-                                            staged_placements.set(Vec::new());
+-                                            game.set(Some(updated));
+-                                        }
+-                                        Err(error) => error_message.set(Some(error)),
++                                    Err(error) => error_message.set(Some(error)),
++                                }
++                                is_loading.set(false);
++                            });
++                        }
++                    },
++                    can_submit_manual: can_submit_manual_action,
++                    on_submit_manual: move |_| {
++                        let server_url = server_url_for_manual.clone();
++                        let current_game = game().clone();
++                        let staged = staged_placements().clone();
++                        if let Some(current_game) = current_game {
++                            spawn(async move {
++                                is_loading.set(true);
++                                error_message.set(None);
++                                match submit_manual_move(
++                                        &server_url,
++                                        &current_game,
++                                        &staged,
++                                        DirectionDto::Horizontal,
++                                    )
++                                    .await
++                                {
++                                    Ok(updated) => {
++                                        info_message.set(Some("Submitted staged move.".to_string()));
++                                        dragging_tile_id.set(None);
++                                        selected_blank_letter.set(None);
++                                        staged_placements.set(Vec::new());
++                                        game.set(Some(updated));
+                                     }
+-                                    is_loading.set(false);
+-                                });
+-                            }
+-                        },
+-                        "Submit Staged Move"
+-                    }
++                                    Err(error) => error_message.set(Some(error)),
++                                }
++                                is_loading.set(false);
++                            });
++                        }
++                    },
+                 }
+-            }
+ 
+-            Home {
+-                game: game_for_home,
+-                server_url: server_url_for_view,
+-                is_live: game().is_some(),
+-                is_loading: is_loading(),
+-                info_message: info_message().clone(),
+-                error_message: error_message().clone(),
+-                rack_tiles,
+-                staged_placements: staged_placements().clone(),
+-                can_stage_moves: can_submit_human_action,
+-                on_drag_rack_tile: move |tile_id| {
+-                    dragging_tile_id.set(Some(tile_id));
+-                },
+-                on_drag_end_rack_tile: move |_| {
+-                    dragging_tile_id.set(None);
+-                },
+-                on_drop_board_cell: move |board_index| {
+-                    if !can_submit_human_action {
+-                        return;
+-                    }
+-                    if game_for_board_drop
+-                        .board
+-                        .get(board_index)
+-                        .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
+-                    {
+-                        return;
+-                    }
+-                    if staged_placements()
+-                        .iter()
+-                        .any(|p| p.board_index == board_index)
+-                    {
+-                        return;
+-                    }
+-                    let Some(tile_id) = dragging_tile_id() else {
+-                        return;
+-                    };
+-                    let Some(tile) = current_rack_tiles(&game_for_board_drop, &staged_placements())
+-                        .into_iter()
+-                        .find(|t| t.id == tile_id)
+-                        else {
+-                        dragging_tile_id.set(None);
+-                        return;
+-                    };
+-                    let (tile_for_board, display_for_board) = match tile.tile.clone() {
+-                        TileDto::Blank { .. } => (TileDto::Blank { acting_as: None }, '?'),
+-                        other => (other, tile.display),
+-                    };
+-                    staged_placements
+-                        .with_mut(|placements| {
+-                            placements
+-                                .push(StagedPlacementView {
+-                                    board_index,
+-                                    rack_tile_id: tile.id,
+-                                    display: display_for_board,
+-                                    tile: tile_for_board,
+-                                });
+-                        });
+-                    dragging_tile_id.set(None);
+-                },
+-                on_clear_staged: move |_| {
+-                    dragging_tile_id.set(None);
+-                    selected_blank_letter.set(None);
+-                    staged_placements.set(Vec::new());
+-                    info_message.set(Some("Cleared staged placements.".to_string()));
+-                },
+-                on_remove_staged: move |board_index| {
+-                    staged_placements
+-                        .with_mut(|placements| {
+-                            placements.retain(|p| p.board_index != board_index);
+-                        });
+-                },
+-                on_set_blank_letter: move |letter| {
+-                    selected_blank_letter.set(Some(letter));
+-                    staged_placements
+-                        .with_mut(|placements| {
+-                            if let Some(placement) = placements
+-                                .iter_mut()
+-                                .find(|p| matches!(p.tile, TileDto::Blank { acting_as: None }))
+-                            {
+-                                placement.tile = TileDto::Blank {
+-                                    acting_as: Some(letter),
+-                                };
+-                                placement.display = letter.to_ascii_lowercase();
+-                            }
+-                        });
+-                },
+-                selected_blank_letter: selected_blank_letter(),
+-                staged_preview,
++                Sidebar {
++                    participants: game_for_view.participants.clone(),
++                    moves: game_for_view.moves.clone(),
++                    current_seat: game_for_view.current_seat,
++                }
+             }
+         }
+     }
+@@ -493,16 +498,12 @@ fn mirrored_positions(x: u8, y: u8) -> [(u8, u8); 4] {
+     [(x, y), (max - x, y), (x, max - y), (max - x, max - y)]
+ }
+ 
+-async fn load_latest_game(server_url: &str) -> Result<Option<GameStateDto>, String> {
+-    let ids = get_json::<Vec<String>>(&format!("{server_url}/games")).await?;
+-
+-    let Some(game_id) = ids.first() else {
+-        return Ok(None);
+-    };
+-
+-    let game = get_json::<GameStateDto>(&format!("{server_url}/games/{game_id}")).await?;
++async fn load_game_summaries(server_url: &str) -> Result<Vec<api::GameSummaryDto>, String> {
++    get_json::<Vec<api::GameSummaryDto>>(&format!("{server_url}/games")).await
++}
+ 
+-    Ok(Some(game))
++async fn load_game_by_id(server_url: &str, game_id: &str) -> Result<GameStateDto, String> {
++    get_json::<GameStateDto>(&format!("{server_url}/games/{game_id}")).await
+ }
+ 
+ async fn create_default_game(server_url: &str) -> Result<GameStateDto, String> {
+diff --git a/crates/ui/src/components/games_panel.rs b/crates/ui/src/components/games_panel.rs
+new file mode 100644
+index 0000000..0c81e31
+--- /dev/null
++++ b/crates/ui/src/components/games_panel.rs
+@@ -0,0 +1,91 @@
++use crate::time_format::format_relative_time;
++use api::{GameStatus, GameSummaryDto};
++use dioxus::prelude::*;
++
++#[component]
++pub fn GamesPanel(
++    summaries: Vec<GameSummaryDto>,
++    selected_id: Option<String>,
++    is_loading: bool,
++    on_select: EventHandler<String>,
++    on_new_game: EventHandler<()>,
++    on_refresh: EventHandler<()>,
++) -> Element {
++    let rows = summaries.iter().cloned().map(|summary| {
++        let is_selected = selected_id.as_deref() == Some(summary.id.as_str());
++        let row_class = if is_selected {
++            "game-row game-row-active"
++        } else {
++            "game-row"
++        };
++        let badge_class = format!("game-status-badge game-status-{}", status_slug(&summary.status));
++        let participants_label = if summary.participants.is_empty() {
++            "No seats yet".to_string()
++        } else {
++            summary
++                .participants
++                .iter()
++                .map(|participant| participant.display_name.clone())
++                .collect::<Vec<_>>()
++                .join(" vs ")
++        };
++        let relative_time = format_relative_time(&summary.last_activity_at);
++        let game_id = summary.id.clone();
++
++        rsx! {
++            button {
++                key: "{summary.id}",
++                class: "{row_class}",
++                onclick: move |_| on_select.call(game_id.clone()),
++                div { class: "game-row-top",
++                    span { class: "{badge_class}", "{status_label(&summary.status)}" }
++                    span { class: "game-row-time", "{relative_time}" }
++                }
++                p { class: "game-row-participants", "{participants_label}" }
++            }
++        }
++    });
++
++    rsx! {
++        aside { class: "games-panel",
++            div { class: "games-panel-header",
++                h2 { "Games" }
++                div { class: "games-panel-actions",
++                    button {
++                        class: "toggle-button",
++                        disabled: is_loading,
++                        onclick: move |_| on_new_game.call(()),
++                        "New"
++                    }
++                    button {
++                        class: "toggle-button toggle-button-muted",
++                        disabled: is_loading,
++                        onclick: move |_| on_refresh.call(()),
++                        "Refresh"
++                    }
++                }
++            }
++            if summaries.is_empty() {
++                p { class: "empty-copy", "No games yet. Create one to begin." }
++            } else {
++                div { class: "games-list", {rows} }
++            }
++        }
++    }
++}
++
++fn status_label(status: &GameStatus) -> &'static str {
++    match status {
++        GameStatus::Waiting => "Waiting",
++        GameStatus::Active => "Active",
++        GameStatus::Finished => "Finished",
++    }
++}
++
++fn status_slug(status: &GameStatus) -> &'static str {
++    match status {
++        GameStatus::Waiting => "waiting",
++        GameStatus::Active => "active",
++        GameStatus::Finished => "finished",
++    }
++}
+diff --git a/crates/ui/src/components/mod.rs b/crates/ui/src/components/mod.rs
+index 155891c..22db664 100644
+--- a/crates/ui/src/components/mod.rs
++++ b/crates/ui/src/components/mod.rs
+@@ -1,3 +1,4 @@
+ pub mod board_view;
++pub mod games_panel;
+ pub mod rack_view;
+ pub mod sidebar;
+diff --git a/crates/ui/src/components/sidebar.rs b/crates/ui/src/components/sidebar.rs
+index 1f9a6d0..246023b 100644
+--- a/crates/ui/src/components/sidebar.rs
++++ b/crates/ui/src/components/sidebar.rs
+@@ -1,13 +1,12 @@
+-use api::{GameStatus, MoveRecordDto, ParticipantDto};
++use api::{MoveRecordDto, ParticipantDto};
+ use dioxus::prelude::*;
+ 
++/// Only the most recent moves are shown — this is a live-play glance, not
++/// a full game log.
++const RECENT_MOVES_LIMIT: usize = 8;
++
+ #[component]
+-pub fn Sidebar(
+-    participants: Vec<ParticipantDto>,
+-    moves: Vec<MoveRecordDto>,
+-    current_seat: u8,
+-    status: GameStatus,
+-) -> Element {
++pub fn Sidebar(participants: Vec<ParticipantDto>, moves: Vec<MoveRecordDto>, current_seat: u8) -> Element {
+     let seat_cards = participants.iter().map(|participant| {
+         let class_name = if participant.seat_number == current_seat {
+             "seat-card seat-card-active"
+@@ -29,33 +28,42 @@ pub fn Sidebar(
+         }
+     });
+ 
+-    let history_items = moves.iter().map(|record| {
+-        let word_link = record.main_word.as_deref().map(|word| {
++    let recent_moves = moves.iter().rev().take(RECENT_MOVES_LIMIT).map(|record| {
++        let player_name = participant_name(&participants, record.seat_number);
++        let is_scoring_play = record.move_type == "place";
++        let row_class = if is_scoring_play {
++            "recent-move-row"
++        } else {
++            "recent-move-row recent-move-row-muted"
++        };
++
++        let detail = if is_scoring_play {
++            let word = record.main_word.clone().unwrap_or_default();
+             let url = format!(
+                 "https://www.collinsdictionary.com/dictionary/english/{}",
+                 word.to_lowercase()
+             );
+             rsx! {
++                span { class: "recent-move-score", "{record.score_delta}" }
+                 a {
+-                    class: "history-word-link",
++                    class: "recent-move-word",
+                     href: "{url}",
+                     target: "_blank",
+                     rel: "noopener noreferrer",
+                     "{word}"
+                 }
+             }
+-        });
++        } else {
++            let note = action_note(record);
++            rsx! {
++                span { class: "recent-move-note", "{note}" }
++            }
++        };
+ 
+         rsx! {
+-            div { key: "{record.move_number}", class: "history-item",
+-                div { class: "history-row",
+-                    span { class: "history-badge", "#{record.move_number}" }
+-                    span { class: "history-type", "{record.move_type}" }
+-                    if let Some(link) = word_link {
+-                        {link}
+-                    }
+-                }
+-                p { class: "history-copy", "{record.description}" }
++            div { key: "{record.move_number}", class: "{row_class}",
++                span { class: "recent-move-player", "{player_name}" }
++                {detail}
+             }
+         }
+     });
+@@ -63,31 +71,46 @@ pub fn Sidebar(
+     rsx! {
+         aside { class: "workspace-sidebar",
+             section { class: "sidebar-card",
+-                p { class: "sidebar-kicker", "Match State" }
+-                h2 { "Seats" }
+                 div { class: "seat-list", {seat_cards} }
+             }
+ 
+             section { class: "sidebar-card",
+-                p { class: "sidebar-kicker", "Server Decisions" }
+-                h2 { "Move History" }
++                h2 { "Recent Moves" }
+                 if moves.is_empty() {
+-                    p { class: "empty-copy",
+-                        "No moves yet. Create a game, assign seats, then start from the authoritative server."
+-                    }
++                    p { class: "empty-copy", "No moves yet." }
+                 } else {
+-                    div { class: "history-list", {history_items} }
++                    div { class: "recent-move-list", {recent_moves} }
+                 }
+             }
++        }
++    }
++}
+ 
+-            section { class: "sidebar-card sidebar-card-accent",
+-                p { class: "sidebar-kicker", "Contract" }
+-                h2 { "Client Role" }
+-                p { class: "empty-copy",
+-                    "Status: {status_label(&status)}. This UI renders API-shaped state and leaves legality, scoring, and persistence to the server."
+-                }
+-            }
++fn participant_name(participants: &[ParticipantDto], seat_number: u8) -> String {
++    participants
++        .iter()
++        .find(|participant| participant.seat_number == seat_number)
++        .map(|participant| participant.display_name.clone())
++        .unwrap_or_else(|| format!("Seat {seat_number}"))
++}
++
++/// Pass/exchange/resign rows have no word or score, so this builds the
++/// short note shown in that slot instead. Exchange's tile count is parsed
++/// out of the existing `description` text (e.g. "Alice exchanged 3 tiles")
++/// rather than adding a new field, since the server already formats it.
++fn action_note(record: &MoveRecordDto) -> String {
++    match record.move_type.as_str() {
++        "pass" => "passed".to_string(),
++        "resign" => "resigned".to_string(),
++        "exchange" => {
++            let count = record
++                .description
++                .split_whitespace()
++                .find_map(|token| token.parse::<u32>().ok())
++                .unwrap_or(0);
++            format!("exchanged {count} letter{}", if count == 1 { "" } else { "s" })
+         }
++        other => other.to_string(),
+     }
+ }
+ 
+@@ -97,11 +120,3 @@ fn seat_kind_label(kind: &api::SeatKind) -> &'static str {
+         api::SeatKind::Engine => "Engine",
+     }
+ }
+-
+-fn status_label(status: &GameStatus) -> &'static str {
+-    match status {
+-        GameStatus::Waiting => "Waiting",
+-        GameStatus::Active => "Active",
+-        GameStatus::Finished => "Finished",
+-    }
+-}
+diff --git a/crates/ui/src/main.rs b/crates/ui/src/main.rs
+index 89e54bd..4d38a90 100644
+--- a/crates/ui/src/main.rs
++++ b/crates/ui/src/main.rs
+@@ -1,6 +1,7 @@
+ use dioxus::prelude::*;
+ mod app;
+ mod components;
++mod time_format;
+ mod views;
+ 
+ fn main() {
+diff --git a/crates/ui/src/time_format.rs b/crates/ui/src/time_format.rs
+new file mode 100644
+index 0000000..a93ec16
+--- /dev/null
++++ b/crates/ui/src/time_format.rs
+@@ -0,0 +1,40 @@
++//! Formats the server's `last_activity_at` timestamps (seconds since the
++//! Unix epoch, as a string — see `server-game::persistence::now_iso`) as a
++//! short relative string like "3m ago" for the games list.
++
++#[cfg(target_arch = "wasm32")]
++fn now_epoch_seconds() -> u64 {
++    (js_sys::Date::now() / 1000.0) as u64
++}
++
++#[cfg(not(target_arch = "wasm32"))]
++fn now_epoch_seconds() -> u64 {
++    use std::time::{SystemTime, UNIX_EPOCH};
++    SystemTime::now()
++        .duration_since(UNIX_EPOCH)
++        .map(|duration| duration.as_secs())
++        .unwrap_or(0)
++}
++
++/// Falls back to the raw string if it isn't parseable, so an unexpected
++/// server format degrades gracefully instead of panicking the UI.
++pub fn format_relative_time(epoch_seconds_str: &str) -> String {
++    let Ok(then) = epoch_seconds_str.parse::<u64>() else {
++        return epoch_seconds_str.to_string();
++    };
++    let diff = now_epoch_seconds().saturating_sub(then);
++
++    if diff < 10 {
++        "just now".to_string()
++    } else if diff < 60 {
++        format!("{diff}s ago")
++    } else if diff < 3_600 {
++        format!("{}m ago", diff / 60)
++    } else if diff < 86_400 {
++        format!("{}h ago", diff / 3_600)
++    } else if diff < 604_800 {
++        format!("{}d ago", diff / 86_400)
++    } else {
++        format!("{}w ago", diff / 604_800)
++    }
++}
+diff --git a/crates/ui/src/views/home.rs b/crates/ui/src/views/home.rs
+index c01a1e5..af66622 100644
+--- a/crates/ui/src/views/home.rs
++++ b/crates/ui/src/views/home.rs
+@@ -1,14 +1,13 @@
+ use crate::{
+     app::{MovePreviewView, RackTileView, StagedPlacementView},
+-    components::{board_view::BoardView, rack_view::RackView, sidebar::Sidebar},
++    components::{board_view::BoardView, rack_view::RackView},
+ };
+-use api::{GameStateDto, TileDto};
++use api::{GameStateDto, GameStatus, TileDto};
+ use dioxus::prelude::*;
+ 
+ #[component]
+ pub fn Home(
+     game: GameStateDto,
+-    server_url: String,
+     is_live: bool,
+     is_loading: bool,
+     info_message: Option<String>,
+@@ -24,8 +23,18 @@ pub fn Home(
+     on_set_blank_letter: EventHandler<char>,
+     selected_blank_letter: Option<char>,
+     staged_preview: Option<MovePreviewView>,
++    can_start: bool,
++    on_start: EventHandler<()>,
++    can_submit_suggested: bool,
++    on_submit_suggested: EventHandler<()>,
++    can_pass: bool,
++    on_pass: EventHandler<()>,
++    can_submit_manual: bool,
++    on_submit_manual: EventHandler<()>,
+ ) -> Element {
+-    let first_rack = game.racks.first().cloned();
++    let has_rack = !game.racks.is_empty();
++    let is_waiting = game.status == GameStatus::Waiting;
++    let is_active = game.status == GameStatus::Active;
+ 
+     // Show blank picker when there is a staged blank tile still needing a letter.
+     let has_unresolved_blank = staged_placements
+@@ -53,111 +62,100 @@ pub fn Home(
+     });
+ 
+     rsx! {
+-        div { class: "workspace-shell",
+-            section { class: "workspace-main",
+-                div { class: "hero-panel",
+-                    p { class: "eyebrow", "Web Client" }
+-                    h1 { "Scrabble PX" }
+-                    p { class: "hero-copy",
+-                        "Server-authoritative play, engine-ready seats, and shared rules previews sit behind one API boundary."
+-                    }
+-                    div { class: "hero-metadata",
+-                        span { class: "meta-chip", "Status: {format_status(&game)}" }
+-                        span { class: "meta-chip", "Seat: {game.current_seat}" }
+-                        span { class: "meta-chip", "Bag: {game.bag_count}" }
+-                        span { class: "meta-chip",
+-                            if is_live {
+-                                "Live server state"
+-                            } else {
+-                                "No live game loaded"
+-                            }
+-                        }
+-                        if is_loading {
+-                            span { class: "meta-chip", "Working..." }
+-                        }
+-                    }
+-                    if let Some(info_message) = info_message {
+-                        p { class: "status-banner", "{info_message}" }
+-                    }
+-                    if let Some(error_message) = error_message {
+-                        p { class: "error-banner", "{error_message}" }
+-                    }
++        section { class: "workspace-main",
++            div { class: "status-strip",
++                span { class: "meta-chip", "{format_status(&game)}" }
++                span { class: "meta-chip", "Seat {game.current_seat}" }
++                span { class: "meta-chip", "Bag {game.bag_count}" }
++                if !is_live {
++                    span { class: "meta-chip", "No game selected" }
++                }
++                if is_loading {
++                    span { class: "meta-chip", "Working..." }
++                }
++            }
++            if let Some(info_message) = info_message {
++                p { class: "status-banner", "{info_message}" }
++            }
++            if let Some(error_message) = error_message {
++                p { class: "error-banner", "{error_message}" }
++            }
++
++            div { class: "board-panel",
++                BoardView {
++                    board: game.board.clone(),
++                    staged_placements: staged_placements.clone(),
++                    can_stage_moves,
++                    on_drop_tile: on_drop_board_cell,
++                    on_remove_staged,
+                 }
++            }
+ 
+-                div { class: "board-panel",
++            if has_rack {
++                div { class: "rack-panel",
+                     div { class: "panel-header",
+-                        div {
+-                            h2 { "Board" }
+-                            p {
+-                                if is_live {
+-                                    "Live layout typed against the shared API DTOs."
+-                                } else {
+-                                    "Create or load a server game to replace this placeholder board."
+-                                }
++                        h2 { "Rack" }
++                        if !staged_placements.is_empty() {
++                            button {
++                                class: "direction-button direction-button-muted",
++                                onclick: move |_| on_clear_staged.call(()),
++                                "Clear"
++                            }
++                        }
++                    }
++                    if has_unresolved_blank {
++                        div { class: "blank-picker",
++                            p { class: "composer-copy",
++                                "Blank tile — choose a letter: {selected_blank_text}"
+                             }
++                            div { class: "blank-picker-grid", {blank_letter_buttons} }
+                         }
+-                        div { class: "panel-tag", "{server_url}" }
+                     }
+-                    BoardView {
+-                        board: game.board.clone(),
+-                        staged_placements: staged_placements.clone(),
++                    if let Some(preview) = staged_preview {
++                        div { class: if preview.is_legal { "preview-banner" } else { "preview-banner preview-banner-error" },
++                            h3 { class: "preview-title", "{preview.headline}" }
++                            p { class: "composer-copy", "{preview.detail}" }
++                        }
++                    }
++                    RackView {
++                        tiles: rack_tiles,
+                         can_stage_moves,
+-                        on_drop_tile: on_drop_board_cell,
+-                        on_remove_staged,
++                        on_drag_start: on_drag_rack_tile,
++                        on_drag_end: on_drag_end_rack_tile,
+                     }
+-                }
+ 
+-                if let Some(_rack) = first_rack {
+-                    div { class: "rack-panel",
+-                        div { class: "panel-header",
+-                            div {
+-                                h2 { "Rack" }
+-                                p {
+-                                    if can_stage_moves {
+-                                        "Drag a tile onto the board. Right-click a staged tile to remove it."
+-                                    } else {
+-                                        "Manual placement is enabled only for an active human turn."
+-                                    }
+-                                }
+-                            }
+-                            if !staged_placements.is_empty() {
+-                                button {
+-                                    class: "direction-button direction-button-muted",
+-                                    onclick: move |_| on_clear_staged.call(()),
+-                                    "Clear"
+-                                }
++                    div { class: "turn-actions",
++                        if is_waiting {
++                            button {
++                                class: "toggle-button",
++                                disabled: is_loading || !can_start,
++                                onclick: move |_| on_start.call(()),
++                                "Start"
+                             }
+                         }
+-                        if has_unresolved_blank {
+-                            div { class: "blank-picker",
+-                                p { class: "composer-copy",
+-                                    "Blank tile — choose a letter: {selected_blank_text}"
+-                                }
+-                                div { class: "blank-picker-grid", {blank_letter_buttons} }
++                        if is_active {
++                            button {
++                                class: "toggle-button toggle-button-muted",
++                                disabled: is_loading || !can_submit_suggested,
++                                onclick: move |_| on_submit_suggested.call(()),
++                                "Play Suggested Move"
+                             }
+-                        }
+-                        if let Some(preview) = staged_preview {
+-                            div { class: if preview.is_legal { "preview-banner" } else { "preview-banner preview-banner-error" },
+-                                h3 { class: "preview-title", "{preview.headline}" }
+-                                p { class: "composer-copy", "{preview.detail}" }
++                            button {
++                                class: "toggle-button toggle-button-muted",
++                                disabled: is_loading || !can_pass,
++                                onclick: move |_| on_pass.call(()),
++                                "Pass"
++                            }
++                            button {
++                                class: "toggle-button",
++                                disabled: is_loading || !can_submit_manual,
++                                onclick: move |_| on_submit_manual.call(()),
++                                "Submit Staged Move"
+                             }
+-                        }
+-                        RackView {
+-                            tiles: rack_tiles,
+-                            can_stage_moves,
+-                            on_drag_start: on_drag_rack_tile,
+-                            on_drag_end: on_drag_end_rack_tile,
+                         }
+                     }
+                 }
+             }
+-
+-            Sidebar {
+-                participants: game.participants.clone(),
+-                moves: game.moves.clone(),
+-                current_seat: game.current_seat,
+-                status: game.status.clone(),
+-            }
+         }
+     }
+ }

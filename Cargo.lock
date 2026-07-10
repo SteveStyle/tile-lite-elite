@@ -4325,6 +4325,7 @@ dependencies = [
  "dioxus-web",
  "futures-util",
  "gloo-net",
+ "js-sys",
  "reqwest",
  "serde",
  "serde_json",
