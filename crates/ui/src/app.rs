@@ -31,7 +31,7 @@ pub struct RackTileView {
 }
 
 impl RackTileView {
-    pub fn is_blank(&self) -> bool {
+    pub fn _is_blank(&self) -> bool {
         matches!(self.tile, TileDto::Blank { .. })
     }
 }

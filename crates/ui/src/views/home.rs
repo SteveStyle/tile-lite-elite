@@ -107,7 +107,7 @@ pub fn Home(
                     }
                 }
 
-                if let Some(rack) = first_rack {
+                if let Some(_rack) = first_rack {
                     div { class: "rack-panel",
                         div { class: "panel-header",
                             div {
