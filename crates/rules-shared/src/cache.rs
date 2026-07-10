@@ -1,8 +1,8 @@
 use crate::board::{BoardCell, BoardState};
 use crate::dictionary::Dictionary;
 use crate::model::{
-    ALPHABET, Direction, Letter, LetterMask, Position, Score, VariantRules, mask_contains,
-    mask_insert,
+    mask_contains, mask_insert, Direction, Letter, LetterMask, Position, Score, VariantRules,
+    ALPHABET,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -226,16 +226,16 @@ fn board_has_any_tiles(board: &BoardState, rules: &VariantRules) -> bool {
 
 fn touches_filled_neighbor(board: &BoardState, pos: Position, rules: &VariantRules) -> bool {
     for direction in [Direction::Horizontal, Direction::Vertical] {
-        if let Some(next) = pos.try_step_backward(direction)
-            && matches!(board.get(next), Some(BoardCell::Filled(_)))
-        {
-            return true;
+        if let Some(next) = pos.try_step_backward(direction) {
+            if matches!(board.get(next), Some(BoardCell::Filled(_))) {
+                return true;
+            }
         }
 
-        if let Some(next) = pos.try_step_forward(direction, rules.width, rules.height)
-            && matches!(board.get(next), Some(BoardCell::Filled(_)))
-        {
-            return true;
+        if let Some(next) = pos.try_step_forward(direction, rules.width, rules.height) {
+            if matches!(board.get(next), Some(BoardCell::Filled(_))) {
+                return true;
+            }
         }
     }
 
@@ -320,7 +320,7 @@ pub fn compute_cross_check<D: Dictionary>(
 
 #[cfg(test)]
 mod tests {
-    use super::{CrossCheck, RuleCache, compute_cross_check};
+    use super::{compute_cross_check, CrossCheck, RuleCache};
     use crate::board::{BoardCell, BoardState, EmptyCell, FilledCell};
     use crate::dictionary::SowpodsDictionary;
     use crate::model::{Direction, Letter, Position, Premium, VariantRules};

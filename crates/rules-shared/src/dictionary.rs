@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-const SOWPODS_WORD_FILE: &str = include_str!("../../first-try/src/sowpods.txt");
+const SOWPODS_WORD_FILE: &str = include_str!("sowpods.txt");
 
 pub trait Dictionary {
     fn is_word(&self, word: &str) -> bool;
