@@ -965,4 +965,231 @@ mod tests {
         assert_eq!(restored.status, api::GameStatus::Active);
         assert_eq!(restored.participants.len(), 1);
     }
+
+    async fn create_two_human_game(app: Router) -> GameStateDto {
+        let created: GameStateDto = read_json(
+            send_json(
+                app.clone(),
+                Method::POST,
+                "/games",
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            email: None,
+                            recovery_secret: None,
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Bob".to_string(),
+                            engine_id: None,
+                            email: None,
+                            recovery_secret: None,
+                        },
+                    ],
+                    seed: Some(42),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let started: GameStateDto = read_json(
+            send_json(
+                app,
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(started.status, api::GameStatus::Active);
+        started
+    }
+
+    #[tokio::test]
+    async fn pass_action_advances_turn_and_records_move() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        assert_eq!(started.current_seat, 0);
+
+        let response = send_json(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", started.id),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Pass,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(response).await;
+        assert_eq!(updated.status, api::GameStatus::Active);
+        assert_eq!(updated.current_seat, 1);
+        assert_eq!(updated.moves.len(), 1);
+        assert_eq!(updated.moves[0].seat_number, 0);
+        assert_eq!(updated.moves[0].move_type, "pass");
+    }
+
+    #[tokio::test]
+    async fn exchange_action_refills_rack_and_advances_turn() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+
+        // Rig seat 0's rack with known letters so we can request their exchange
+        // deterministically (mirrors the pattern used by the Place-move test above).
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&started.id).expect("game should exist");
+            game.participants[0].rack = rack_with_letters(&['A', 'T']);
+        }
+
+        let response = send_json(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", started.id),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Exchange {
+                    tiles: vec![
+                        api::TileDto::Letter { letter: 'A' },
+                        api::TileDto::Letter { letter: 'T' },
+                    ],
+                },
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(response).await;
+        assert_eq!(updated.current_seat, 1);
+        assert_eq!(updated.moves.len(), 1);
+        assert_eq!(updated.moves[0].move_type, "exchange");
+    }
+
+    #[tokio::test]
+    async fn resign_action_finishes_game_and_sets_winner() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+
+        let response = send_json(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", started.id),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Resign,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(response).await;
+        assert_eq!(updated.status, api::GameStatus::Finished);
+        assert_eq!(updated.winner_seat, Some(1));
+        assert_eq!(updated.moves[0].move_type, "resign");
+    }
+
+    #[tokio::test]
+    async fn acting_out_of_turn_returns_bad_request() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        assert_eq!(started.current_seat, 0);
+
+        let response = send_json(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", started.id),
+            &GameActionRequest {
+                seat_number: 1,
+                action: PlayerActionDto::Pass,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body: api::ApiError = read_json(response).await;
+        assert!(body.message.contains("turn"));
+    }
+
+    #[tokio::test]
+    async fn action_on_unknown_game_returns_not_found() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_json(
+            app.clone(),
+            Method::POST,
+            "/games/does-not-exist/actions",
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Pass,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let get_response = send_empty(app, Method::GET, "/games/does-not-exist").await;
+        assert_eq!(get_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn illegal_placement_is_rejected_and_does_not_advance_turn() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+
+        // An empty tile placement is not a legal move shape.
+        let empty_candidate = api::MoveCandidateDto {
+            start: api::PositionDto { x: 7, y: 7 },
+            direction: api::DirectionDto::Horizontal,
+            tiles: vec![],
+        };
+
+        let response = send_json(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/actions", started.id),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Place {
+                    candidate: empty_candidate,
+                },
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Turn should not have advanced after a rejected move.
+        let fetched: GameStateDto = read_json(
+            send_empty(app, Method::GET, &format!("/games/{}", started.id)).await,
+        )
+        .await;
+        assert_eq!(fetched.current_seat, 0);
+        assert_eq!(fetched.moves.len(), 0);
+    }
 }
