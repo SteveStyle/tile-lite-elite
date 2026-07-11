@@ -14,13 +14,15 @@ pub fn AuthPanel(
     on_logout: EventHandler<()>,
 ) -> Element {
     let stored = crate::local_storage::load();
+    let has_remembered_name = stored.remembered_name.is_some();
+    let remembered_name = stored.remembered_name.unwrap_or_default();
 
     let mut is_open = use_signal(|| false);
     let mut mode = use_signal(|| AuthMode::Login);
-    let mut display_name = use_signal(move || stored.remembered_name.clone().unwrap_or_default());
+    let mut display_name = use_signal(move || remembered_name);
     let mut email = use_signal(String::new);
     let mut password = use_signal(String::new);
-    let mut remember_me = use_signal(move || stored.remembered_name.is_some());
+    let mut remember_me = use_signal(move || has_remembered_name);
     let mut stay_logged_in = use_signal(|| false);
     let mut error_message = use_signal(|| None::<String>);
     let mut is_submitting = use_signal(|| false);

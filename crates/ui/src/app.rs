@@ -954,6 +954,7 @@ async fn fetch_server_preview(
     };
     match post_json::<_, api::PreviewMoveResponse>(
         &format!("{server_url}/games/{}/preview", game.id),
+        None,
         &preview_request,
     )
     .await
