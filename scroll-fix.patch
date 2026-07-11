@@ -1,0 +1,40 @@
+diff --git a/crates/ui/assets/styling/main.css b/crates/ui/assets/styling/main.css
+index b0e9db8..47fd107 100644
+--- a/crates/ui/assets/styling/main.css
++++ b/crates/ui/assets/styling/main.css
+@@ -106,11 +106,21 @@ button:disabled {
+     grid-template-columns: minmax(220px, 0.7fr) minmax(0, 1.7fr) minmax(260px, 0.85fr);
+     gap: 20px;
+     align-items: start;
++    height: calc(100vh - 140px);
++    min-height: 480px;
++}
++
++.workspace-main,
++.games-panel,
++.workspace-sidebar {
++    min-height: 0;
++    overflow-y: auto;
+ }
+ 
+ .workspace-main {
+     display: grid;
+     gap: 20px;
++    align-content: start;
+ }
+ 
+ .hero-panel,
+@@ -680,6 +690,13 @@ button:disabled {
+ @media (max-width: 1080px) {
+     .workspace-shell {
+         grid-template-columns: 1fr;
++        height: auto;
++    }
++
++    .workspace-main,
++    .games-panel,
++    .workspace-sidebar {
++        overflow-y: visible;
+     }
+ 
+     .panel-header,
