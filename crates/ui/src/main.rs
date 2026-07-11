@@ -19,7 +19,7 @@ fn main() {
                         .with_title("Scrabble Desktop")
                         .with_resizable(true)
                         .with_min_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(800, 600))
-                        .with_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(1400, 900)),
+                        .with_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(1400, 1150)),
                 ),
             )],
         );
