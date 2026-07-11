@@ -10,6 +10,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_arch = "wasm32")]
+use gloo_storage::Storage;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredAuth {
     pub remembered_name: Option<String>,
