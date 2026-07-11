@@ -222,7 +222,7 @@ impl GameSession {
             .ok_or_else(|| format!("Unknown seat {seat_number}"))?;
         let validated = rules_engine
             .validate_game_move(&self.state, Some(&participant.rack), &candidate)
-            .map_err(|error| format!("{error:?}"))?;
+            .map_err(|error| format_move_error(&error))?;
 
         for placement in &candidate.tiles {
             if !participant.rack.consume_tile(placement.tile) {
@@ -502,6 +502,35 @@ impl GameSession {
                 .find(|participant| !participant.resigned)
                 .map(|participant| participant.seat_number);
         }
+    }
+}
+
+/// Short, player-facing text for a rejected move. Deliberately terse (one
+/// line, no jargon) since the UI renders this in a fixed-height banner slot
+/// that never displaces the rack. Shared by the `/preview` endpoint and the
+/// real move-submission path so both give the same wording for the same
+/// mistake.
+///
+/// Note: `InvalidWord` only ever names the *main* word. A cross word that
+/// isn't in the dictionary is rejected earlier, as `LetterNotAllowedInPosition`,
+/// without capturing its text — the rule cache only tracks a per-letter
+/// allow/disallow mask at each square, not the word itself. Reporting every
+/// simultaneously-invalid word by name (main and cross together) would need
+/// that tracked through validation instead of short-circuiting on the first
+/// one.
+pub fn format_move_error(error: &rules_shared::MoveError) -> String {
+    match error {
+        rules_shared::MoveError::InvalidWord(word) => {
+            format!("{word} is not in the dictionary.")
+        }
+        rules_shared::MoveError::LetterNotAllowedInPosition => {
+            "That would form a word that's not in the dictionary.".to_string()
+        }
+        rules_shared::MoveError::InvalidMove
+        | rules_shared::MoveError::InvalidPosition
+        | rules_shared::MoveError::InvalidDirection
+        | rules_shared::MoveError::TilesDoNotFit
+        | rules_shared::MoveError::TilesDoNotConnect => "Incorrect tile placement.".to_string(),
     }
 }
 

@@ -20,7 +20,8 @@ use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
 use crate::game_state::{
-    EngineRegistry, GameSession, ParticipantState, move_candidate_from_dto, tile_from_dto,
+    EngineRegistry, GameSession, ParticipantState, format_move_error, move_candidate_from_dto,
+    tile_from_dto,
 };
 use crate::persistence;
 
@@ -330,8 +331,8 @@ async fn preview_move(
         },
         Err(error) => api::PreviewMoveResponse {
             is_legal: false,
-            headline: "Move is not currently legal".to_string(),
-            detail: format_move_error(&error),
+            headline: format_move_error(&error),
+            detail: String::new(),
             score: None,
         },
     };
@@ -405,24 +406,6 @@ async fn suggest_move(
     let _ = state.events.send(event);
 
     Ok(Json(dto))
-}
-
-fn format_move_error(error: &rules_shared::MoveError) -> String {
-    match error {
-        rules_shared::MoveError::InvalidMove => "Invalid move shape.".to_string(),
-        rules_shared::MoveError::InvalidWord(word) => format!("Invalid word: {word}"),
-        rules_shared::MoveError::InvalidPosition => "Tile placement is off the board.".to_string(),
-        rules_shared::MoveError::InvalidDirection => "Invalid move direction.".to_string(),
-        rules_shared::MoveError::TilesDoNotFit => {
-            "The tiles do not fit the rack or span.".to_string()
-        }
-        rules_shared::MoveError::TilesDoNotConnect => {
-            "The move does not connect to the board correctly.".to_string()
-        }
-        rules_shared::MoveError::LetterNotAllowedInPosition => {
-            "A tile is not allowed at one of the chosen squares.".to_string()
-        }
-    }
 }
 
 async fn game_events(

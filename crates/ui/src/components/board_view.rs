@@ -7,8 +7,10 @@ pub fn BoardView(
     board: Vec<BoardCellDto>,
     staged_placements: Vec<StagedPlacementView>,
     can_stage_moves: bool,
+    selected_cell: Option<usize>,
     on_drop_tile: EventHandler<usize>,
     on_remove_staged: EventHandler<usize>,
+    on_select_cell: EventHandler<usize>,
 ) -> Element {
     let cells = board.iter().enumerate().map(|(index, cell)| {
         let staged = staged_placements
@@ -17,8 +19,10 @@ pub fn BoardView(
         let has_letter = cell.letter.is_some();
         let is_staged = staged.is_some();
         let can_drop = can_stage_moves && !has_letter && !is_staged;
+        let is_selectable = can_stage_moves && !has_letter;
+        let is_selected = selected_cell == Some(index);
 
-        let class_name = if has_letter {
+        let mut class_name = if has_letter {
             format!(
                 "board-cell {} board-cell-filled",
                 premium_class(&cell.premium)
@@ -36,6 +40,12 @@ pub fn BoardView(
         } else {
             format!("board-cell {}", premium_class(&cell.premium))
         };
+        if is_selectable {
+            class_name.push_str(" board-cell-clickable");
+        }
+        if is_selected {
+            class_name.push_str(" board-cell-selected");
+        }
 
         rsx! {
             div {
@@ -50,6 +60,11 @@ pub fn BoardView(
                     event.prevent_default();
                     if can_drop {
                         on_drop_tile.call(index);
+                    }
+                },
+                onclick: move |_| {
+                    if is_selectable {
+                        on_select_cell.call(index);
                     }
                 },
                 oncontextmenu: move |event| {

@@ -4,6 +4,8 @@ use crate::{
 };
 use api::{GameStateDto, GameStatus, TileDto};
 use dioxus::prelude::*;
+use std::collections::HashSet;
+use std::rc::Rc;
 
 #[component]
 pub fn Home(
@@ -15,9 +17,14 @@ pub fn Home(
     rack_tiles: Vec<RackTileView>,
     staged_placements: Vec<StagedPlacementView>,
     can_stage_moves: bool,
+    selected_cell: Option<usize>,
     on_drag_rack_tile: EventHandler<usize>,
     on_drag_end_rack_tile: EventHandler<()>,
     on_drop_board_cell: EventHandler<usize>,
+    on_select_cell: EventHandler<usize>,
+    on_click_rack_tile: EventHandler<usize>,
+    on_type_letter: EventHandler<char>,
+    on_backspace: EventHandler<()>,
     on_clear_staged: EventHandler<()>,
     on_remove_staged: EventHandler<usize>,
     on_set_blank_letter: EventHandler<char>,
@@ -25,12 +32,18 @@ pub fn Home(
     staged_preview: Option<MovePreviewView>,
     can_start: bool,
     on_start: EventHandler<()>,
-    can_submit_suggested: bool,
-    on_submit_suggested: EventHandler<()>,
     can_pass: bool,
     on_pass: EventHandler<()>,
     can_submit_manual: bool,
     on_submit_manual: EventHandler<()>,
+    exchange_mode: bool,
+    exchange_selected: HashSet<usize>,
+    can_toggle_exchange: bool,
+    on_toggle_exchange_mode: EventHandler<()>,
+    on_toggle_exchange_tile: EventHandler<usize>,
+    can_confirm_exchange: bool,
+    on_confirm_exchange: EventHandler<()>,
+    on_cancel_exchange: EventHandler<()>,
 ) -> Element {
     let has_rack = !game.racks.is_empty();
     let is_waiting = game.status == GameStatus::Waiting;
@@ -61,11 +74,43 @@ pub fn Home(
         }
     });
 
+    // Keyboard typing (letter placement, backspace) only works while this
+    // element has DOM focus. Clicking a board cell reclaims focus here
+    // explicitly (see `on_select_cell` below) since a plain, non-form
+    // element losing focus to e.g. a turn-action button is otherwise a dead
+    // end — nothing else would naturally hand focus back.
+    let mut keyboard_focus: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
+
     rsx! {
-        section { class: "workspace-main",
+        section {
+            class: "workspace-main",
+            tabindex: "0",
+            onmounted: move |event| {
+                keyboard_focus.set(Some(event.data()));
+            },
+            onkeydown: move |event| {
+                if selected_cell.is_none() {
+                    return;
+                }
+                match event.key() {
+                    Key::Character(text) if text.chars().count() == 1 => {
+                        if let Some(letter) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
+                            event.prevent_default();
+                            on_type_letter.call(letter.to_ascii_uppercase());
+                        }
+                    }
+                    Key::Backspace => {
+                        event.prevent_default();
+                        on_backspace.call(());
+                    }
+                    _ => {}
+                }
+            },
             div { class: "status-strip",
                 span { class: "meta-chip", "{format_status(&game)}" }
-                span { class: "meta-chip", "Seat {game.current_seat}" }
+                if is_active {
+                    span { class: "meta-chip", "Turn: {current_turn_name(&game)}" }
+                }
                 span { class: "meta-chip", "Bag {game.bag_count}" }
                 if !is_live {
                     span { class: "meta-chip", "No game selected" }
@@ -86,8 +131,17 @@ pub fn Home(
                     board: game.board.clone(),
                     staged_placements: staged_placements.clone(),
                     can_stage_moves,
+                    selected_cell,
                     on_drop_tile: on_drop_board_cell,
                     on_remove_staged,
+                    on_select_cell: move |index| {
+                        if let Some(handle) = keyboard_focus() {
+                            spawn(async move {
+                                let _ = handle.set_focus(true).await;
+                            });
+                        }
+                        on_select_cell.call(index);
+                    },
                 }
             }
 
@@ -111,17 +165,25 @@ pub fn Home(
                             div { class: "blank-picker-grid", {blank_letter_buttons} }
                         }
                     }
-                    if let Some(preview) = staged_preview {
-                        div { class: if preview.is_legal { "preview-banner" } else { "preview-banner preview-banner-error" },
-                            h3 { class: "preview-title", "{preview.headline}" }
-                            p { class: "composer-copy", "{preview.detail}" }
+                    div { class: "preview-slot",
+                        if let Some(preview) = staged_preview {
+                            div { class: if preview.is_legal { "preview-banner" } else { "preview-banner preview-banner-error" },
+                                h3 { class: "preview-title", "{preview.headline}" }
+                                if preview.is_legal && !preview.detail.is_empty() {
+                                    p { class: "composer-copy", "{preview.detail}" }
+                                }
+                            }
                         }
                     }
                     RackView {
                         tiles: rack_tiles,
                         can_stage_moves,
+                        exchange_mode,
+                        exchange_selected: exchange_selected.clone(),
                         on_drag_start: on_drag_rack_tile,
                         on_drag_end: on_drag_end_rack_tile,
+                        on_click_tile: on_click_rack_tile,
+                        on_toggle_exchange_tile,
                     }
 
                     div { class: "turn-actions",
@@ -133,13 +195,21 @@ pub fn Home(
                                 "Start"
                             }
                         }
-                        if is_active {
+                        if is_active && exchange_mode {
                             button {
                                 class: "toggle-button toggle-button-muted",
-                                disabled: is_loading || !can_submit_suggested,
-                                onclick: move |_| on_submit_suggested.call(()),
-                                "Play Suggested Move"
+                                disabled: is_loading,
+                                onclick: move |_| on_cancel_exchange.call(()),
+                                "Cancel"
                             }
+                            button {
+                                class: "toggle-button",
+                                disabled: is_loading || !can_confirm_exchange,
+                                onclick: move |_| on_confirm_exchange.call(()),
+                                "Confirm Exchange ({exchange_selected.len()})"
+                            }
+                        }
+                        if is_active && !exchange_mode {
                             button {
                                 class: "toggle-button toggle-button-muted",
                                 disabled: is_loading || !can_pass,
@@ -147,10 +217,16 @@ pub fn Home(
                                 "Pass"
                             }
                             button {
+                                class: "toggle-button toggle-button-muted",
+                                disabled: is_loading || !can_toggle_exchange,
+                                onclick: move |_| on_toggle_exchange_mode.call(()),
+                                "Exchange"
+                            }
+                            button {
                                 class: "toggle-button",
                                 disabled: is_loading || !can_submit_manual,
                                 onclick: move |_| on_submit_manual.call(()),
-                                "Submit Staged Move"
+                                "Play"
                             }
                         }
                     }
@@ -158,6 +234,14 @@ pub fn Home(
             }
         }
     }
+}
+
+fn current_turn_name(game: &GameStateDto) -> &str {
+    game.participants
+        .iter()
+        .find(|participant| participant.seat_number == game.current_seat)
+        .map(|participant| participant.display_name.as_str())
+        .unwrap_or("Unknown")
 }
 
 fn format_status(game: &GameStateDto) -> &'static str {

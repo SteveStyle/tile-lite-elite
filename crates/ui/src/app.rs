@@ -5,6 +5,7 @@ use api::{
 };
 use dioxus::prelude::*;
 use futures_util::StreamExt;
+use std::collections::HashSet;
 
 #[cfg(target_arch = "wasm32")]
 use gloo_net::{
@@ -70,6 +71,9 @@ pub fn RootApp() -> Element {
     let mut dragging_tile_id = use_signal(|| None::<usize>);
     let mut staged_placements = use_signal(Vec::<StagedPlacementView>::new);
     let mut selected_blank_letter = use_signal(|| None::<char>);
+    let mut selected_cell = use_signal(|| None::<usize>);
+    let mut exchange_mode = use_signal(|| false);
+    let mut exchange_selected = use_signal(HashSet::<usize>::new);
 
     if !bootstrapped() {
         bootstrapped.set(true);
@@ -107,9 +111,14 @@ pub fn RootApp() -> Element {
                         Some(game_id) => match load_game_by_id(&server_url, &game_id).await {
                             Ok(loaded) => {
                                 info_message.set(None);
-                                dragging_tile_id.set(None);
-                                selected_blank_letter.set(None);
-                                staged_placements.set(Vec::new());
+                                reset_composer_state(
+                                    dragging_tile_id,
+                                    selected_blank_letter,
+                                    staged_placements,
+                                    selected_cell,
+                                    exchange_mode,
+                                    exchange_selected,
+                                );
                                 game.set(Some(loaded));
                             }
                             Err(error) => error_message.set(Some(error)),
@@ -154,15 +163,17 @@ pub fn RootApp() -> Element {
                 .is_some_and(|participant| participant.kind == SeatKind::Human)
     });
     let rack_tiles = current_rack_tiles(&game_for_view, &staged_placements());
-    let can_submit_manual_action = can_submit_human_action && !staged_placements().is_empty();
+    let can_submit_manual_action =
+        can_submit_human_action && !exchange_mode() && !staged_placements().is_empty();
 
     let mut staged_preview: Signal<Option<MovePreviewView>> = use_signal(|| None);
     {
         let server_url_for_preview = server_url.clone();
+        let game_for_direction = game_for_view.clone();
         use_effect(move || {
             let staged = staged_placements();
             let game_val = game();
-            let direction = DirectionDto::Horizontal;
+            let direction = infer_typing_direction(&game_for_direction, &staged);
             let is_human_turn = can_submit_human_action;
             let server_url = server_url_for_preview.clone();
             spawn(async move {
@@ -183,11 +194,15 @@ pub fn RootApp() -> Element {
     let server_url_for_refresh = server_url.clone();
     let server_url_for_select = server_url.clone();
     let server_url_for_start = server_url.clone();
-    let server_url_for_suggested = server_url.clone();
+    let server_url_for_exchange = server_url.clone();
     let server_url_for_pass = server_url.clone();
     let server_url_for_manual = server_url.clone();
     let game_for_home = game_for_view.clone();
-    let game_for_board_drop = game_for_view.clone();
+    let game_for_drop = game_for_view.clone();
+    let game_for_select = game_for_view.clone();
+    let game_for_click = game_for_view.clone();
+    let game_for_type = game_for_view.clone();
+    let game_for_backspace = game_for_view.clone();
 
     rsx! {
         document::Link { rel: "stylesheet", href: MAIN_CSS }
@@ -240,9 +255,14 @@ pub fn RootApp() -> Element {
                             match load_game_by_id(&server_url, &game_id).await {
                                 Ok(loaded) => {
                                     info_message.set(None);
-                                    dragging_tile_id.set(None);
-                                    selected_blank_letter.set(None);
-                                    staged_placements.set(Vec::new());
+                                    reset_composer_state(
+                                        dragging_tile_id,
+                                        selected_blank_letter,
+                                        staged_placements,
+                                        selected_cell,
+                                        exchange_mode,
+                                        exchange_selected,
+                                    );
                                     websocket_game_id.set(None);
                                     game.set(Some(loaded));
                                 }
@@ -261,9 +281,14 @@ pub fn RootApp() -> Element {
                             match create_game(&server_url, token.as_deref(), kind, my_display_name.as_deref()).await {
                                 Ok(created) => {
                                     info_message.set(None);
-                                    dragging_tile_id.set(None);
-                                    selected_blank_letter.set(None);
-                                    staged_placements.set(Vec::new());
+                                    reset_composer_state(
+                                        dragging_tile_id,
+                                        selected_blank_letter,
+                                        staged_placements,
+                                        selected_cell,
+                                        exchange_mode,
+                                        exchange_selected,
+                                    );
                                     websocket_game_id.set(None);
                                     game.set(Some(created));
                                     if let Ok(summaries) = load_game_summaries(&server_url).await {
@@ -297,7 +322,8 @@ pub fn RootApp() -> Element {
                     error_message: error_message().clone(),
                     rack_tiles,
                     staged_placements: staged_placements().clone(),
-                    can_stage_moves: can_submit_human_action,
+                    can_stage_moves: can_submit_human_action && !exchange_mode(),
+                    selected_cell: selected_cell(),
                     on_drag_rack_tile: move |tile_id| {
                         dragging_tile_id.set(Some(tile_id));
                     },
@@ -305,10 +331,10 @@ pub fn RootApp() -> Element {
                         dragging_tile_id.set(None);
                     },
                     on_drop_board_cell: move |board_index| {
-                        if !can_submit_human_action {
+                        if !can_submit_human_action || exchange_mode() {
                             return;
                         }
-                        if game_for_board_drop
+                        if game_for_drop
                             .board
                             .get(board_index)
                             .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
@@ -324,33 +350,141 @@ pub fn RootApp() -> Element {
                         let Some(tile_id) = dragging_tile_id() else {
                             return;
                         };
-                        let Some(tile) = current_rack_tiles(&game_for_board_drop, &staged_placements())
+                        let Some(tile) = current_rack_tiles(&game_for_drop, &staged_placements())
                             .into_iter()
                             .find(|t| t.id == tile_id)
                             else {
                             dragging_tile_id.set(None);
                             return;
                         };
-                        let (tile_for_board, display_for_board) = match tile.tile.clone() {
-                            TileDto::Blank { .. } => (TileDto::Blank { acting_as: None }, '?'),
-                            other => (other, tile.display),
-                        };
+                        let placement = stage_tile_at_cell(board_index, &tile, None);
                         staged_placements
-                            .with_mut(|placements| {
-                                placements
-                                    .push(StagedPlacementView {
-                                        board_index,
-                                        rack_tile_id: tile.id,
-                                        display: display_for_board,
-                                        tile: tile_for_board,
-                                    });
-                            });
+                            .with_mut(|placements| placements.push(placement));
                         dragging_tile_id.set(None);
+                    },
+                    on_select_cell: move |board_index: usize| {
+                        if !can_submit_human_action || exchange_mode() {
+                            return;
+                        }
+                        if game_for_select
+                            .board
+                            .get(board_index)
+                            .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
+                        {
+                            return;
+                        }
+                        selected_cell.set(Some(board_index));
+                    },
+                    on_click_rack_tile: move |tile_id: usize| {
+                        if !can_submit_human_action || exchange_mode() {
+                            return;
+                        }
+                        let Some(cell_index) = selected_cell() else {
+                            return;
+                        };
+                        if game_for_click
+                            .board
+                            .get(cell_index)
+                            .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
+                        {
+                            return;
+                        }
+                        if staged_placements()
+                            .iter()
+                            .any(|p| p.board_index == cell_index)
+                        {
+                            return;
+                        }
+                        let Some(tile) = current_rack_tiles(&game_for_click, &staged_placements())
+                            .into_iter()
+                            .find(|t| t.id == tile_id)
+                        else {
+                            return;
+                        };
+                        let placement = stage_tile_at_cell(cell_index, &tile, None);
+                        staged_placements
+                            .with_mut(|placements| placements.push(placement));
+                        advance_selection(&game_for_click, staged_placements, selected_cell, cell_index);
+                    },
+                    on_type_letter: move |letter: char| {
+                        if !can_submit_human_action || exchange_mode() {
+                            return;
+                        }
+                        let Some(cell_index) = selected_cell() else {
+                            return;
+                        };
+                        if game_for_type
+                            .board
+                            .get(cell_index)
+                            .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
+                        {
+                            return;
+                        }
+                        if staged_placements()
+                            .iter()
+                            .any(|p| p.board_index == cell_index)
+                        {
+                            return;
+                        }
+                        let rack = current_rack_tiles(&game_for_type, &staged_placements());
+                        // Prefer an exact unused letter tile; fall back to an
+                        // unused blank, auto-resolved to the typed letter
+                        // (skips the manual blank-letter picker, since the
+                        // player already told us the letter by typing it).
+                        let chosen = rack
+                            .iter()
+                            .find(|t| {
+                                !t.is_used
+                                    && matches!(&t.tile, TileDto::Letter { letter: l } if *l == letter)
+                            })
+                            .or_else(|| {
+                                rack.iter()
+                                    .find(|t| !t.is_used && matches!(t.tile, TileDto::Blank { .. }))
+                            });
+                        let Some(tile) = chosen else {
+                            return;
+                        };
+                        let resolved = matches!(tile.tile, TileDto::Blank { .. }).then_some(letter);
+                        let placement = stage_tile_at_cell(cell_index, tile, resolved);
+                        staged_placements
+                            .with_mut(|placements| placements.push(placement));
+                        advance_selection(&game_for_type, staged_placements, selected_cell, cell_index);
+                    },
+                    on_backspace: move |_| {
+                        if !can_submit_human_action || exchange_mode() {
+                            return;
+                        }
+                        let Some(cell_index) = selected_cell() else {
+                            return;
+                        };
+                        let had_staged_tile = staged_placements()
+                            .iter()
+                            .any(|p| p.board_index == cell_index);
+                        if had_staged_tile {
+                            staged_placements
+                                .with_mut(|placements| {
+                                    placements.retain(|p| p.board_index != cell_index);
+                                });
+                        }
+                        let direction = infer_typing_direction(&game_for_backspace, &staged_placements());
+                        let previous = find_next_placeable_cell(
+                            &game_for_backspace,
+                            &staged_placements(),
+                            cell_index,
+                            direction,
+                            false,
+                        );
+                        if let Some(previous) = previous {
+                            selected_cell.set(Some(previous));
+                        } else if had_staged_tile {
+                            selected_cell.set(Some(cell_index));
+                        }
                     },
                     on_clear_staged: move |_| {
                         dragging_tile_id.set(None);
                         selected_blank_letter.set(None);
                         staged_placements.set(Vec::new());
+                        selected_cell.set(None);
                         info_message.set(Some("Cleared staged placements.".to_string()));
                     },
                     on_remove_staged: move |board_index| {
@@ -388,9 +522,14 @@ pub fn RootApp() -> Element {
                                 match start_game(&server_url, &current_game.id, token.as_deref()).await {
                                     Ok(updated) => {
                                         info_message.set(None);
-                                        dragging_tile_id.set(None);
-                                        selected_blank_letter.set(None);
-                                        staged_placements.set(Vec::new());
+                                        reset_composer_state(
+                                            dragging_tile_id,
+                                            selected_blank_letter,
+                                            staged_placements,
+                                            selected_cell,
+                                            exchange_mode,
+                                            exchange_selected,
+                                        );
                                         game.set(Some(updated));
                                     }
                                     Err(error) => error_message.set(Some(error)),
@@ -399,30 +538,7 @@ pub fn RootApp() -> Element {
                             });
                         }
                     },
-                    can_submit_suggested: can_submit_human_action,
-                    on_submit_suggested: move |_| {
-                        let server_url = server_url_for_suggested.clone();
-                        let current_game = game().clone();
-                        let token = session().map(|current| current.session_token.clone());
-                        if let Some(current_game) = current_game {
-                            spawn(async move {
-                                is_loading.set(true);
-                                error_message.set(None);
-                                match submit_suggested_move(&server_url, &current_game, token.as_deref()).await {
-                                    Ok(updated) => {
-                                        info_message.set(Some("Submitted suggested move.".to_string()));
-                                        dragging_tile_id.set(None);
-                                        selected_blank_letter.set(None);
-                                        staged_placements.set(Vec::new());
-                                        game.set(Some(updated));
-                                    }
-                                    Err(error) => error_message.set(Some(error)),
-                                }
-                                is_loading.set(false);
-                            });
-                        }
-                    },
-                    can_pass: can_submit_human_action,
+                    can_pass: can_submit_human_action && !exchange_mode(),
                     on_pass: move |_| {
                         let server_url = server_url_for_pass.clone();
                         let current_game = game().clone();
@@ -434,9 +550,14 @@ pub fn RootApp() -> Element {
                                 match submit_pass(&server_url, &current_game, token.as_deref()).await {
                                     Ok(updated) => {
                                         info_message.set(Some("Submitted pass action.".to_string()));
-                                        dragging_tile_id.set(None);
-                                        selected_blank_letter.set(None);
-                                        staged_placements.set(Vec::new());
+                                        reset_composer_state(
+                                            dragging_tile_id,
+                                            selected_blank_letter,
+                                            staged_placements,
+                                            selected_cell,
+                                            exchange_mode,
+                                            exchange_selected,
+                                        );
                                         game.set(Some(updated));
                                     }
                                     Err(error) => error_message.set(Some(error)),
@@ -452,6 +573,7 @@ pub fn RootApp() -> Element {
                         let staged = staged_placements().clone();
                         let token = session().map(|current| current.session_token.clone());
                         if let Some(current_game) = current_game {
+                            let direction = infer_typing_direction(&current_game, &staged);
                             spawn(async move {
                                 is_loading.set(true);
                                 error_message.set(None);
@@ -459,16 +581,21 @@ pub fn RootApp() -> Element {
                                         &server_url,
                                         &current_game,
                                         &staged,
-                                        DirectionDto::Horizontal,
+                                        direction,
                                         token.as_deref(),
                                     )
                                     .await
                                 {
                                     Ok(updated) => {
-                                        info_message.set(Some("Submitted staged move.".to_string()));
-                                        dragging_tile_id.set(None);
-                                        selected_blank_letter.set(None);
-                                        staged_placements.set(Vec::new());
+                                        info_message.set(Some("Played a move.".to_string()));
+                                        reset_composer_state(
+                                            dragging_tile_id,
+                                            selected_blank_letter,
+                                            staged_placements,
+                                            selected_cell,
+                                            exchange_mode,
+                                            exchange_selected,
+                                        );
                                         game.set(Some(updated));
                                     }
                                     Err(error) => error_message.set(Some(error)),
@@ -476,6 +603,78 @@ pub fn RootApp() -> Element {
                                 is_loading.set(false);
                             });
                         }
+                    },
+                    exchange_mode: exchange_mode(),
+                    exchange_selected: exchange_selected().clone(),
+                    can_toggle_exchange: can_submit_human_action,
+                    on_toggle_exchange_mode: move |_| {
+                        if !can_submit_human_action {
+                            return;
+                        }
+                        let turning_on = !exchange_mode();
+                        if turning_on {
+                            // Placing and exchanging are mutually exclusive
+                            // for a turn; drop any in-progress placement so
+                            // the two states can never mix.
+                            reset_composer_state(
+                                dragging_tile_id,
+                                selected_blank_letter,
+                                staged_placements,
+                                selected_cell,
+                                exchange_mode,
+                                exchange_selected,
+                            );
+                            exchange_mode.set(true);
+                        } else {
+                            exchange_mode.set(false);
+                            exchange_selected.set(HashSet::new());
+                        }
+                    },
+                    on_toggle_exchange_tile: move |tile_id: usize| {
+                        exchange_selected
+                            .with_mut(|selected| {
+                                if !selected.remove(&tile_id) {
+                                    selected.insert(tile_id);
+                                }
+                            });
+                    },
+                    can_confirm_exchange: exchange_mode() && !exchange_selected().is_empty(),
+                    on_confirm_exchange: move |_| {
+                        let server_url = server_url_for_exchange.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        let selected_ids = exchange_selected().clone();
+                        if let Some(current_game) = current_game {
+                            let tiles: Vec<TileDto> = current_rack_tiles(&current_game, &Vec::new())
+                                .into_iter()
+                                .filter(|tile| selected_ids.contains(&tile.id))
+                                .map(|tile| tile.tile)
+                                .collect();
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match submit_exchange(&server_url, &current_game, tiles, token.as_deref()).await {
+                                    Ok(updated) => {
+                                        info_message.set(Some("Exchanged tiles.".to_string()));
+                                        reset_composer_state(
+                                            dragging_tile_id,
+                                            selected_blank_letter,
+                                            staged_placements,
+                                            selected_cell,
+                                            exchange_mode,
+                                            exchange_selected,
+                                        );
+                                        game.set(Some(updated));
+                                    }
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    on_cancel_exchange: move |_| {
+                        exchange_mode.set(false);
+                        exchange_selected.set(HashSet::new());
                     },
                 }
 
@@ -684,12 +883,17 @@ async fn submit_pass(
     post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
 }
 
-async fn submit_suggested_move(
+async fn submit_exchange(
     server_url: &str,
     game: &GameStateDto,
+    tiles: Vec<TileDto>,
     token: Option<&str>,
 ) -> Result<GameStateDto, String> {
-    post_json::<(), _>(&format!("{server_url}/games/{}/suggest", game.id), token, &()).await
+    let request = GameActionRequest {
+        seat_number: game.current_seat,
+        action: api::PlayerActionDto::Exchange { tiles },
+    };
+    post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
 }
 
 async fn submit_manual_move(
@@ -1049,6 +1253,130 @@ fn board_cell_has_letter(cell: &BoardCellDto) -> bool {
     cell.letter.is_some()
 }
 
+/// The direction this turn's staged placements would submit in — same
+/// logic `build_manual_move_request` uses, exposed standalone so the
+/// click/keyboard composer can auto-advance in the direction the move will
+/// actually be read in, not always horizontally.
+fn infer_typing_direction(game: &GameStateDto, staged: &[StagedPlacementView]) -> DirectionDto {
+    match staged.len() {
+        0 => DirectionDto::Horizontal,
+        1 => infer_single_tile_direction(game, staged[0].board_index, DirectionDto::Horizontal),
+        _ => {
+            let positions: Vec<(usize, usize)> = staged
+                .iter()
+                .map(|p| (p.board_index % BOARD_WIDTH, p.board_index / BOARD_WIDTH))
+                .collect();
+            let same_row = positions.iter().all(|(_, y)| *y == positions[0].1);
+            if same_row {
+                DirectionDto::Horizontal
+            } else {
+                DirectionDto::Vertical
+            }
+        }
+    }
+}
+
+/// Steps one cell from `index` in `direction`; `forward` picks which way
+/// along that axis. Returns `None` at the board edge.
+fn step_index(index: usize, direction: DirectionDto, forward: bool) -> Option<usize> {
+    let x = index % BOARD_WIDTH;
+    let y = index / BOARD_WIDTH;
+    match (direction, forward) {
+        (DirectionDto::Horizontal, true) => (x + 1 < BOARD_WIDTH).then(|| index + 1),
+        (DirectionDto::Horizontal, false) => (x > 0).then(|| index - 1),
+        (DirectionDto::Vertical, true) => (y + 1 < BOARD_HEIGHT).then(|| index + BOARD_WIDTH),
+        (DirectionDto::Vertical, false) => (y > 0).then(|| index - BOARD_WIDTH),
+    }
+}
+
+/// Walks from `from_index` in `direction`, skipping over cells that are
+/// already occupied (a permanently-played letter, or a tile staged earlier
+/// this turn), and returns the first free one. Used to auto-advance to the
+/// next slot when typing a word, and to step backward on backspace —
+/// stepping through already-placed letters rather than stopping on them,
+/// since a staged word can legitimately run across existing board tiles.
+fn find_next_placeable_cell(
+    game: &GameStateDto,
+    staged: &[StagedPlacementView],
+    from_index: usize,
+    direction: DirectionDto,
+    forward: bool,
+) -> Option<usize> {
+    let mut current = from_index;
+    loop {
+        current = step_index(current, direction, forward)?;
+        let is_permanent = game
+            .board
+            .get(current)
+            .is_some_and(board_cell_has_letter);
+        let is_staged = staged.iter().any(|p| p.board_index == current);
+        if !is_permanent && !is_staged {
+            return Some(current);
+        }
+    }
+}
+
+/// Moves `selected_cell` to the next placeable cell after `from_index`,
+/// following the direction this turn's placements are currently reading
+/// in. Clears the selection at the edge of the board rather than wrapping.
+fn advance_selection(
+    game: &GameStateDto,
+    staged_placements: Signal<Vec<StagedPlacementView>>,
+    mut selected_cell: Signal<Option<usize>>,
+    from_index: usize,
+) {
+    let staged = staged_placements();
+    let direction = infer_typing_direction(game, &staged);
+    selected_cell.set(find_next_placeable_cell(game, &staged, from_index, direction, true));
+}
+
+/// Builds the staged placement for dropping/clicking/typing `tile` onto
+/// `board_index`. `resolved_letter` is `Some` only when a blank is being
+/// auto-assigned a letter because the player typed it directly (keyboard
+/// path) — the mouse path still leaves blanks unresolved for the
+/// blank-letter picker, same as before.
+fn stage_tile_at_cell(
+    board_index: usize,
+    tile: &RackTileView,
+    resolved_letter: Option<char>,
+) -> StagedPlacementView {
+    let (tile_for_board, display_for_board) = match (&tile.tile, resolved_letter) {
+        (TileDto::Blank { .. }, Some(letter)) => (
+            TileDto::Blank {
+                acting_as: Some(letter),
+            },
+            letter.to_ascii_lowercase(),
+        ),
+        (TileDto::Blank { .. }, None) => (TileDto::Blank { acting_as: None }, '?'),
+        (other, _) => (other.clone(), tile.display),
+    };
+    StagedPlacementView {
+        board_index,
+        rack_tile_id: tile.id,
+        display: display_for_board,
+        tile: tile_for_board,
+    }
+}
+
+/// Resets everything about an in-progress move/exchange composition —
+/// called whenever the game state moves on from under it (a new game
+/// loaded, an action submitted, a turn started).
+fn reset_composer_state(
+    mut dragging_tile_id: Signal<Option<usize>>,
+    mut selected_blank_letter: Signal<Option<char>>,
+    mut staged_placements: Signal<Vec<StagedPlacementView>>,
+    mut selected_cell: Signal<Option<usize>>,
+    mut exchange_mode: Signal<bool>,
+    mut exchange_selected: Signal<HashSet<usize>>,
+) {
+    dragging_tile_id.set(None);
+    selected_blank_letter.set(None);
+    staged_placements.set(Vec::new());
+    selected_cell.set(None);
+    exchange_mode.set(false);
+    exchange_selected.set(HashSet::new());
+}
+
 fn current_rack_tiles(game: &GameStateDto, staged: &[StagedPlacementView]) -> Vec<RackTileView> {
     let Some(rack) = game.racks.get(game.current_seat as usize) else {
         return Vec::new();
@@ -1124,5 +1452,136 @@ mod tests {
         let seats = build_new_game_seats(NewGameKind::VsEngine, None);
         assert_ne!(seats[0].display_name, "Alice");
         assert!(!seats[0].display_name.is_empty());
+    }
+
+    fn test_game(board: Vec<BoardCellDto>) -> GameStateDto {
+        GameStateDto {
+            board,
+            ..empty_live_game()
+        }
+    }
+
+    fn letter_placement(board_index: usize, rack_tile_id: usize, letter: char) -> StagedPlacementView {
+        StagedPlacementView {
+            board_index,
+            rack_tile_id,
+            display: letter,
+            tile: TileDto::Letter { letter },
+        }
+    }
+
+    #[test]
+    fn step_index_stops_at_board_edges() {
+        assert_eq!(step_index(0, DirectionDto::Horizontal, false), None);
+        assert_eq!(step_index(0, DirectionDto::Vertical, false), None);
+        assert_eq!(step_index(0, DirectionDto::Horizontal, true), Some(1));
+        assert_eq!(step_index(0, DirectionDto::Vertical, true), Some(BOARD_WIDTH));
+
+        let last = BOARD_WIDTH * BOARD_HEIGHT - 1;
+        assert_eq!(step_index(last, DirectionDto::Horizontal, true), None);
+        assert_eq!(step_index(last, DirectionDto::Vertical, true), None);
+    }
+
+    #[test]
+    fn find_next_placeable_cell_skips_permanent_and_staged_tiles() {
+        let mut board = empty_board();
+        board[12].letter = Some('A');
+        let game = test_game(board);
+        let staged = vec![letter_placement(11, 0, 'B')];
+
+        // From 10 going right: 11 is staged, 12 is permanently filled, 13 is
+        // the first genuinely free cell.
+        assert_eq!(
+            find_next_placeable_cell(&game, &staged, 10, DirectionDto::Horizontal, true),
+            Some(13)
+        );
+    }
+
+    #[test]
+    fn find_next_placeable_cell_returns_none_past_the_edge() {
+        let game = test_game(empty_board());
+        assert_eq!(
+            find_next_placeable_cell(&game, &[], BOARD_WIDTH - 1, DirectionDto::Horizontal, true),
+            None
+        );
+    }
+
+    #[test]
+    fn infer_typing_direction_defaults_to_horizontal_when_empty_or_isolated() {
+        let game = test_game(empty_board());
+        assert_eq!(infer_typing_direction(&game, &[]), DirectionDto::Horizontal);
+
+        let staged = vec![letter_placement(112, 0, 'A')];
+        assert_eq!(infer_typing_direction(&game, &staged), DirectionDto::Horizontal);
+    }
+
+    #[test]
+    fn infer_typing_direction_follows_the_existing_neighbor_for_a_single_tile() {
+        let staged = vec![letter_placement(112, 0, 'A')];
+
+        let mut board_with_left_neighbor = empty_board();
+        board_with_left_neighbor[111].letter = Some('C');
+        let game = test_game(board_with_left_neighbor);
+        assert_eq!(infer_typing_direction(&game, &staged), DirectionDto::Horizontal);
+
+        let mut board_with_top_neighbor = empty_board();
+        board_with_top_neighbor[112 - BOARD_WIDTH].letter = Some('C');
+        let game = test_game(board_with_top_neighbor);
+        assert_eq!(infer_typing_direction(&game, &staged), DirectionDto::Vertical);
+    }
+
+    #[test]
+    fn infer_typing_direction_follows_multi_tile_alignment() {
+        let game = test_game(empty_board());
+
+        let same_row = vec![letter_placement(100, 0, 'A'), letter_placement(102, 1, 'B')];
+        assert_eq!(infer_typing_direction(&game, &same_row), DirectionDto::Horizontal);
+
+        let same_column = vec![
+            letter_placement(100, 0, 'A'),
+            letter_placement(100 + BOARD_WIDTH * 2, 1, 'B'),
+        ];
+        assert_eq!(infer_typing_direction(&game, &same_column), DirectionDto::Vertical);
+    }
+
+    #[test]
+    fn stage_tile_at_cell_keeps_letter_tiles_unchanged() {
+        let tile = RackTileView {
+            id: 5,
+            display: 'Q',
+            tile: TileDto::Letter { letter: 'Q' },
+            is_used: false,
+        };
+        let placement = stage_tile_at_cell(42, &tile, None);
+        assert_eq!(placement.board_index, 42);
+        assert_eq!(placement.rack_tile_id, 5);
+        assert_eq!(placement.display, 'Q');
+        assert_eq!(placement.tile, TileDto::Letter { letter: 'Q' });
+    }
+
+    #[test]
+    fn stage_tile_at_cell_resolves_a_typed_blank_and_lowercases_its_display() {
+        let tile = RackTileView {
+            id: 6,
+            display: '*',
+            tile: TileDto::Blank { acting_as: None },
+            is_used: false,
+        };
+        let placement = stage_tile_at_cell(7, &tile, Some('Z'));
+        assert_eq!(placement.display, 'z');
+        assert_eq!(placement.tile, TileDto::Blank { acting_as: Some('Z') });
+    }
+
+    #[test]
+    fn stage_tile_at_cell_leaves_an_unresolved_blank_for_the_mouse_path() {
+        let tile = RackTileView {
+            id: 6,
+            display: '*',
+            tile: TileDto::Blank { acting_as: None },
+            is_used: false,
+        };
+        let placement = stage_tile_at_cell(7, &tile, None);
+        assert_eq!(placement.display, '?');
+        assert_eq!(placement.tile, TileDto::Blank { acting_as: None });
     }
 }
