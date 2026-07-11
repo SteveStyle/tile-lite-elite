@@ -25,6 +25,29 @@ const MAIN_CSS: Asset = asset!("/assets/styling/main.css");
 const DEFAULT_ENGINE_ID: &str = "greedy-v1";
 const BOARD_WIDTH: usize = 15;
 const BOARD_HEIGHT: usize = 15;
+/// How often the background reconnect loop pings `/health` while the
+/// server is unreachable.
+const RECONNECT_POLL_MS: u64 = 3000;
+/// Delay between WebSocket reconnect attempts.
+const WEBSOCKET_RETRY_MS: u64 = 3000;
+
+/// Whether the app can currently reach the backend at all — set by the
+/// HTTP helpers (`get_json`/`post_json`) and the WebSocket subscription the
+/// moment either one fails at the network level (server unreachable, not a
+/// legitimate rejection response), and cleared the moment either succeeds.
+/// Read from anywhere (the topbar indicator, the button-disabling checks,
+/// the background reconnect loop) without threading it through props.
+static IS_ONLINE: GlobalSignal<bool> = Signal::global(|| true);
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn sleep_ms(ms: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn sleep_ms(ms: u64) {
+    gloo_timers::future::TimeoutFuture::new(ms as u32).await;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RackTileView {
@@ -103,38 +126,69 @@ pub fn RootApp() -> Element {
 
             is_loading.set(true);
             error_message.set(None);
-            match load_game_summaries(&server_url).await {
-                Ok(summaries) => {
-                    let most_recent_id = summaries.first().map(|summary| summary.id.clone());
-                    game_summaries.set(summaries);
-                    match most_recent_id {
-                        Some(game_id) => match load_game_by_id(&server_url, &game_id).await {
-                            Ok(loaded) => {
-                                info_message.set(None);
-                                reset_composer_state(
-                                    dragging_tile_id,
-                                    selected_blank_letter,
-                                    staged_placements,
-                                    selected_cell,
-                                    exchange_mode,
-                                    exchange_selected,
-                                );
-                                game.set(Some(loaded));
-                            }
-                            Err(error) => error_message.set(Some(error)),
-                        },
-                        None => {
-                            info_message.set(Some(
-                                "No games yet. Create one to begin.".to_string(),
-                            ));
-                        }
+            load_summaries_and_game(
+                &server_url,
+                None,
+                game,
+                game_summaries,
+                info_message,
+                error_message,
+                dragging_tile_id,
+                selected_blank_letter,
+                staged_placements,
+                selected_cell,
+                exchange_mode,
+                exchange_selected,
+            )
+            .await;
+            is_loading.set(false);
+        });
+    }
+
+    // Once we know we're offline (a request failed at the network level —
+    // see `mark_offline`/`IS_ONLINE`), keep pinging `/health` in the
+    // background until it answers, then reload whatever was on screen. A
+    // plain WebSocket reconnect (below) isn't enough on its own: the server
+    // doesn't replay missed events to a freshly (re)connected socket, so
+    // anything that happened while we were disconnected — including the
+    // very first load if the server was down at launch — needs an explicit
+    // reload to catch up.
+    let mut is_reconnecting = use_signal(|| false);
+    {
+        let server_url = server_url.clone();
+        use_effect(move || {
+            if IS_ONLINE() || is_reconnecting() {
+                return;
+            }
+            is_reconnecting.set(true);
+            let server_url = server_url.clone();
+            let current_game_id = game().as_ref().map(|current| current.id.clone());
+            spawn(async move {
+                loop {
+                    sleep_ms(RECONNECT_POLL_MS).await;
+                    if check_server_reachable(&server_url).await {
+                        break;
                     }
                 }
-                Err(error) => {
-                    error_message.set(Some(error));
-                }
-            }
-            is_loading.set(false);
+                *IS_ONLINE.write() = true;
+                info_message.set(Some("Reconnected — catching up...".to_string()));
+                load_summaries_and_game(
+                    &server_url,
+                    current_game_id,
+                    game,
+                    game_summaries,
+                    info_message,
+                    error_message,
+                    dragging_tile_id,
+                    selected_blank_letter,
+                    staged_placements,
+                    selected_cell,
+                    exchange_mode,
+                    exchange_selected,
+                )
+                .await;
+                is_reconnecting.set(false);
+            });
         });
     }
 
@@ -144,24 +198,36 @@ pub fn RootApp() -> Element {
             websocket_game_id.set(Some(game_id.clone()));
             let server_url = server_url.clone();
             spawn(async move {
-                if let Err(error) = subscribe_to_game_events(&server_url, &game_id, game).await {
-                    error_message.set(Some(error));
+                // Keep retrying for as long as this is still the selected
+                // game — a dropped connection (network blip, server
+                // restart) shouldn't leave live updates dead for the rest
+                // of the session. `subscribe_to_game_events` itself marks
+                // `IS_ONLINE` on connect/disconnect (see `mark_online` /
+                // `mark_offline`); this loop just keeps trying.
+                while websocket_game_id().as_deref() == Some(game_id.as_str()) {
+                    let _ = subscribe_to_game_events(&server_url, &game_id, game).await;
+                    if websocket_game_id().as_deref() != Some(game_id.as_str()) {
+                        break;
+                    }
+                    sleep_ms(WEBSOCKET_RETRY_MS).await;
                 }
             });
         }
     }
 
     let game_for_view = game().clone().unwrap_or_else(empty_live_game);
-    let can_start = game()
-        .as_ref()
-        .is_some_and(|current| current.status == GameStatus::Waiting);
-    let can_submit_human_action = game().as_ref().is_some_and(|current| {
-        current.status == GameStatus::Active
-            && current
-                .participants
-                .get(current.current_seat as usize)
-                .is_some_and(|participant| participant.kind == SeatKind::Human)
-    });
+    let can_start = IS_ONLINE()
+        && game()
+            .as_ref()
+            .is_some_and(|current| current.status == GameStatus::Waiting);
+    let can_submit_human_action = IS_ONLINE()
+        && game().as_ref().is_some_and(|current| {
+            current.status == GameStatus::Active
+                && current
+                    .participants
+                    .get(current.current_seat as usize)
+                    .is_some_and(|participant| participant.kind == SeatKind::Human)
+        });
     let rack_tiles = current_rack_tiles(&game_for_view, &staged_placements());
     let can_submit_manual_action =
         can_submit_human_action && !exchange_mode() && !staged_placements().is_empty();
@@ -210,6 +276,9 @@ pub fn RootApp() -> Element {
         div { class: "app-shell",
             header { class: "topbar",
                 p { class: "topbar-kicker", "Scrabble PX" }
+                if !IS_ONLINE() {
+                    span { class: "offline-indicator", "Can't reach the server — reconnecting..." }
+                }
                 AuthPanel {
                     server_url: server_url.clone(),
                     session: session().clone(),
@@ -638,7 +707,7 @@ pub fn RootApp() -> Element {
                                 }
                             });
                     },
-                    can_confirm_exchange: exchange_mode() && !exchange_selected().is_empty(),
+                    can_confirm_exchange: IS_ONLINE() && exchange_mode() && !exchange_selected().is_empty(),
                     on_confirm_exchange: move |_| {
                         let server_url = server_url_for_exchange.clone();
                         let current_game = game().clone();
@@ -799,6 +868,76 @@ async fn load_game_by_id(server_url: &str, game_id: &str) -> Result<GameStateDto
     get_json::<GameStateDto>(&format!("{server_url}/games/{game_id}")).await
 }
 
+/// A bare reachability probe — unlike `get_json`, doesn't care about the
+/// response body (the `/health` endpoint returns plain text, not JSON),
+/// only whether a response came back at all. Used by the reconnect loop to
+/// poll without spamming `mark_offline`/`mark_online` state churn on every
+/// attempt.
+#[cfg(not(target_arch = "wasm32"))]
+async fn check_server_reachable(server_url: &str) -> bool {
+    reqwest::Client::new()
+        .get(format!("{server_url}/health"))
+        .send()
+        .await
+        .is_ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn check_server_reachable(server_url: &str) -> bool {
+    Request::get(&format!("{server_url}/health"))
+        .send()
+        .await
+        .is_ok()
+}
+
+/// Loads the games list and a target game (a specific id if given, else the
+/// most recent one), replacing whatever's currently shown. Shared by the
+/// initial bootstrap and the reconnect-recovery loop so both end up in the
+/// same state after a successful load.
+#[allow(clippy::too_many_arguments)]
+async fn load_summaries_and_game(
+    server_url: &str,
+    preferred_game_id: Option<String>,
+    mut game: Signal<Option<GameStateDto>>,
+    mut game_summaries: Signal<Vec<api::GameSummaryDto>>,
+    mut info_message: Signal<Option<String>>,
+    mut error_message: Signal<Option<String>>,
+    dragging_tile_id: Signal<Option<usize>>,
+    selected_blank_letter: Signal<Option<char>>,
+    staged_placements: Signal<Vec<StagedPlacementView>>,
+    selected_cell: Signal<Option<usize>>,
+    exchange_mode: Signal<bool>,
+    exchange_selected: Signal<HashSet<usize>>,
+) {
+    match load_game_summaries(server_url).await {
+        Ok(summaries) => {
+            let target_id = preferred_game_id.or_else(|| summaries.first().map(|s| s.id.clone()));
+            game_summaries.set(summaries);
+            match target_id {
+                Some(game_id) => match load_game_by_id(server_url, &game_id).await {
+                    Ok(loaded) => {
+                        info_message.set(None);
+                        reset_composer_state(
+                            dragging_tile_id,
+                            selected_blank_letter,
+                            staged_placements,
+                            selected_cell,
+                            exchange_mode,
+                            exchange_selected,
+                        );
+                        game.set(Some(loaded));
+                    }
+                    Err(error) => error_message.set(Some(error)),
+                },
+                None => {
+                    info_message.set(Some("No games yet. Create one to begin.".to_string()));
+                }
+            }
+        }
+        Err(error) => error_message.set(Some(error)),
+    }
+}
+
 /// Builds the two seats for a freshly created game. The first seat is
 /// always the human-facing "me" seat when `my_display_name` is known (i.e.
 /// the caller is logged in); it falls back to a generic name for anonymous
@@ -915,6 +1054,29 @@ where
     post_json_impl(url, token, payload).await
 }
 
+/// Text shown for a request that never got a response at all — as opposed
+/// to a response the server sent back rejecting it, which keeps its own
+/// specific message. This is the one signal that distinguishes "the server
+/// is down/unreachable" from "you made an illegal move."
+const UNREACHABLE_MESSAGE: &str = "Can't reach the server.";
+
+/// Marks the backend unreachable. Called only at the point where a request
+/// never got a response — a genuine connection failure, not an HTTP error
+/// status. Returns `UNREACHABLE_MESSAGE` for convenience at call sites.
+fn mark_offline() -> String {
+    *IS_ONLINE.write() = false;
+    UNREACHABLE_MESSAGE.to_string()
+}
+
+/// Marks the backend reachable — called as soon as any HTTP response
+/// arrives at all, even a rejection, since that still proves the server is
+/// up and talking to us.
+fn mark_online() {
+    if !*IS_ONLINE.read() {
+        *IS_ONLINE.write() = true;
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn get_json<R>(url: &str) -> Result<R, String>
 where
@@ -924,7 +1086,8 @@ where
         .get(url)
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| mark_offline())?;
+    mark_online();
     if !response.status().is_success() {
         let msg = response
             .json::<api::ApiError>()
@@ -941,10 +1104,8 @@ async fn get_json<R>(url: &str) -> Result<R, String>
 where
     R: serde::de::DeserializeOwned,
 {
-    let response = Request::get(url)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+    let response = Request::get(url).send().await.map_err(|_| mark_offline())?;
+    mark_online();
     if !response.ok() {
         let msg = response
             .json::<api::ApiError>()
@@ -969,7 +1130,8 @@ where
     if let Some(token) = token {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    let response = request.send().await.map_err(|error| error.to_string())?;
+    let response = request.send().await.map_err(|_| mark_offline())?;
+    mark_online();
     if !response.status().is_success() {
         let msg = response
             .json::<api::ApiError>()
@@ -996,7 +1158,8 @@ where
         .map_err(|error| error.to_string())?
         .send()
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|_| mark_offline())?;
+    mark_online();
     if !response.ok() {
         let msg = response
             .json::<api::ApiError>()
@@ -1026,13 +1189,12 @@ async fn subscribe_to_game_events_impl(
     mut game_signal: Signal<Option<GameStateDto>>,
 ) -> Result<(), String> {
     let ws_url = websocket_url(server_url, game_id)?;
-    let (stream, _) = connect_async(ws_url)
-        .await
-        .map_err(|error| error.to_string())?;
+    let (stream, _) = connect_async(ws_url).await.map_err(|_| mark_offline())?;
+    mark_online();
     let (_, mut read) = stream.split();
 
     while let Some(message) = read.next().await {
-        let message = message.map_err(|error| error.to_string())?;
+        let message = message.map_err(|_| mark_offline())?;
         let text = match message.to_text() {
             Ok(text) => text,
             Err(_) => continue,
@@ -1059,10 +1221,11 @@ async fn subscribe_to_game_events_impl(
     mut game_signal: Signal<Option<GameStateDto>>,
 ) -> Result<(), String> {
     let ws_url = websocket_url(server_url, game_id)?;
-    let mut read = WebSocket::open(&ws_url).map_err(|error| error.to_string())?;
+    let mut read = WebSocket::open(&ws_url).map_err(|_| mark_offline())?;
+    mark_online();
 
     while let Some(message) = read.next().await {
-        let message = message.map_err(|error| error.to_string())?;
+        let message = message.map_err(|_| mark_offline())?;
         let text = match message {
             WsMessage::Text(text) => text,
             WsMessage::Bytes(_) => continue,
