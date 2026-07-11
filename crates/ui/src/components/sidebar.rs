@@ -21,7 +21,6 @@ pub fn Sidebar(participants: Vec<ParticipantDto>, moves: Vec<MoveRecordDto>, cur
                     span { class: "seat-kind", "{seat_kind_label(&participant.kind)}" }
                 }
                 div { class: "seat-meta",
-                    span { "Seat {participant.seat_number}" }
                     span { "Score {participant.score}" }
                 }
             }
@@ -37,14 +36,23 @@ pub fn Sidebar(participants: Vec<ParticipantDto>, moves: Vec<MoveRecordDto>, cur
             "recent-move-row recent-move-row-muted"
         };
 
-        let detail = if is_scoring_play {
+        let score_cell = if is_scoring_play {
+            rsx! {
+                span { class: "recent-move-score", "{record.score_delta}" }
+            }
+        } else {
+            rsx! {
+                span { class: "recent-move-score" }
+            }
+        };
+
+        let detail_cell = if is_scoring_play {
             let word = record.main_word.clone().unwrap_or_default();
             let url = format!(
                 "https://www.collinsdictionary.com/dictionary/english/{}",
                 word.to_lowercase()
             );
             rsx! {
-                span { class: "recent-move-score", "{record.score_delta}" }
                 a {
                     class: "recent-move-word",
                     href: "{url}",
@@ -63,7 +71,8 @@ pub fn Sidebar(participants: Vec<ParticipantDto>, moves: Vec<MoveRecordDto>, cur
         rsx! {
             div { key: "{record.move_number}", class: "{row_class}",
                 span { class: "recent-move-player", "{player_name}" }
-                {detail}
+                {score_cell}
+                {detail_cell}
             }
         }
     });

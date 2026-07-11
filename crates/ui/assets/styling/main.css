@@ -552,10 +552,16 @@ button:disabled {
 }
 
 .seat-heading,
-.seat-meta,
-.recent-move-row {
+.seat-meta {
     display: flex;
     justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+}
+
+.recent-move-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 3em minmax(0, 1fr);
     gap: 12px;
     align-items: center;
 }
@@ -579,6 +585,7 @@ button:disabled {
 .recent-move-score {
     font-weight: 700;
     color: rgba(35, 25, 15, 0.75);
+    text-align: right;
 }
 
 .recent-move-note {
