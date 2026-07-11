@@ -267,3 +267,28 @@ pub struct InvitePlayerRequest {
 pub struct InvitationResponseRequest {
     pub accept: bool,
 }
+
+// ========== Admin ==========
+//
+// The /admin/* endpoints these types serve are restricted to loopback
+// callers only (see `server-game`'s admin route guard) — there's no
+// per-request auth beyond "you're running on the same machine as the
+// server," so these types intentionally aren't reachable by the ordinary
+// player-facing clients.
+
+/// A game summary with `created_at`, for age-based filtering/display in the
+/// admin CLI — the ordinary player-facing `GameSummaryDto` deliberately
+/// doesn't carry this.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminGameSummaryDto {
+    pub id: String,
+    pub status: GameStatus,
+    pub created_at: String,
+    pub last_activity_at: String,
+    pub participants: Vec<ParticipantDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminResetPasswordRequest {
+    pub new_password: String,
+}

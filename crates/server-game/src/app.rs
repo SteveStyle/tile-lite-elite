@@ -2,17 +2,20 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::net::SocketAddr;
+
 use api::{
-    ApiError, CreateGameRequest, GameActionRequest, GameEventDto, GameInvitationDto,
-    InvitationStatus, InvitePlayerRequest, LoginPlayerRequest, PlayerActionDto, PlayerDto,
-    PlayerSessionDto, PreviewMoveRequest, RegisterPlayerRequest, StartGameRequest,
-    ValidateSessionRequest,
+    AdminGameSummaryDto, AdminResetPasswordRequest, ApiError, CreateGameRequest,
+    GameActionRequest, GameEventDto, GameInvitationDto, InvitationStatus, InvitePlayerRequest,
+    LoginPlayerRequest, PlayerActionDto, PlayerDto, PlayerSessionDto, PreviewMoveRequest,
+    RegisterPlayerRequest, StartGameRequest, ValidateSessionRequest,
 };
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{Path, State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, Path, Query, Request, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use sqlx::{Pool, Sqlite};
 use tokio::sync::{RwLock, broadcast};
@@ -58,6 +61,23 @@ impl AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    // Admin routes are for operating the server, not for players — no
+    // token or account, just "you're on the same machine as the server."
+    // The guard below enforces that regardless of what SCRABBLE_PX_BIND is
+    // set to (docs/operations.md documents binding to 0.0.0.0 for LAN
+    // play, which would otherwise expose these to the whole LAN too).
+    let admin_routes = Router::new()
+        .route("/admin/users", get(admin_list_users))
+        .route("/admin/users/{player_id}", delete(admin_delete_user))
+        .route(
+            "/admin/users/{player_id}/reset-password",
+            post(admin_reset_password),
+        )
+        .route("/admin/games", get(admin_list_games))
+        .route("/admin/games/{game_id}", delete(admin_delete_game))
+        .route("/admin/games/{game_id}/force-end", post(admin_force_end_game))
+        .layer(middleware::from_fn(require_loopback));
+
     Router::new()
         .route("/health", get(health))
         .route("/engines", get(list_engines))
@@ -87,8 +107,17 @@ pub fn build_router(state: AppState) -> Router {
             "/invitations/{invitation_id}/reject",
             post(reject_invitation),
         )
+        .merge(admin_routes)
         .layer(CorsLayer::permissive())
         .with_state(state)
+}
+
+async fn require_loopback(ConnectInfo(addr): ConnectInfo<SocketAddr>, request: Request, next: Next) -> Response {
+    if !addr.ip().is_loopback() {
+        return ApiProblem::forbidden("Admin endpoints are only reachable from the server itself")
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn health() -> &'static str {
@@ -769,6 +798,190 @@ async fn run_engine_turns(game: &mut GameSession, engines: &EngineRegistry) -> R
     Ok(())
 }
 
+// ========== Admin Handlers ==========
+//
+// Reachable only from loopback (see `require_loopback`) — an operator with
+// terminal access to the server, not player-facing, hence no per-account
+// auth here.
+
+async fn admin_list_users(State(state): State<AppState>) -> Result<Json<Vec<PlayerDto>>, ApiProblem> {
+    let players = persistence::list_players(&state.db)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    Ok(Json(
+        players
+            .into_iter()
+            .map(|player| PlayerDto {
+                id: player.id,
+                display_name: player.display_name,
+                email: player.email,
+                created_at: player.created_at,
+                last_seen_at: player.last_seen_at,
+            })
+            .collect(),
+    ))
+}
+
+async fn admin_delete_user(
+    State(state): State<AppState>,
+    Path(player_id): Path<String>,
+) -> Result<StatusCode, ApiProblem> {
+    let deleted = persistence::delete_player(&state.db, &player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    if !deleted {
+        return Err(ApiProblem::not_found("Player not found"));
+    }
+    // The DB row is unclaimed already (see `delete_player`); every loaded
+    // `GameSession` is a separate in-memory copy that needs the same
+    // update, or a still-running server would keep serving the seat as
+    // claimed by a player that no longer exists.
+    for game in state.games.write().await.values_mut() {
+        for participant in &mut game.participants {
+            if participant.player_id.as_deref() == Some(player_id.as_str()) {
+                participant.player_id = None;
+            }
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn admin_reset_password(
+    State(state): State<AppState>,
+    Path(player_id): Path<String>,
+    Json(request): Json<AdminResetPasswordRequest>,
+) -> Result<StatusCode, ApiProblem> {
+    if request.new_password.is_empty() {
+        return Err(ApiProblem::bad_request("A new password is required"));
+    }
+    let password_hash = hash_password(&request.new_password)
+        .map_err(|_| ApiProblem::bad_request("Could not process that password"))?;
+    let updated = persistence::update_player_password(&state.db, &player_id, &password_hash)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    if !updated {
+        return Err(ApiProblem::not_found("Player not found"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(serde::Deserialize)]
+struct AdminGamesQuery {
+    status: Option<String>,
+    older_than_days: Option<i64>,
+}
+
+async fn admin_list_games(
+    State(state): State<AppState>,
+    Query(query): Query<AdminGamesQuery>,
+) -> Result<Json<Vec<AdminGameSummaryDto>>, ApiProblem> {
+    let created_at = persistence::created_at_by_game(&state.db)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    let last_activity = persistence::last_activity_by_game(&state.db)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+    let status_filter = match query.status.as_deref() {
+        Some("waiting") => Some(api::GameStatus::Waiting),
+        Some("active") => Some(api::GameStatus::Active),
+        Some("finished") => Some(api::GameStatus::Finished),
+        Some(other) => {
+            return Err(ApiProblem::bad_request(format!(
+                "Unknown status '{other}', expected waiting/active/finished"
+            )));
+        }
+        None => None,
+    };
+    let cutoff = query.older_than_days.map(|days| {
+        let now_seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before epoch")
+            .as_secs() as i64;
+        now_seconds - days * 86_400
+    });
+
+    let games = state.games.read().await;
+    let mut summaries: Vec<AdminGameSummaryDto> = games
+        .values()
+        .filter(|game| status_filter.as_ref().is_none_or(|status| &game.status == status))
+        .filter(|game| {
+            let Some(cutoff) = cutoff else {
+                return true;
+            };
+            created_at
+                .get(&game.id)
+                .and_then(|value| value.parse::<i64>().ok())
+                .is_some_and(|created| created <= cutoff)
+        })
+        .map(|game| AdminGameSummaryDto {
+            id: game.id.clone(),
+            status: game.status.clone(),
+            created_at: created_at
+                .get(&game.id)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string()),
+            last_activity_at: last_activity
+                .get(&game.id)
+                .cloned()
+                .unwrap_or_else(|| "unknown".to_string()),
+            participants: game
+                .participants
+                .iter()
+                .map(|participant| api::ParticipantDto {
+                    seat_number: participant.seat_number,
+                    kind: participant.kind.clone(),
+                    display_name: participant.display_name.clone(),
+                    player_id: participant.player_id.clone(),
+                    engine_id: participant.engine_id.clone(),
+                    score: participant.score,
+                })
+                .collect(),
+        })
+        .collect();
+    summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    Ok(Json(summaries))
+}
+
+async fn admin_delete_game(
+    State(state): State<AppState>,
+    Path(game_id): Path<String>,
+) -> Result<StatusCode, ApiProblem> {
+    let deleted = persistence::delete_game(&state.db, &game_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    if !deleted {
+        return Err(ApiProblem::not_found("Game not found"));
+    }
+    state.games.write().await.remove(&game_id);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Directly marks a game `Finished` without going through per-seat
+/// resignation — for an operator to clear out a stuck or abandoned game
+/// (e.g. a human seat that will never act again). Doesn't touch scores or
+/// `winner_seat`.
+async fn admin_force_end_game(
+    State(state): State<AppState>,
+    Path(game_id): Path<String>,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let dto = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+        game.status = api::GameStatus::Finished;
+        let dto = game.to_dto();
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        dto
+    };
+    let _ = state.events.send(GameEventDto::GameFinished { game: dto.clone() });
+    Ok(Json(dto))
+}
+
 pub struct ApiProblem {
     status: StatusCode,
     message: String,
@@ -792,6 +1005,13 @@ impl ApiProblem {
     fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
             message: message.into(),
         }
     }
@@ -900,6 +1120,42 @@ mod tests {
         )
         .await
         .expect("request should succeed")
+    }
+
+    /// `oneshot()`-driven tests never go through a real TCP listener, so
+    /// `ConnectInfo` (what `require_loopback` reads) is never populated the
+    /// way it would be by `into_make_service_with_connect_info` in
+    /// production — it has to be injected into the request's extensions by
+    /// hand, exactly like axum's own connect-info middleware would.
+    fn loopback_peer() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 54321))
+    }
+
+    fn remote_peer() -> SocketAddr {
+        SocketAddr::from(([203, 0, 113, 5], 54321))
+    }
+
+    async fn send_admin<T: Serialize>(
+        app: Router,
+        method: Method,
+        uri: &str,
+        peer: SocketAddr,
+        payload: Option<&T>,
+    ) -> axum::http::Response<Body> {
+        let body = match payload {
+            Some(payload) => {
+                Body::from(serde_json::to_vec(payload).expect("payload should serialize"))
+            }
+            None => Body::empty(),
+        };
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(body)
+            .expect("request should build");
+        request.extensions_mut().insert(ConnectInfo(peer));
+        app.oneshot(request).await.expect("request should succeed")
     }
 
     async fn read_json<T: DeserializeOwned>(response: axum::http::Response<Body>) -> T {
@@ -1729,5 +1985,279 @@ mod tests {
             finished.participants.iter().any(|participant| participant.score != 0),
             "expected at least one participant to have a non-zero score by game end"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_endpoints_reject_non_loopback_callers() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response =
+            send_admin::<()>(app, Method::GET, "/admin/users", remote_peer(), None).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn admin_can_list_and_delete_users() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice: PlayerSessionDto = read_json(
+            send_json(
+                app.clone(),
+                Method::POST,
+                "/auth/register",
+                &RegisterPlayerRequest {
+                    display_name: "Alice".to_string(),
+                    email: "alice@example.com".to_string(),
+                    password: "correct horse battery staple".to_string(),
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let listed: Vec<PlayerDto> = read_json(
+            send_admin::<()>(app.clone(), Method::GET, "/admin/users", loopback_peer(), None)
+                .await,
+        )
+        .await;
+        assert!(listed.iter().any(|player| player.id == alice.player_id));
+
+        let delete_response = send_admin::<()>(
+            app.clone(),
+            Method::DELETE,
+            &format!("/admin/users/{}", alice.player_id),
+            loopback_peer(),
+            None,
+        )
+        .await;
+        assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+        let listed_after: Vec<PlayerDto> =
+            read_json(send_admin::<()>(app, Method::GET, "/admin/users", loopback_peer(), None).await)
+                .await;
+        assert!(!listed_after.iter().any(|player| player.id == alice.player_id));
+    }
+
+    #[tokio::test]
+    async fn admin_deleting_a_user_unclaims_their_seat_but_keeps_the_game() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice: PlayerSessionDto = read_json(
+            send_json(
+                app.clone(),
+                Method::POST,
+                "/auth/register",
+                &RegisterPlayerRequest {
+                    display_name: "Alice".to_string(),
+                    email: "alice@example.com".to_string(),
+                    password: "correct horse battery staple".to_string(),
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                        },
+                    ],
+                    seed: Some(7),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created.participants[0].player_id.as_deref(), Some(alice.player_id.as_str()));
+
+        let delete_response = send_admin::<()>(
+            app.clone(),
+            Method::DELETE,
+            &format!("/admin/users/{}", alice.player_id),
+            loopback_peer(),
+            None,
+        )
+        .await;
+        assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+        let fetched: GameStateDto =
+            read_json(send_empty(app, Method::GET, &format!("/games/{}", created.id)).await).await;
+        assert_eq!(fetched.id, created.id, "the game itself should survive");
+        assert_eq!(
+            fetched.participants[0].player_id, None,
+            "the seat should be unclaimed, not still pointing at a deleted player"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_can_reset_a_password() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        read_json::<PlayerSessionDto>(
+            send_json(
+                app.clone(),
+                Method::POST,
+                "/auth/register",
+                &RegisterPlayerRequest {
+                    display_name: "Alice".to_string(),
+                    email: "alice@example.com".to_string(),
+                    password: "original-password".to_string(),
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let reset_response = send_admin(
+            app.clone(),
+            Method::POST,
+            "/admin/users/whoever/reset-password",
+            loopback_peer(),
+            Some(&AdminResetPasswordRequest {
+                new_password: "brand-new-password".to_string(),
+            }),
+        )
+        .await;
+        // Wrong id on purpose first, to check a bad id 404s rather than
+        // silently succeeding.
+        assert_eq!(reset_response.status(), StatusCode::NOT_FOUND);
+
+        let listed: Vec<PlayerDto> = read_json(
+            send_admin::<()>(app.clone(), Method::GET, "/admin/users", loopback_peer(), None)
+                .await,
+        )
+        .await;
+        let alice_id = listed
+            .iter()
+            .find(|player| player.display_name == "Alice")
+            .expect("Alice should be listed")
+            .id
+            .clone();
+
+        let reset_response = send_admin(
+            app.clone(),
+            Method::POST,
+            &format!("/admin/users/{alice_id}/reset-password"),
+            loopback_peer(),
+            Some(&AdminResetPasswordRequest {
+                new_password: "brand-new-password".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(reset_response.status(), StatusCode::NO_CONTENT);
+
+        let old_password_login = send_json(
+            app.clone(),
+            Method::POST,
+            "/auth/login",
+            &LoginPlayerRequest {
+                display_name: "Alice".to_string(),
+                password: "original-password".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(old_password_login.status(), StatusCode::BAD_REQUEST);
+
+        let new_password_login = send_json(
+            app,
+            Method::POST,
+            "/auth/login",
+            &LoginPlayerRequest {
+                display_name: "Alice".to_string(),
+                password: "brand-new-password".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(new_password_login.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn admin_can_list_and_delete_games() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let created = create_two_human_game(app.clone()).await;
+
+        let listed: Vec<AdminGameSummaryDto> = read_json(
+            send_admin::<()>(app.clone(), Method::GET, "/admin/games", loopback_peer(), None)
+                .await,
+        )
+        .await;
+        let listed_game = listed
+            .iter()
+            .find(|game| game.id == created.id)
+            .expect("created game should be listed");
+        assert!(!listed_game.created_at.is_empty());
+
+        let delete_response = send_admin::<()>(
+            app.clone(),
+            Method::DELETE,
+            &format!("/admin/games/{}", created.id),
+            loopback_peer(),
+            None,
+        )
+        .await;
+        assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
+
+        let fetch_after = send_empty(app.clone(), Method::GET, &format!("/games/{}", created.id)).await;
+        assert_eq!(fetch_after.status(), StatusCode::NOT_FOUND);
+
+        let listed_after: Vec<AdminGameSummaryDto> = read_json(
+            send_admin::<()>(app, Method::GET, "/admin/games", loopback_peer(), None).await,
+        )
+        .await;
+        assert!(!listed_after.iter().any(|game| game.id == created.id));
+    }
+
+    #[tokio::test]
+    async fn admin_can_force_end_a_stuck_game() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let started = create_two_human_game(app.clone()).await;
+        assert_eq!(started.status, api::GameStatus::Active);
+
+        let response = send_admin::<()>(
+            app.clone(),
+            Method::POST,
+            &format!("/admin/games/{}/force-end", started.id),
+            loopback_peer(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let ended: GameStateDto = read_json(response).await;
+        assert_eq!(ended.status, api::GameStatus::Finished);
+
+        let fetched: GameStateDto =
+            read_json(send_empty(app, Method::GET, &format!("/games/{}", started.id)).await).await;
+        assert_eq!(fetched.status, api::GameStatus::Finished);
     }
 }

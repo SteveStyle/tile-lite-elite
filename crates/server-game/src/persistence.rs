@@ -351,6 +351,115 @@ pub async fn last_activity_by_game(
         .collect())
 }
 
+/// `created_at` per game id — a separate lookup rather than a field on
+/// `GameSession` itself, same reasoning as `last_activity_by_game`: nothing
+/// in the in-memory session model needs it, only the admin listing does.
+pub async fn created_at_by_game(
+    pool: &Pool<Sqlite>,
+) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+    let rows = sqlx::query("select id, created_at from games")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get::<String, _>(0), row.get::<String, _>(1)))
+        .collect())
+}
+
+// ========== Admin Functions ==========
+
+pub async fn list_players(pool: &Pool<Sqlite>) -> Result<Vec<PlayerRecord>, sqlx::Error> {
+    let rows = sqlx::query(
+        "select id, display_name, email, password_hash, created_at, updated_at, last_seen_at
+         from players order by created_at desc",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| PlayerRecord {
+            id: r.get(0),
+            display_name: r.get(1),
+            email: r.get(2),
+            password_hash: r.get(3),
+            created_at: r.get(4),
+            updated_at: r.get(5),
+            last_seen_at: r.get(6),
+        })
+        .collect())
+}
+
+pub async fn update_player_password(
+    pool: &Pool<Sqlite>,
+    player_id: &str,
+    password_hash: &str,
+) -> Result<bool, sqlx::Error> {
+    let now = now_iso();
+    let result = sqlx::query("update players set password_hash = ?1, updated_at = ?2 where id = ?3")
+        .bind(password_hash)
+        .bind(&now)
+        .bind(player_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Deletes a player along with their sessions and invitations, but
+/// preserves game history: `game_participants.player_id` is unclaimed
+/// (set to null) rather than deleting the participant row or the game,
+/// matching how an anonymous, never-claimed seat already behaves — the
+/// seat and its moves stay, just no longer bound to an account.
+pub async fn delete_player(pool: &Pool<Sqlite>, player_id: &str) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("delete from sessions where player_id = ?1")
+        .bind(player_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "delete from game_invitations where invited_player_id = ?1 or inviting_player_id = ?1",
+    )
+    .bind(player_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("update game_participants set player_id = null where player_id = ?1")
+        .bind(player_id)
+        .execute(&mut *tx)
+        .await?;
+    let result = sqlx::query("delete from players where id = ?1")
+        .bind(player_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Deletes a game and everything that belongs to it (participants, moves,
+/// invitations). Doesn't touch player accounts. Caller is responsible for
+/// also dropping it from the in-memory `AppState.games` map — this only
+/// handles the database side.
+pub async fn delete_game(pool: &Pool<Sqlite>, game_id: &str) -> Result<bool, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("delete from game_moves where game_id = ?1")
+        .bind(game_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from game_participants where game_id = ?1")
+        .bind(game_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from game_invitations where game_id = ?1")
+        .bind(game_id)
+        .execute(&mut *tx)
+        .await?;
+    let result = sqlx::query("delete from games where id = ?1")
+        .bind(game_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn upsert_engine_profiles(
     pool: &Pool<Sqlite>,
     profiles: &[api::EngineProfileDto],
