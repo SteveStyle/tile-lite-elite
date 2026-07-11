@@ -220,13 +220,37 @@ async fn get_game(
 async fn start_game(
     Path(game_id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(_request): Json<StartGameRequest>,
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers).await;
+
     let dto = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
             .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+        // A fully anonymous game (no claimed seats) stays open to anyone,
+        // same as before this change. Once any seat is claimed, only a
+        // player who owns one of those seats can start the match — same
+        // "unclaimed stays open, claimed is owner-only" rule submit_action
+        // already applies per-seat, just evaluated game-wide here since
+        // starting isn't a per-seat action.
+        let claimed_owners: Vec<&str> = game
+            .participants
+            .iter()
+            .filter_map(|participant| participant.player_id.as_deref())
+            .collect();
+        let caller_owns_a_seat = caller_player_id
+            .as_deref()
+            .is_some_and(|id| claimed_owners.contains(&id));
+        if !claimed_owners.is_empty() && !caller_owns_a_seat {
+            return Err(ApiProblem::unauthorized(
+                "Only a player with a claimed seat in this game can start it",
+            ));
+        }
+
         game.start();
         run_engine_turns(game, &state.engines).await?;
         let dto = game.to_dto();
@@ -311,12 +335,29 @@ async fn submit_action(
 async fn preview_move(
     Path(game_id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<PreviewMoveRequest>,
 ) -> Result<Json<api::PreviewMoveResponse>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers).await;
     let games = state.games.read().await;
     let game = games
         .get(&game_id)
         .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+    // Previewing a seat you don't own would otherwise let a caller probe
+    // an opponent's exact rack contents by repeatedly guessing candidate
+    // placements and reading back legality/score.
+    if let Some(owner_id) = game
+        .participants
+        .get(request.seat_number as usize)
+        .and_then(|participant| participant.player_id.as_ref())
+    {
+        if caller_player_id.as_deref() != Some(owner_id.as_str()) {
+            return Err(ApiProblem::unauthorized(
+                "This seat belongs to a different player",
+            ));
+        }
+    }
 
     if game.status != api::GameStatus::Active {
         return Ok(Json(api::PreviewMoveResponse {
@@ -376,7 +417,10 @@ async fn preview_move(
 async fn suggest_move(
     Path(game_id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers).await;
+
     let dto = {
         let mut games = state.games.write().await;
         let game = games
@@ -395,6 +439,13 @@ async fn suggest_move(
             return Err(ApiProblem::bad_request(
                 "Current seat is not human-controlled",
             ));
+        }
+        if let Some(owner_id) = participant.player_id.as_ref() {
+            if caller_player_id.as_deref() != Some(owner_id.as_str()) {
+                return Err(ApiProblem::unauthorized(
+                    "This seat belongs to a different player",
+                ));
+            }
         }
 
         let rack = participant.rack;
@@ -442,15 +493,36 @@ async fn suggest_move(
 }
 
 async fn game_events(
-    Path(_game_id): Path<String>,
+    Path(game_id): Path<String>,
     State(state): State<AppState>,
     websocket: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    websocket.on_upgrade(move |socket| stream_events(socket, state.events.subscribe()))
+    websocket.on_upgrade(move |socket| stream_events(socket, game_id, state.events.subscribe()))
 }
 
-async fn stream_events(mut socket: WebSocket, mut rx: broadcast::Receiver<GameEventDto>) {
+/// `state.events` is a single broadcast channel shared by every game on the
+/// server, not one per game — every subscriber sees every game's events
+/// unless it filters, which this previously didn't do at all (the path's
+/// `game_id` was captured but never used). That meant a socket opened for
+/// one game silently received full state — including every seat's rack —
+/// for every other game in progress too. The client already discarded
+/// non-matching events, so this was invisible in normal play, but the
+/// leak was real on the wire.
+fn event_belongs_to_game(event: &GameEventDto, game_id: &str) -> bool {
+    let game = match event {
+        GameEventDto::StateUpdated { game }
+        | GameEventDto::GameStarted { game }
+        | GameEventDto::GameFinished { game } => game,
+    };
+    game.id == game_id
+}
+
+async fn stream_events(mut socket: WebSocket, game_id: String, mut rx: broadcast::Receiver<GameEventDto>) {
     while let Ok(event) = rx.recv().await {
+        if !event_belongs_to_game(&event, &game_id) {
+            continue;
+        }
+
         let message = match serde_json::to_string(&event) {
             Ok(message) => message,
             Err(_) => continue,
@@ -1120,6 +1192,21 @@ mod tests {
         )
         .await
         .expect("request should succeed")
+    }
+
+    async fn send_empty_auth(
+        app: Router,
+        method: Method,
+        uri: &str,
+        token: Option<&str>,
+    ) -> axum::http::Response<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if let Some(token) = token {
+            builder = builder.header("authorization", format!("Bearer {token}"));
+        }
+        app.oneshot(builder.body(Body::empty()).expect("request should build"))
+            .await
+            .expect("request should succeed")
     }
 
     /// `oneshot()`-driven tests never go through a real TCP listener, so
@@ -1886,6 +1973,249 @@ mod tests {
         )
         .await;
         assert_eq!(accepted.status(), StatusCode::OK);
+    }
+
+    /// Registers Alice and Mallory, and has Alice create a game (while
+    /// authenticated) with a human seat 0 for herself and the given kind
+    /// for seat 1. Returns both sessions and the created game.
+    async fn create_claimed_game_and_second_player(
+        app: Router,
+        seat_one_kind: SeatKind,
+    ) -> (PlayerSessionDto, PlayerSessionDto, GameStateDto) {
+        let alice: PlayerSessionDto = read_json(
+            send_json(
+                app.clone(),
+                Method::POST,
+                "/auth/register",
+                &RegisterPlayerRequest {
+                    display_name: "Alice".to_string(),
+                    email: "alice@example.com".to_string(),
+                    password: "correct horse battery staple".to_string(),
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let mallory: PlayerSessionDto = read_json(
+            send_json(
+                app.clone(),
+                Method::POST,
+                "/auth/register",
+                &RegisterPlayerRequest {
+                    display_name: "Mallory".to_string(),
+                    email: "mallory@example.com".to_string(),
+                    password: "another password entirely".to_string(),
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let seat_one = match seat_one_kind {
+            SeatKind::Human => CreateSeatRequest {
+                kind: SeatKind::Human,
+                display_name: "Player 2".to_string(),
+                engine_id: None,
+            },
+            SeatKind::Engine => CreateSeatRequest {
+                kind: SeatKind::Engine,
+                display_name: "Greedy".to_string(),
+                engine_id: Some("greedy-v1".to_string()),
+            },
+        };
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app,
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                        },
+                        seat_one,
+                    ],
+                    seed: Some(7),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            created.participants[0].player_id.as_deref(),
+            Some(alice.player_id.as_str())
+        );
+
+        (alice, mallory, created)
+    }
+
+    #[tokio::test]
+    async fn claimed_game_only_starts_for_a_seat_owner() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let (alice, mallory, created) =
+            create_claimed_game_and_second_player(app.clone(), SeatKind::Engine).await;
+
+        let rejected = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/start", created.id),
+            Some(&mallory.session_token),
+            &StartGameRequest::default(),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/start", created.id),
+            Some(&alice.session_token),
+            &StartGameRequest::default(),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn anonymous_game_start_still_works_for_anyone() {
+        // Games created without being logged in have no claimed seats, so
+        // starting one must stay open — same backward-compatibility
+        // guarantee as anonymous creation and unclaimed-seat actions.
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let started = create_two_human_game(app).await;
+        assert_eq!(started.status, api::GameStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn claimed_seat_preview_rejects_a_different_player() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let (alice, mallory, created) =
+            create_claimed_game_and_second_player(app.clone(), SeatKind::Engine).await;
+
+        let candidate = api::MoveCandidateDto {
+            start: api::PositionDto { x: 7, y: 7 },
+            direction: api::DirectionDto::Horizontal,
+            tiles: vec![api::TilePlacementDto {
+                offset: 0,
+                tile: api::TileDto::Letter { letter: 'A' },
+            }],
+        };
+
+        let rejected = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/preview", created.id),
+            Some(&mallory.session_token),
+            &PreviewMoveRequest {
+                seat_number: 0,
+                candidate: candidate.clone(),
+            },
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/preview", created.id),
+            Some(&alice.session_token),
+            &PreviewMoveRequest {
+                seat_number: 0,
+                candidate,
+            },
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn claimed_seat_suggest_move_rejects_a_different_player() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let (alice, mallory, created) =
+            create_claimed_game_and_second_player(app.clone(), SeatKind::Engine).await;
+
+        send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/start", created.id),
+            Some(&alice.session_token),
+            &StartGameRequest::default(),
+        )
+        .await;
+
+        let rejected = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/suggest", created.id),
+            Some(&mallory.session_token),
+        )
+        .await;
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted = send_empty_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/suggest", created.id),
+            Some(&alice.session_token),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn event_belongs_to_game_filters_by_id() {
+        // Regression test for the bug this fixed: a socket subscribed to
+        // one game's events must not receive another game's, even though
+        // every game shares the same underlying broadcast channel.
+        let event_for_a = GameEventDto::StateUpdated {
+            game: empty_live_game_for_test("game-a"),
+        };
+        let event_for_b = GameEventDto::GameFinished {
+            game: empty_live_game_for_test("game-b"),
+        };
+
+        assert!(event_belongs_to_game(&event_for_a, "game-a"));
+        assert!(!event_belongs_to_game(&event_for_a, "game-b"));
+        assert!(event_belongs_to_game(&event_for_b, "game-b"));
+        assert!(!event_belongs_to_game(&event_for_b, "game-a"));
+    }
+
+    fn empty_live_game_for_test(id: &str) -> GameStateDto {
+        GameStateDto {
+            id: id.to_string(),
+            status: api::GameStatus::Waiting,
+            variant: "official".to_string(),
+            language: "sowpods".to_string(),
+            board_layout: "official".to_string(),
+            turn_number: 0,
+            current_seat: 0,
+            winner_seat: None,
+            bag_count: 100,
+            participants: Vec::new(),
+            board: Vec::new(),
+            racks: Vec::new(),
+            moves: Vec::new(),
+        }
     }
 
     #[tokio::test]
