@@ -162,7 +162,11 @@ async fn create_game(
         })
         .collect::<Vec<_>>();
 
-    let seed = request.seed.unwrap_or(0x5EED_1234);
+    // A caller-supplied seed exists purely for deterministic tests; real
+    // play must get a fresh shuffle each time. The old fallback was a fixed
+    // constant, so every game created through the UI (which never sends a
+    // seed) dealt the exact same racks in the exact same order, every game.
+    let seed = request.seed.unwrap_or_else(rand::random);
     let game = GameSession::new(Uuid::new_v4().to_string(), participants, seed, rules);
     let dto = game.to_dto();
 
@@ -969,6 +973,67 @@ mod tests {
         assert_eq!(fetched_response.status(), StatusCode::OK);
         let fetched: GameStateDto = read_json(fetched_response).await;
         assert_eq!(fetched.id, created.id);
+    }
+
+    #[tokio::test]
+    async fn games_created_without_a_seed_get_different_racks() {
+        // Regression test: the default seed used to be a fixed constant, so
+        // every game created without an explicit seed (i.e. every real game
+        // through the UI, which never sends one) dealt the exact same racks
+        // in the exact same order, every single time.
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let new_game = CreateGameRequest {
+            seats: vec![
+                CreateSeatRequest {
+                    kind: SeatKind::Human,
+                    display_name: "Alice".to_string(),
+                    engine_id: None,
+                },
+                CreateSeatRequest {
+                    kind: SeatKind::Human,
+                    display_name: "Bob".to_string(),
+                    engine_id: None,
+                },
+            ],
+            seed: None,
+            variant: None,
+            language: None,
+            board_layout: None,
+        };
+
+        let first: GameStateDto =
+            read_json(send_json(app.clone(), Method::POST, "/games", &new_game).await).await;
+        let second: GameStateDto =
+            read_json(send_json(app.clone(), Method::POST, "/games", &new_game).await).await;
+
+        let first_started: GameStateDto = read_json(
+            send_json(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/start", first.id),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+        let second_started: GameStateDto = read_json(
+            send_json(
+                app,
+                Method::POST,
+                &format!("/games/{}/start", second.id),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+
+        assert_ne!(
+            first_started.racks, second_started.racks,
+            "two games created without an explicit seed dealt identical racks"
+        );
     }
 
     #[tokio::test]
