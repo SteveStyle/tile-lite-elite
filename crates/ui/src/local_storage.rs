@@ -19,6 +19,7 @@ pub struct StoredAuth {
     pub session_token: Option<String>,
 }
 
+#[cfg(target_arch = "wasm32")]
 const STORAGE_KEY: &str = "scrabble_px_auth";
 
 pub fn load() -> StoredAuth {
