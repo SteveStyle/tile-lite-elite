@@ -16,7 +16,7 @@ use gloo_net::{
 use tokio_tungstenite::connect_async;
 
 use crate::components::auth_panel::AuthPanel;
-use crate::components::games_panel::GamesPanel;
+use crate::components::games_panel::{GamesPanel, NewGameKind};
 use crate::components::sidebar::Sidebar;
 use crate::views::Home;
 
@@ -251,13 +251,14 @@ pub fn RootApp() -> Element {
                             is_loading.set(false);
                         });
                     },
-                    on_new_game: move |_| {
+                    on_new_game: move |kind: NewGameKind| {
                         let server_url = server_url_for_create.clone();
                         let token = session().map(|current| current.session_token.clone());
+                        let my_display_name = session().map(|current| current.display_name.clone());
                         spawn(async move {
                             is_loading.set(true);
                             error_message.set(None);
-                            match create_default_game(&server_url, token.as_deref()).await {
+                            match create_game(&server_url, token.as_deref(), kind, my_display_name.as_deref()).await {
                                 Ok(created) => {
                                     info_message.set(None);
                                     dragging_tile_id.set(None);
@@ -599,12 +600,17 @@ async fn load_game_by_id(server_url: &str, game_id: &str) -> Result<GameStateDto
     get_json::<GameStateDto>(&format!("{server_url}/games/{game_id}")).await
 }
 
-async fn create_default_game(server_url: &str, token: Option<&str>) -> Result<GameStateDto, String> {
-    let request = CreateGameRequest {
-        seats: vec![
+/// Builds the two seats for a freshly created game. The first seat is
+/// always the human-facing "me" seat when `my_display_name` is known (i.e.
+/// the caller is logged in); it falls back to a generic name for anonymous
+/// play, matching the server's existing anonymous-creation support.
+fn build_new_game_seats(kind: NewGameKind, my_display_name: Option<&str>) -> Vec<CreateSeatRequest> {
+    let my_name = my_display_name.unwrap_or("Player 1").to_string();
+    match kind {
+        NewGameKind::VsEngine => vec![
             CreateSeatRequest {
                 kind: SeatKind::Human,
-                display_name: "Alice".to_string(),
+                display_name: my_name,
                 engine_id: None,
             },
             CreateSeatRequest {
@@ -613,6 +619,41 @@ async fn create_default_game(server_url: &str, token: Option<&str>) -> Result<Ga
                 engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
             },
         ],
+        NewGameKind::VsHuman => vec![
+            CreateSeatRequest {
+                kind: SeatKind::Human,
+                display_name: my_name,
+                engine_id: None,
+            },
+            CreateSeatRequest {
+                kind: SeatKind::Human,
+                display_name: "Player 2".to_string(),
+                engine_id: None,
+            },
+        ],
+        NewGameKind::EngineVsEngine => vec![
+            CreateSeatRequest {
+                kind: SeatKind::Engine,
+                display_name: "Greedy One".to_string(),
+                engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
+            },
+            CreateSeatRequest {
+                kind: SeatKind::Engine,
+                display_name: "Greedy Two".to_string(),
+                engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
+            },
+        ],
+    }
+}
+
+async fn create_game(
+    server_url: &str,
+    token: Option<&str>,
+    kind: NewGameKind,
+    my_display_name: Option<&str>,
+) -> Result<GameStateDto, String> {
+    let request = CreateGameRequest {
+        seats: build_new_game_seats(kind, my_display_name),
         seed: None,
         variant: None,
         language: None,
@@ -1045,4 +1086,43 @@ fn current_rack_tiles(game: &GameStateDto, staged: &[StagedPlacementView]) -> Ve
     }
 
     tiles
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vs_engine_seats_are_one_human_one_engine() {
+        let seats = build_new_game_seats(NewGameKind::VsEngine, Some("Alice"));
+        assert_eq!(seats.len(), 2);
+        assert_eq!(seats[0].kind, SeatKind::Human);
+        assert_eq!(seats[0].display_name, "Alice");
+        assert_eq!(seats[1].kind, SeatKind::Engine);
+        assert!(seats[1].engine_id.is_some());
+    }
+
+    #[test]
+    fn vs_human_seats_are_both_human() {
+        let seats = build_new_game_seats(NewGameKind::VsHuman, Some("Alice"));
+        assert_eq!(seats.len(), 2);
+        assert!(seats.iter().all(|seat| seat.kind == SeatKind::Human));
+        assert_eq!(seats[0].display_name, "Alice");
+    }
+
+    #[test]
+    fn engine_vs_engine_seats_are_both_engine_and_ignore_display_name() {
+        let seats = build_new_game_seats(NewGameKind::EngineVsEngine, Some("Alice"));
+        assert_eq!(seats.len(), 2);
+        assert!(seats.iter().all(|seat| seat.kind == SeatKind::Engine));
+        assert!(seats.iter().all(|seat| seat.engine_id.is_some()));
+        assert!(seats.iter().all(|seat| seat.display_name != "Alice"));
+    }
+
+    #[test]
+    fn anonymous_creator_gets_a_generic_name_instead_of_a_hardcoded_one() {
+        let seats = build_new_game_seats(NewGameKind::VsEngine, None);
+        assert_ne!(seats[0].display_name, "Alice");
+        assert!(!seats[0].display_name.is_empty());
+    }
 }

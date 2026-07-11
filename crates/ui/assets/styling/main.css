@@ -475,13 +475,25 @@ button:disabled {
     margin-bottom: 16px;
 }
 
-.games-panel-actions {
-    display: flex;
-    gap: 8px;
+.games-panel-header .toggle-button-muted {
+    padding: 8px 14px;
+    font-size: 0.85rem;
 }
 
-.games-panel-actions .toggle-button,
-.games-panel-actions .toggle-button-muted {
+.games-panel-new-game {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.games-panel-new-game-label {
+    font-size: 0.8rem;
+    color: rgba(35, 25, 15, 0.6);
+}
+
+.games-panel-new-game .toggle-button {
     padding: 8px 14px;
     font-size: 0.85rem;
 }

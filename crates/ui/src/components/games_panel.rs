@@ -2,13 +2,23 @@ use crate::time_format::format_relative_time;
 use api::{GameStatus, GameSummaryDto};
 use dioxus::prelude::*;
 
+/// The seat shape for a newly created game. Every variant is exactly two
+/// seats today; see `crate::app::build_new_game_seats` for how each maps to
+/// `CreateSeatRequest`s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewGameKind {
+    VsEngine,
+    VsHuman,
+    EngineVsEngine,
+}
+
 #[component]
 pub fn GamesPanel(
     summaries: Vec<GameSummaryDto>,
     selected_id: Option<String>,
     is_loading: bool,
     on_select: EventHandler<String>,
-    on_new_game: EventHandler<()>,
+    on_new_game: EventHandler<NewGameKind>,
     on_refresh: EventHandler<()>,
 ) -> Element {
     let rows = summaries.iter().cloned().map(|summary| {
@@ -50,19 +60,32 @@ pub fn GamesPanel(
         aside { class: "games-panel",
             div { class: "games-panel-header",
                 h2 { "Games" }
-                div { class: "games-panel-actions",
-                    button {
-                        class: "toggle-button",
-                        disabled: is_loading,
-                        onclick: move |_| on_new_game.call(()),
-                        "New"
-                    }
-                    button {
-                        class: "toggle-button toggle-button-muted",
-                        disabled: is_loading,
-                        onclick: move |_| on_refresh.call(()),
-                        "Refresh"
-                    }
+                button {
+                    class: "toggle-button toggle-button-muted",
+                    disabled: is_loading,
+                    onclick: move |_| on_refresh.call(()),
+                    "Refresh"
+                }
+            }
+            div { class: "games-panel-new-game",
+                span { class: "games-panel-new-game-label", "New game:" }
+                button {
+                    class: "toggle-button",
+                    disabled: is_loading,
+                    onclick: move |_| on_new_game.call(NewGameKind::VsEngine),
+                    "vs Engine"
+                }
+                button {
+                    class: "toggle-button",
+                    disabled: is_loading,
+                    onclick: move |_| on_new_game.call(NewGameKind::VsHuman),
+                    "vs Human"
+                }
+                button {
+                    class: "toggle-button",
+                    disabled: is_loading,
+                    onclick: move |_| on_new_game.call(NewGameKind::EngineVsEngine),
+                    "Engine vs Engine"
                 }
             }
             if summaries.is_empty() {
