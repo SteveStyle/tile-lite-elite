@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use crate::board::{BoardCell, BoardState};
 use crate::cache::CrossCheck;
-use crate::dictionary::Dictionary;
+use crate::dictionary::{Dictionary, PrefixCursor};
 use crate::model::{Direction, Letter, MoveCandidate, Position, Rack, Tile, TilePlacement};
 use crate::validate::{GameState, RulesEngine};
 
@@ -12,7 +12,7 @@ pub trait MoveGenerator<State, Rack> {
     fn enumerate_legal_moves(&self, state: &State, rack: &Rack) -> Self::Iter;
 }
 
-impl<D: Dictionary> RulesEngine<'_, D> {
+impl<'a, D: Dictionary> RulesEngine<'a, D> {
     pub fn enumerate_legal_single_tile_moves(
         &self,
         state: &GameState,
@@ -61,6 +61,17 @@ impl<D: Dictionary> RulesEngine<'_, D> {
                         continue;
                     }
 
+                    // Seed the prefix search with whatever's already on
+                    // the board immediately before this anchor (if this
+                    // lane is extending an existing word rather than
+                    // starting fresh) — the cursor tracks the *whole*
+                    // word being built, not just the newly placed part.
+                    let Some(cursor) =
+                        seed_cursor(self.dictionary.root_cursor(), &state.board, start, direction)
+                    else {
+                        continue;
+                    };
+
                     let mut remaining = *rack;
                     let mut placements = Vec::new();
                     let next =
@@ -79,6 +90,7 @@ impl<D: Dictionary> RulesEngine<'_, D> {
                         max_tiles,
                         &mut moves,
                         &mut seen,
+                        cursor,
                     );
                 }
             }
@@ -102,6 +114,7 @@ impl<D: Dictionary> RulesEngine<'_, D> {
         max_tiles: usize,
         moves: &mut Vec<MoveCandidate>,
         seen: &mut HashSet<String>,
+        cursor: D::Cursor<'a>,
     ) {
         if !placements.is_empty() {
             let candidate = MoveCandidate {
@@ -123,7 +136,15 @@ impl<D: Dictionary> RulesEngine<'_, D> {
 
         let cell = state.board.get(current);
         match cell {
-            Some(BoardCell::Filled(_)) => {
+            Some(BoardCell::Filled(filled)) => {
+                // Only one possible "choice" here (whatever letter is
+                // already on the board) — just track it and keep going.
+                // If it somehow doesn't extend any real word (shouldn't
+                // happen: only fully-valid words ever get placed), that's
+                // a legitimate dead end for this lane, not a bug.
+                let Some(cursor) = cursor.advance(filled.letter) else {
+                    return;
+                };
                 if let Some(next_pos) = next {
                     self.expand_lane(
                         position,
@@ -138,6 +159,7 @@ impl<D: Dictionary> RulesEngine<'_, D> {
                         max_tiles,
                         moves,
                         seen,
+                        cursor,
                     );
                 }
             }
@@ -149,6 +171,17 @@ impl<D: Dictionary> RulesEngine<'_, D> {
                 };
 
                 for tile in available_tiles_for_crosscheck(remaining, cross_check) {
+                    // The actual pruning win: skip a letter entirely (no
+                    // recursion, no rack mutation) the moment it can't
+                    // possibly continue toward any real word, rather than
+                    // finding that out only after exploring everything
+                    // beneath it.
+                    let Some(letter) = tile.letter() else {
+                        continue;
+                    };
+                    let Some(next_cursor) = cursor.advance(letter) else {
+                        continue;
+                    };
                     if !remaining.consume_tile(tile) {
                         continue;
                     }
@@ -172,6 +205,7 @@ impl<D: Dictionary> RulesEngine<'_, D> {
                             max_tiles,
                             moves,
                             seen,
+                            next_cursor,
                         );
                     }
                     placements.pop();
@@ -190,6 +224,37 @@ impl<D: Dictionary> MoveGenerator<GameState, Rack> for RulesEngine<'_, D> {
         self.enumerate_legal_multi_tile_moves(state, rack)
             .into_iter()
     }
+}
+
+/// Walks backward from `pos` through any existing filled cells (i.e. this
+/// lane is extending an already-placed word rather than starting fresh),
+/// and replays those letters forward through `root` to get the correct
+/// starting search position — the cursor needs to track the *whole* word,
+/// not just the part still to be typed from `pos` onward.
+fn seed_cursor<C: PrefixCursor>(
+    root: C,
+    board: &BoardState,
+    pos: Position,
+    direction: Direction,
+) -> Option<C> {
+    let mut letters = Vec::new();
+    let mut current = pos;
+    while let Some(prev) = current.try_step_backward(direction) {
+        match board.filled_letter(prev) {
+            Some((letter, _)) => {
+                letters.push(letter);
+                current = prev;
+            }
+            None => break,
+        }
+    }
+    letters.reverse();
+
+    let mut cursor = root;
+    for letter in letters {
+        cursor = cursor.advance(letter)?;
+    }
+    Some(cursor)
 }
 
 fn available_tiles_for_crosscheck(rack: &Rack, cross_check: CrossCheck) -> Vec<Tile> {
@@ -277,6 +342,10 @@ mod tests {
         fn is_word(&self, word: &str) -> bool {
             self.words.contains(word)
         }
+
+        type Cursor<'a> = ();
+
+        fn root_cursor(&self) -> Self::Cursor<'_> {}
     }
 
     fn sample_rules() -> crate::model::VariantRules {
