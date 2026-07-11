@@ -1,0 +1,766 @@
+diff --git a/crates/api/src/lib.rs b/crates/api/src/lib.rs
+index 631a72a..30be15b 100644
+--- a/crates/api/src/lib.rs
++++ b/crates/api/src/lib.rs
+@@ -78,8 +78,6 @@ pub struct CreateSeatRequest {
+     pub kind: SeatKind,
+     pub display_name: String,
+     pub engine_id: Option<String>,
+-    pub email: Option<String>,
+-    pub recovery_secret: Option<String>,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+@@ -204,7 +202,7 @@ pub struct PreviewMoveResponse {
+ pub struct RegisterPlayerRequest {
+     pub display_name: String,
+     pub email: String,
+-    pub recovery_secret: String,
++    pub password: String,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+@@ -218,7 +216,7 @@ pub struct PlayerSessionDto {
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+ pub struct LoginPlayerRequest {
+     pub display_name: String,
+-    pub recovery_secret: String,
++    pub password: String,
+ }
+ 
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+diff --git a/crates/server-game/Cargo.toml b/crates/server-game/Cargo.toml
+index e0ad678..190300b 100644
+--- a/crates/server-game/Cargo.toml
++++ b/crates/server-game/Cargo.toml
+@@ -5,12 +5,14 @@ edition.workspace=true
+ 
+ [dependencies]
+ api = { path = "../api" }
++argon2 = "0.5"
+ axum = { version = "0.8", features = ["ws", "macros"] }
+ engine-core = { path = "../engine-core" }
+ rand = "0.8"
+ rules-shared = { path = "../rules-shared" }
+ serde = { version = "1", features = ["derive"] }
+ serde_json = "1"
++sha2 = "0.10"
+ sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "macros"] }
+ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "time"] }
+ tower = { version = "0.5", features = ["util"] }
+diff --git a/crates/server-game/src/app.rs b/crates/server-game/src/app.rs
+index 35a4f45..ea512a7 100644
+--- a/crates/server-game/src/app.rs
++++ b/crates/server-game/src/app.rs
+@@ -10,7 +10,7 @@ use api::{
+ };
+ use axum::extract::ws::{Message, WebSocket};
+ use axum::extract::{Path, State, WebSocketUpgrade};
+-use axum::http::StatusCode;
++use axum::http::{HeaderMap, StatusCode};
+ use axum::response::{IntoResponse, Response};
+ use axum::routing::{get, post};
+ use axum::{Json, Router};
+@@ -121,26 +121,43 @@ async fn list_games(State(state): State<AppState>) -> Result<Json<Vec<api::GameS
+ 
+ async fn create_game(
+     State(state): State<AppState>,
++    headers: HeaderMap,
+     Json(request): Json<CreateGameRequest>,
+ ) -> Result<Json<api::GameStateDto>, ApiProblem> {
+     if request.seats.is_empty() {
+         return Err(ApiProblem::bad_request("At least one seat is required"));
+     }
+ 
++    // If the creator is logged in, they own the first human seat, so nobody
++    // else can act as "them" later. Anonymous creation (no session) still
++    // works and produces an unclaimed game, same as before this change —
++    // claiming additional seats for other players is a separate invitation
++    // flow this doesn't attempt to solve yet.
++    let creator_player_id = authenticated_player_id(&state, &headers).await;
++    let mut creator_seat_claimed = false;
++
+     let rules = rules_shared::VariantRules::official();
+     let participants = request
+         .seats
+         .into_iter()
+         .enumerate()
+-        .map(|(seat_number, seat)| ParticipantState {
+-            seat_number: seat_number as u8,
+-            kind: seat.kind,
+-            display_name: seat.display_name,
+-            player_id: None,
+-            engine_id: seat.engine_id,
+-            score: 0,
+-            rack: rules_shared::Rack::default(),
+-            resigned: false,
++        .map(|(seat_number, seat)| {
++            let player_id = if !creator_seat_claimed && seat.kind == api::SeatKind::Human {
++                creator_seat_claimed = true;
++                creator_player_id.clone()
++            } else {
++                None
++            };
++            ParticipantState {
++                seat_number: seat_number as u8,
++                kind: seat.kind,
++                display_name: seat.display_name,
++                player_id,
++                engine_id: seat.engine_id,
++                score: 0,
++                rack: rules_shared::Rack::default(),
++                resigned: false,
++            }
+         })
+         .collect::<Vec<_>>();
+ 
+@@ -194,14 +211,33 @@ async fn start_game(
+ async fn submit_action(
+     Path(game_id): Path<String>,
+     State(state): State<AppState>,
++    headers: HeaderMap,
+     Json(request): Json<GameActionRequest>,
+ ) -> Result<Json<api::GameStateDto>, ApiProblem> {
++    let caller_player_id = authenticated_player_id(&state, &headers).await;
++
+     let dto = {
+         let mut games = state.games.write().await;
+         let game = games
+             .get_mut(&game_id)
+             .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+ 
++        // Unclaimed seats (no player_id bound at game creation) stay open
++        // to anyone, same as before this change. A claimed seat can only
++        // be acted on by the player who owns it.
++        if let Some(owner_id) = game
++            .participants
++            .iter()
++            .find(|participant| participant.seat_number == request.seat_number)
++            .and_then(|participant| participant.player_id.as_ref())
++        {
++            if caller_player_id.as_deref() != Some(owner_id.as_str()) {
++                return Err(ApiProblem::unauthorized(
++                    "This seat belongs to a different player",
++                ));
++            }
++        }
++
+         match request.action {
+             PlayerActionDto::Place { candidate } => game
+                 .apply_place_move(request.seat_number, move_candidate_from_dto(candidate))
+@@ -416,40 +452,48 @@ async fn register_player(
+     State(state): State<AppState>,
+     Json(request): Json<RegisterPlayerRequest>,
+ ) -> Result<Json<PlayerSessionDto>, ApiProblem> {
+-    // Hash the recovery secret
+-    let secret_hash = hash_secret(&request.recovery_secret);
++    let display_name = request.display_name.trim();
++    let email = request.email.trim();
++    if display_name.is_empty() || email.is_empty() || request.password.is_empty() {
++        return Err(ApiProblem::bad_request(
++            "Display name, email, and password are all required",
++        ));
++    }
+ 
+-    let player_id = Uuid::new_v4().to_string();
+-    let session_token = Uuid::new_v4().to_string();
+-    let session_token_hash = hash_secret(&session_token);
++    if persistence::get_player_by_name(&state.db, display_name)
++        .await
++        .map_err(ApiProblem::from_sqlx)?
++        .is_some()
++    {
++        return Err(ApiProblem::bad_request(
++            "That display name is already taken",
++        ));
++    }
+ 
+-    // Create player
+-    let _ = persistence::create_player(
+-        &state.db,
+-        &player_id,
+-        &request.display_name,
+-        &request.email,
+-        &secret_hash,
+-    )
+-    .await
+-    .map_err(|_| ApiProblem::bad_request("Failed to create player"))?;
++    let password_hash = hash_password(&request.password)
++        .map_err(|_| ApiProblem::bad_request("Could not process that password"))?;
+ 
+-    // Create session
+-    let _ = persistence::create_session(
++    let player_id = Uuid::new_v4().to_string();
++    persistence::create_player(&state.db, &player_id, display_name, email, &password_hash)
++        .await
++        .map_err(ApiProblem::from_sqlx)?;
++
++    let session_token = Uuid::new_v4().to_string();
++    persistence::create_session(
+         &state.db,
+         &Uuid::new_v4().to_string(),
+         &player_id,
+-        &session_token_hash,
++        &hash_token(&session_token),
+         None,
+     )
+     .await
+-    .map_err(|_| ApiProblem::bad_request("Failed to create session"))?;
++    .map_err(ApiProblem::from_sqlx)?;
+ 
+     Ok(Json(PlayerSessionDto {
+         player_id,
+         session_token,
+-        display_name: request.display_name,
+-        email: request.email,
++        display_name: display_name.to_string(),
++        email: email.to_string(),
+     }))
+ }
+ 
+@@ -457,30 +501,30 @@ async fn login_player(
+     State(state): State<AppState>,
+     Json(request): Json<LoginPlayerRequest>,
+ ) -> Result<Json<PlayerSessionDto>, ApiProblem> {
+-    // Look up player by display name
+-    let player = persistence::get_player_by_name(&state.db, &request.display_name)
++    // The same error is returned whether the name doesn't exist or the
++    // password is wrong, so a caller can't use this endpoint to discover
++    // which display names are registered.
++    let mismatch = || ApiProblem::bad_request("Incorrect name or password");
++
++    let player = persistence::get_player_by_name(&state.db, request.display_name.trim())
+         .await
+-        .map_err(|_| ApiProblem::bad_request("Database error"))?
+-        .ok_or_else(|| ApiProblem::not_found("Player not found"))?;
++        .map_err(ApiProblem::from_sqlx)?
++        .ok_or_else(mismatch)?;
+ 
+-    // Verify recovery secret
+-    let secret_hash = hash_secret(&request.recovery_secret);
+-    if secret_hash != player.recovery_secret_hash {
+-        return Err(ApiProblem::bad_request("Invalid recovery secret"));
++    if !verify_password(&request.password, &player.password_hash) {
++        return Err(mismatch());
+     }
+ 
+-    // Create session
+     let session_token = Uuid::new_v4().to_string();
+-    let session_token_hash = hash_secret(&session_token);
+-    let _ = persistence::create_session(
++    persistence::create_session(
+         &state.db,
+         &Uuid::new_v4().to_string(),
+         &player.id,
+-        &session_token_hash,
++        &hash_token(&session_token),
+         None,
+     )
+     .await
+-    .map_err(|_| ApiProblem::bad_request("Failed to create session"))?;
++    .map_err(ApiProblem::from_sqlx)?;
+ 
+     Ok(Json(PlayerSessionDto {
+         player_id: player.id,
+@@ -491,19 +535,26 @@ async fn login_player(
+ }
+ 
+ async fn validate_session(
+-    State(_state): State<AppState>,
++    State(state): State<AppState>,
+     Json(request): Json<ValidateSessionRequest>,
+ ) -> Result<Json<PlayerDto>, ApiProblem> {
+-    let _session_token_hash = hash_secret(&request.session_token);
++    let session = persistence::get_session_by_token_hash(&state.db, &hash_token(&request.session_token))
++        .await
++        .map_err(ApiProblem::from_sqlx)?
++        .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
+ 
+-    // Find session by token hash
+-    // Note: In a real system, you'd want an index on token_hash for performance
+-    // For now, we'll need to query differently or use a different approach
+-    // This is a simplification - in production, store sessions in a faster cache
++    let player = persistence::get_player_by_id(&state.db, &session.player_id)
++        .await
++        .map_err(ApiProblem::from_sqlx)?
++        .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
+ 
+-    Err(ApiProblem::bad_request(
+-        "Session validation not yet implemented",
+-    ))
++    Ok(Json(PlayerDto {
++        id: player.id,
++        display_name: player.display_name,
++        email: player.email,
++        created_at: player.created_at,
++        last_seen_at: player.last_seen_at,
++    }))
+ }
+ 
+ // ========== Game Invitation Handlers ==========
+@@ -632,13 +683,64 @@ async fn reject_invitation(
+ 
+ // ========== Helper Functions ==========
+ 
+-fn hash_secret(secret: &str) -> String {
+-    use std::collections::hash_map::DefaultHasher;
+-    use std::hash::{Hash, Hasher};
++/// Argon2 is deliberately slow, which is exactly right for a human-chosen
++/// password (resists brute-force guessing) but wrong for a session token
++/// looked up on every request — that uses `hash_token` (sha256) instead,
++/// since a UUIDv4 token already has enough entropy that a fast hash is safe.
++fn hash_password(password: &str) -> Result<String, String> {
++    use argon2::password_hash::{SaltString, rand_core::OsRng};
++    use argon2::{Argon2, PasswordHasher};
++
++    let salt = SaltString::generate(&mut OsRng);
++    Argon2::default()
++        .hash_password(password.as_bytes(), &salt)
++        .map(|hash| hash.to_string())
++        .map_err(|error| error.to_string())
++}
++
++fn verify_password(password: &str, stored_hash: &str) -> bool {
++    use argon2::{Argon2, PasswordHash, PasswordVerifier};
++
++    let Ok(parsed_hash) = PasswordHash::new(stored_hash) else {
++        return false;
++    };
++    Argon2::default()
++        .verify_password(password.as_bytes(), &parsed_hash)
++        .is_ok()
++}
++
++fn hash_token(token: &str) -> String {
++    use sha2::{Digest, Sha256};
+ 
+-    let mut hasher = DefaultHasher::new();
+-    secret.hash(&mut hasher);
+-    format!("{:x}", hasher.finish())
++    let mut hasher = Sha256::new();
++    hasher.update(token.as_bytes());
++    format!("{:x}", hasher.finalize())
++}
++
++/// Resolves the `Authorization: Bearer <token>` header (if present and
++/// valid) to a player id. Returns `None` rather than an error for any
++/// missing/malformed/unknown/expired token — callers decide whether an
++/// absent identity is acceptable for the action they're guarding.
++async fn authenticated_player_id(state: &AppState, headers: &HeaderMap) -> Option<String> {
++    let token = headers
++        .get(axum::http::header::AUTHORIZATION)?
++        .to_str()
++        .ok()?
++        .strip_prefix("Bearer ")?;
++
++    let session = persistence::get_session_by_token_hash(&state.db, &hash_token(token))
++        .await
++        .ok()??;
++
++    if let Some(expires_at) = &session.expires_at {
++        if let (Ok(expiry), Ok(now)) = (expires_at.parse::<u64>(), now_iso().parse::<u64>()) {
++            if now > expiry {
++                return None;
++            }
++        }
++    }
++
++    Some(session.player_id)
+ }
+ 
+ fn now_iso() -> String {
+@@ -691,6 +793,13 @@ impl ApiProblem {
+         }
+     }
+ 
++    fn unauthorized(message: impl Into<String>) -> Self {
++        Self {
++            status: StatusCode::UNAUTHORIZED,
++            message: message.into(),
++        }
++    }
++
+     fn from_sqlx(error: sqlx::Error) -> Self {
+         Self {
+             status: StatusCode::INTERNAL_SERVER_ERROR,
+@@ -760,6 +869,31 @@ mod tests {
+         .expect("request should succeed")
+     }
+ 
++    async fn send_json_auth<T: Serialize>(
++        app: Router,
++        method: Method,
++        uri: &str,
++        token: Option<&str>,
++        payload: &T,
++    ) -> axum::http::Response<Body> {
++        let mut builder = Request::builder()
++            .method(method)
++            .uri(uri)
++            .header("content-type", "application/json");
++        if let Some(token) = token {
++            builder = builder.header("authorization", format!("Bearer {token}"));
++        }
++        app.oneshot(
++            builder
++                .body(Body::from(
++                    serde_json::to_vec(payload).expect("payload should serialize"),
++                ))
++                .expect("request should build"),
++        )
++        .await
++        .expect("request should succeed")
++    }
++
+     async fn send_empty(app: Router, method: Method, uri: &str) -> axum::http::Response<Body> {
+         app.oneshot(
+             Request::builder()
+@@ -803,15 +937,11 @@ mod tests {
+                         kind: SeatKind::Human,
+                         display_name: "Alice".to_string(),
+                         engine_id: None,
+-                        email: None,
+-                        recovery_secret: None,
+                     },
+                     CreateSeatRequest {
+                         kind: SeatKind::Engine,
+                         display_name: "Greedy".to_string(),
+                         engine_id: Some("greedy-v1".to_string()),
+-                        email: None,
+-                        recovery_secret: None,
+                     },
+                 ],
+                 seed: Some(1234),
+@@ -866,15 +996,11 @@ mod tests {
+                             kind: SeatKind::Human,
+                             display_name: "Alice".to_string(),
+                             engine_id: None,
+-                            email: None,
+-                            recovery_secret: None,
+                         },
+                         CreateSeatRequest {
+                             kind: SeatKind::Engine,
+                             display_name: "Greedy".to_string(),
+                             engine_id: Some("greedy-v1".to_string()),
+-                            email: None,
+-                            recovery_secret: None,
+                         },
+                     ],
+                     seed: Some(77),
+@@ -964,8 +1090,6 @@ mod tests {
+                         kind: SeatKind::Human,
+                         display_name: "Alice".to_string(),
+                         engine_id: None,
+-                        email: None,
+-                        recovery_secret: None,
+                     }],
+                     seed: Some(999),
+                     variant: None,
+@@ -1010,15 +1134,11 @@ mod tests {
+                             kind: SeatKind::Human,
+                             display_name: "Alice".to_string(),
+                             engine_id: None,
+-                            email: None,
+-                            recovery_secret: None,
+                         },
+                         CreateSeatRequest {
+                             kind: SeatKind::Human,
+                             display_name: "Bob".to_string(),
+                             engine_id: None,
+-                            email: None,
+-                            recovery_secret: None,
+                         },
+                     ],
+                     seed: Some(42),
+@@ -1224,4 +1344,148 @@ mod tests {
+         assert_eq!(fetched.current_seat, 0);
+         assert_eq!(fetched.moves.len(), 0);
+     }
++
++    #[tokio::test]
++    async fn claimed_seat_rejects_actions_from_a_different_player() {
++        let database_url = test_database_url();
++        let state = create_test_state(&database_url).await;
++        let app = build_router(state);
++
++        let alice: PlayerSessionDto = read_json(
++            send_json(
++                app.clone(),
++                Method::POST,
++                "/auth/register",
++                &RegisterPlayerRequest {
++                    display_name: "Alice".to_string(),
++                    email: "alice@example.com".to_string(),
++                    password: "correct horse battery staple".to_string(),
++                },
++            )
++            .await,
++        )
++        .await;
++
++        let mallory: PlayerSessionDto = read_json(
++            send_json(
++                app.clone(),
++                Method::POST,
++                "/auth/register",
++                &RegisterPlayerRequest {
++                    display_name: "Mallory".to_string(),
++                    email: "mallory@example.com".to_string(),
++                    password: "another password entirely".to_string(),
++                },
++            )
++            .await,
++        )
++        .await;
++
++        // Alice creates a game while logged in, so seat 0 is bound to her.
++        let created: GameStateDto = read_json(
++            send_json_auth(
++                app.clone(),
++                Method::POST,
++                "/games",
++                Some(&alice.session_token),
++                &CreateGameRequest {
++                    seats: vec![
++                        CreateSeatRequest {
++                            kind: SeatKind::Human,
++                            display_name: "Alice".to_string(),
++                            engine_id: None,
++                        },
++                        CreateSeatRequest {
++                            kind: SeatKind::Engine,
++                            display_name: "Greedy".to_string(),
++                            engine_id: Some("greedy-v1".to_string()),
++                        },
++                    ],
++                    seed: Some(7),
++                    variant: None,
++                    language: None,
++                    board_layout: None,
++                },
++            )
++            .await,
++        )
++        .await;
++        assert_eq!(
++            created.participants[0].player_id.as_deref(),
++            Some(alice.player_id.as_str())
++        );
++
++        send_json_auth(
++            app.clone(),
++            Method::POST,
++            &format!("/games/{}/start", created.id),
++            Some(&alice.session_token),
++            &StartGameRequest::default(),
++        )
++        .await;
++
++        // Mallory can't act as Alice's seat, even with a valid session of
++        // her own.
++        let rejected = send_json_auth(
++            app.clone(),
++            Method::POST,
++            &format!("/games/{}/actions", created.id),
++            Some(&mallory.session_token),
++            &GameActionRequest {
++                seat_number: 0,
++                action: PlayerActionDto::Pass,
++            },
++        )
++        .await;
++        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
++
++        // Alice can.
++        let accepted = send_json_auth(
++            app,
++            Method::POST,
++            &format!("/games/{}/actions", created.id),
++            Some(&alice.session_token),
++            &GameActionRequest {
++                seat_number: 0,
++                action: PlayerActionDto::Pass,
++            },
++        )
++        .await;
++        assert_eq!(accepted.status(), StatusCode::OK);
++    }
++
++    #[tokio::test]
++    async fn registering_a_taken_display_name_is_rejected() {
++        let database_url = test_database_url();
++        let state = create_test_state(&database_url).await;
++        let app = build_router(state);
++
++        let first = send_json(
++            app.clone(),
++            Method::POST,
++            "/auth/register",
++            &RegisterPlayerRequest {
++                display_name: "John".to_string(),
++                email: "john1@example.com".to_string(),
++                password: "first-password".to_string(),
++            },
++        )
++        .await;
++        assert_eq!(first.status(), StatusCode::OK);
++
++        // A second "John" with a different email/password must be rejected
++        // outright, rather than silently colliding with the first at login.
++        let second = send_json(
++            app,
++            Method::POST,
++            "/auth/register",
++            &RegisterPlayerRequest {
++                display_name: "John".to_string(),
++                email: "john2@example.com".to_string(),
++                password: "second-password".to_string(),
++            },
++        )
++        .await;
++        assert_eq!(second.status(), StatusCode::BAD_REQUEST);
++    }
+ }
+diff --git a/crates/server-game/src/persistence.rs b/crates/server-game/src/persistence.rs
+index de318d3..1357973 100644
+--- a/crates/server-game/src/persistence.rs
++++ b/crates/server-game/src/persistence.rs
+@@ -44,12 +44,12 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+     sqlx::query(
+         "create table if not exists players (
+             id text primary key,
+-            display_name text not null,
++            display_name text not null unique,
+             email text not null,
+             email_verification_code_hash text,
+             email_verification_sent_at text,
+             email_verified_at text,
+-            recovery_secret_hash text not null,
++            password_hash text not null,
+             created_at text not null,
+             updated_at text not null,
+             last_seen_at text,
+@@ -392,7 +392,7 @@ pub struct PlayerRecord {
+     pub id: String,
+     pub display_name: String,
+     pub email: String,
+-    pub recovery_secret_hash: String,
++    pub password_hash: String,
+     pub created_at: String,
+     pub updated_at: String,
+     pub last_seen_at: Option<String>,
+@@ -403,17 +403,17 @@ pub async fn create_player(
+     id: &str,
+     display_name: &str,
+     email: &str,
+-    recovery_secret_hash: &str,
++    password_hash: &str,
+ ) -> Result<PlayerRecord, sqlx::Error> {
+     let now = now_iso();
+     sqlx::query(
+-        "insert into players (id, display_name, email, recovery_secret_hash, created_at, updated_at)
++        "insert into players (id, display_name, email, password_hash, created_at, updated_at)
+          values (?1, ?2, ?3, ?4, ?5, ?6)",
+     )
+     .bind(id)
+     .bind(display_name)
+     .bind(email)
+-    .bind(recovery_secret_hash)
++    .bind(password_hash)
+     .bind(&now)
+     .bind(&now)
+     .execute(pool)
+@@ -423,7 +423,7 @@ pub async fn create_player(
+         id: id.to_string(),
+         display_name: display_name.to_string(),
+         email: email.to_string(),
+-        recovery_secret_hash: recovery_secret_hash.to_string(),
++        password_hash: password_hash.to_string(),
+         created_at: now.clone(),
+         updated_at: now,
+         last_seen_at: None,
+@@ -435,7 +435,7 @@ pub async fn get_player_by_name(
+     display_name: &str,
+ ) -> Result<Option<PlayerRecord>, sqlx::Error> {
+     let row = sqlx::query(
+-        "select id, display_name, email, recovery_secret_hash, created_at, updated_at, last_seen_at
++        "select id, display_name, email, password_hash, created_at, updated_at, last_seen_at
+          from players where display_name = ?1",
+     )
+     .bind(display_name)
+@@ -446,7 +446,7 @@ pub async fn get_player_by_name(
+         id: r.get(0),
+         display_name: r.get(1),
+         email: r.get(2),
+-        recovery_secret_hash: r.get(3),
++        password_hash: r.get(3),
+         created_at: r.get(4),
+         updated_at: r.get(5),
+         last_seen_at: r.get(6),
+@@ -458,7 +458,7 @@ pub async fn get_player_by_id(
+     id: &str,
+ ) -> Result<Option<PlayerRecord>, sqlx::Error> {
+     let row = sqlx::query(
+-        "select id, display_name, email, recovery_secret_hash, created_at, updated_at, last_seen_at
++        "select id, display_name, email, password_hash, created_at, updated_at, last_seen_at
+          from players where id = ?1",
+     )
+     .bind(id)
+@@ -469,7 +469,7 @@ pub async fn get_player_by_id(
+         id: r.get(0),
+         display_name: r.get(1),
+         email: r.get(2),
+-        recovery_secret_hash: r.get(3),
++        password_hash: r.get(3),
+         created_at: r.get(4),
+         updated_at: r.get(5),
+         last_seen_at: r.get(6),
+@@ -517,6 +517,28 @@ pub async fn create_session(
+     })
+ }
+ 
++pub async fn get_session_by_token_hash(
++    pool: &Pool<Sqlite>,
++    token_hash: &str,
++) -> Result<Option<SessionRecord>, sqlx::Error> {
++    let row = sqlx::query(
++        "select id, player_id, token_hash, created_at, last_seen_at, expires_at
++         from sessions where token_hash = ?1",
++    )
++    .bind(token_hash)
++    .fetch_optional(pool)
++    .await?;
++
++    Ok(row.map(|r| SessionRecord {
++        id: r.get(0),
++        player_id: r.get(1),
++        token_hash: r.get(2),
++        created_at: r.get(3),
++        last_seen_at: r.get(4),
++        expires_at: r.get(5),
++    }))
++}
++
+ pub async fn get_session_by_id(
+     pool: &Pool<Sqlite>,
+     id: &str,
+diff --git a/crates/ui/src/app.rs b/crates/ui/src/app.rs
+index b90bee2..d122b0b 100644
+--- a/crates/ui/src/app.rs
++++ b/crates/ui/src/app.rs
+@@ -513,15 +513,11 @@ async fn create_default_game(server_url: &str) -> Result<GameStateDto, String> {
+                 kind: SeatKind::Human,
+                 display_name: "Alice".to_string(),
+                 engine_id: None,
+-                email: None,
+-                recovery_secret: None,
+             },
+             CreateSeatRequest {
+                 kind: SeatKind::Engine,
+                 display_name: "Greedy".to_string(),
+                 engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
+-                email: None,
+-                recovery_secret: None,
+             },
+         ],
+         seed: None,

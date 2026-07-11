@@ -44,12 +44,12 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     sqlx::query(
         "create table if not exists players (
             id text primary key,
-            display_name text not null,
+            display_name text not null unique,
             email text not null,
             email_verification_code_hash text,
             email_verification_sent_at text,
             email_verified_at text,
-            recovery_secret_hash text not null,
+            password_hash text not null,
             created_at text not null,
             updated_at text not null,
             last_seen_at text,
@@ -392,7 +392,7 @@ pub struct PlayerRecord {
     pub id: String,
     pub display_name: String,
     pub email: String,
-    pub recovery_secret_hash: String,
+    pub password_hash: String,
     pub created_at: String,
     pub updated_at: String,
     pub last_seen_at: Option<String>,
@@ -403,17 +403,17 @@ pub async fn create_player(
     id: &str,
     display_name: &str,
     email: &str,
-    recovery_secret_hash: &str,
+    password_hash: &str,
 ) -> Result<PlayerRecord, sqlx::Error> {
     let now = now_iso();
     sqlx::query(
-        "insert into players (id, display_name, email, recovery_secret_hash, created_at, updated_at)
+        "insert into players (id, display_name, email, password_hash, created_at, updated_at)
          values (?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .bind(id)
     .bind(display_name)
     .bind(email)
-    .bind(recovery_secret_hash)
+    .bind(password_hash)
     .bind(&now)
     .bind(&now)
     .execute(pool)
@@ -423,7 +423,7 @@ pub async fn create_player(
         id: id.to_string(),
         display_name: display_name.to_string(),
         email: email.to_string(),
-        recovery_secret_hash: recovery_secret_hash.to_string(),
+        password_hash: password_hash.to_string(),
         created_at: now.clone(),
         updated_at: now,
         last_seen_at: None,
@@ -435,7 +435,7 @@ pub async fn get_player_by_name(
     display_name: &str,
 ) -> Result<Option<PlayerRecord>, sqlx::Error> {
     let row = sqlx::query(
-        "select id, display_name, email, recovery_secret_hash, created_at, updated_at, last_seen_at
+        "select id, display_name, email, password_hash, created_at, updated_at, last_seen_at
          from players where display_name = ?1",
     )
     .bind(display_name)
@@ -446,7 +446,7 @@ pub async fn get_player_by_name(
         id: r.get(0),
         display_name: r.get(1),
         email: r.get(2),
-        recovery_secret_hash: r.get(3),
+        password_hash: r.get(3),
         created_at: r.get(4),
         updated_at: r.get(5),
         last_seen_at: r.get(6),
@@ -458,7 +458,7 @@ pub async fn get_player_by_id(
     id: &str,
 ) -> Result<Option<PlayerRecord>, sqlx::Error> {
     let row = sqlx::query(
-        "select id, display_name, email, recovery_secret_hash, created_at, updated_at, last_seen_at
+        "select id, display_name, email, password_hash, created_at, updated_at, last_seen_at
          from players where id = ?1",
     )
     .bind(id)
@@ -469,7 +469,7 @@ pub async fn get_player_by_id(
         id: r.get(0),
         display_name: r.get(1),
         email: r.get(2),
-        recovery_secret_hash: r.get(3),
+        password_hash: r.get(3),
         created_at: r.get(4),
         updated_at: r.get(5),
         last_seen_at: r.get(6),
@@ -515,6 +515,28 @@ pub async fn create_session(
         last_seen_at: now,
         expires_at: expires_at.map(|s| s.to_string()),
     })
+}
+
+pub async fn get_session_by_token_hash(
+    pool: &Pool<Sqlite>,
+    token_hash: &str,
+) -> Result<Option<SessionRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        "select id, player_id, token_hash, created_at, last_seen_at, expires_at
+         from sessions where token_hash = ?1",
+    )
+    .bind(token_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| SessionRecord {
+        id: r.get(0),
+        player_id: r.get(1),
+        token_hash: r.get(2),
+        created_at: r.get(3),
+        last_seen_at: r.get(4),
+        expires_at: r.get(5),
+    }))
 }
 
 pub async fn get_session_by_id(

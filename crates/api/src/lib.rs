@@ -78,8 +78,6 @@ pub struct CreateSeatRequest {
     pub kind: SeatKind,
     pub display_name: String,
     pub engine_id: Option<String>,
-    pub email: Option<String>,
-    pub recovery_secret: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,7 +202,7 @@ pub struct PreviewMoveResponse {
 pub struct RegisterPlayerRequest {
     pub display_name: String,
     pub email: String,
-    pub recovery_secret: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -218,7 +216,7 @@ pub struct PlayerSessionDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LoginPlayerRequest {
     pub display_name: String,
-    pub recovery_secret: String,
+    pub password: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
