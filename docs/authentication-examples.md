@@ -22,7 +22,7 @@ curl -X POST http://127.0.0.1:3000/auth/register \
   -d '{
     "display_name": "Alice",
     "email": "alice@example.com",
-    "recovery_secret": "alice-secret-phrase-123"
+    "password": "alice-secret-phrase-123"
   }'
 ```
 
@@ -46,7 +46,7 @@ curl -X POST http://127.0.0.1:3000/auth/register \
   -d '{
     "display_name": "Bob",
     "email": "bob@example.com",
-    "recovery_secret": "bob-secret-phrase-456"
+    "password": "bob-secret-phrase-456"
   }'
 ```
 
@@ -194,14 +194,14 @@ Now both Alice and Bob are in the game and can play!
 
 ### Step 1: Alice Logs in
 
-Assume Alice is on a new laptop. She retrieves her account using her display name + recovery secret:
+Assume Alice is on a new laptop. She retrieves her account using her display name + password:
 
 ```bash
 curl -X POST http://127.0.0.1:3000/auth/login \
   -H "Content-Type: application/json" \
   -d '{
     "display_name": "Alice",
-    "recovery_secret": "alice-secret-phrase-123"
+    "password": "alice-secret-phrase-123"
   }'
 ```
 
@@ -276,23 +276,23 @@ curl -X POST http://127.0.0.1:3000/games/game-123-abc/invite \
 }
 ```
 
-### Invalid Recovery Secret
+### Invalid Password
 
-If Alice tries to log in with the wrong recovery secret:
+If Alice tries to log in with the wrong password:
 
 ```bash
 curl -X POST http://127.0.0.1:3000/auth/login \
   -H "Content-Type: application/json" \
   -d '{
     "display_name": "Alice",
-    "recovery_secret": "wrong-secret"
+    "password": "wrong-secret"
   }'
 ```
 
 **Response:** `400 Bad Request`
 ```json
 {
-  "message": "Invalid recovery secret"
+  "message": "Incorrect name or password"
 }
 ```
 
@@ -310,7 +310,7 @@ const response = await fetch('http://127.0.0.1:3000/auth/register', {
   body: JSON.stringify({
     display_name: 'Alice',
     email: 'alice@example.com',
-    recovery_secret: 'alice-secret-phrase-123'
+    password: 'alice-secret-phrase-123'
   })
 });
 
@@ -323,23 +323,25 @@ localStorage.setItem('player_id', player_id);
 
 ### Desktop Client
 
-Store the session token in the application's secure storage (platform-dependent):
-
-- **Linux/macOS**: Consider `keychain` or encrypted file
-- **Windows**: Consider `Credential Manager` or encrypted file
-- For MVP: encrypted local file or secure directory
+**As actually implemented**: a plain JSON file under the OS config directory (via the `dirs` crate — e.g. `~/.config/scrabble-px/auth.json` on Linux), holding the remembered display name and, if "Stay logged in" was checked, the raw session token. This is **not** encrypted or OS-keychain-backed — anyone with filesystem access to that account can read a logged-in session token straight out of the file. Fine for a hobby project on a personal machine; revisit before this is ever exposed to a shared or untrusted machine.
 
 ```rust
-// Pseudocode
-let response = register_player("Alice", "alice@example.com", "secret").await?;
-secure_storage::write("session_token", &response.session_token)?;
-secure_storage::write("player_id", &response.player_id)?;
+// crates/ui/src/local_storage.rs, roughly:
+let response = register_player(server_url, "Alice", "alice@example.com", "secret").await?;
+local_storage::save(&StoredAuth {
+    remembered_name: Some("Alice".to_string()),
+    session_token: Some(response.session_token),
+});
 ```
+
+The web client's equivalent uses real browser `localStorage` (via `gloo-storage`), which has the same "not really a secret store" caveat — anything in `localStorage` is readable by any script with page access.
 
 ## Next Steps
 
-- Implement session validation endpoint (`POST /auth/validate`) for full reconnect support
-- Add email verification flow with short codes
-- Integrate authentication UI into web/desktop clients
-- Implement automatic seat assignment when invitation is accepted
-- Add player search / discovery endpoint
+- ~~Implement session validation endpoint (`POST /auth/validate`)~~ — done.
+- ~~Integrate authentication UI into web/desktop clients~~ — done (Login/Register tabs, Remember me / Stay logged in checkboxes).
+- Add email verification flow with short codes.
+- Build the "forgot password" flow (`/auth/forgot-password`, `/auth/reset-password`) — currently nothing sends a reset link at all.
+- Implement automatic seat assignment when invitation is accepted (see `authentication-and-invitations.md`).
+- Extend seat-ownership checks beyond `submit_action` to `start_game`, `preview_move`, `suggest_move`, and the WebSocket events endpoint.
+- Add player search / discovery endpoint.

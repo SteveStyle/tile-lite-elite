@@ -42,20 +42,22 @@ The project has successfully implemented the core MVP architecture: a server-aut
 - **Purpose**: Game lifecycle, turn sequencing, persistence, engine proxy
 - **Status**: ✅ Implemented
 - **Contents**:
-  - `app.rs` - Axum router, HTTP handlers (create_game, list_games, get_game, start_game, submit_action, game_events)
-  - `game_state.rs` - GameSession, ParticipantState, EngineRegistry
-  - `persistence.rs` - SQLite migrations, save/load game
-- **Notes**: Server is properly authoritative; all rule validation happens server-side
+  - `app.rs` - Axum router, HTTP handlers (create_game, list_games, get_game, start_game, submit_action, preview_move, suggest_move, game_events, register_player, login_player, validate_session, invite/accept/reject invitation), plus the auth helpers (argon2 password hashing, sha256 token hashing, bearer-token resolution)
+  - `game_state.rs` - GameSession, ParticipantState, EngineRegistry; `maybe_run_engine_turn` is async, running the engine via `spawn_blocking` with a timeout
+  - `persistence.rs` - SQLite migrations, save/load game, session/player lookups
+- **Notes**: Server is properly authoritative; all rule validation happens server-side. Engine-originated moves flow through the exact same `apply_*` methods a human's HTTP action does — no special-cased trust path for engines.
 
 #### `crates/ui/`
 - **Purpose**: Web and desktop presentation layers (Dioxus framework)
 - **Status**: ✅ Implemented
 - **Contents**:
-  - `app.rs` - RootApp component (1200 lines), game state management, event handlers
-  - `main.rs` - Application entry point
-  - `components/` - Reusable UI components (board_view, rack_view, sidebar)
-  - `views/home.rs` - Main game UI layout
-- **Notes**: Dual-target (web WASM + desktop native), uses same codebase via feature flags
+  - `app.rs` - RootApp component, three-column layout composition (Games / board+rack / Seats+Recent Moves), game state management, event handlers, auth session state
+  - `main.rs` - Application entry point (desktop window: 1400×1150 default, 800×600 minimum)
+  - `local_storage.rs` - Cross-platform persistence for "remember me" / "stay logged in" (browser localStorage on web, a plain JSON config file on desktop — not encrypted either way)
+  - `time_format.rs` - Relative-time formatting for the games list ("3m ago")
+  - `components/` - `board_view`, `rack_view`, `sidebar` (Seats + Recent Moves), `games_panel` (game management + selectable list), `auth_panel` (Login/Register widget)
+  - `views/home.rs` - Center-column game view (board, rack, staged-move controls, turn actions); trimmed of the original hero/marketing copy and technical details (server URL, "Client Role" explanation) during a UI cleanup pass
+- **Notes**: Dual-target (web WASM + desktop native), uses same codebase via feature flags. Layout is a CSS Grid with each column independently scrollable within a viewport-relative height, since the 15×15 board plus rack can exceed a typical window's height.
 
 ---
 
@@ -101,9 +103,10 @@ The project has successfully implemented the core MVP architecture: a server-aut
   - Available via GameStateDto
 
 - [x] Deterministic tests for move legality and scoring
-  - rules-shared includes examples/ directory
-  - basic_flow.rs shows test patterns
-  - No full test suite documented yet
+  - rules-shared: 20 unit tests (anchors, cross-checks, dictionary lookup, move generation including blanks, bingo bonus, gap rejection)
+  - server-game: 11 integration tests against the real Axum router (create/list/get, human move + engine auto-reply, persistence reload, all four player actions, wrong-turn/not-found/illegal-move rejection, seat-ownership enforcement, display-name uniqueness)
+  - engine-core: 1 test (greedy engine opening move)
+  - 32 tests total, all passing as of the last full run
 
 ### ✅ Clients
 
@@ -136,6 +139,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
   - games table: id, status, variant, language, board_layout, turn_number, current_seat, winner_seat, random_seed, snapshot_json
   - game_participants: seat_number, kind, display_name, player_id, engine_id, score, joined_at, left_at
   - game_moves: move_number, seat_number, move_type, main_word, score_delta, description
+  - players: display_name (unique), email, password_hash (argon2)
 
 ### ✅ Server Infrastructure
 
@@ -145,10 +149,10 @@ The project has successfully implemented the core MVP architecture: a server-aut
   - CORS enabled (CorsLayer::permissive())
 
 - [x] REST API shape correct
-  - POST /games with CreateGameRequest
-  - GET /games returns list of game IDs
+  - POST /games with CreateGameRequest (binds the creator's first human seat if authenticated; anonymous creation still works, fully open)
+  - GET /games returns `Vec<GameSummaryDto>` (id, status, participants, current seat, last-activity time) — not bare IDs
   - GET /games/{id} returns GameStateDto
-  - POST /games/{id}/actions with GameActionRequest
+  - POST /games/{id}/actions with GameActionRequest — rejects a claimed seat if the caller isn't its owner
   - All responses are JSON, serde-compatible
 
 - [x] Reconnect support
@@ -163,18 +167,19 @@ The project has successfully implemented the core MVP architecture: a server-aut
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| WebSocket events for live updates | Partial | Route exists (`/games/{game_id}/events`) but client doesn't subscribe |
+| WebSocket events for live updates | Implemented client-side | Server broadcasts, and the client (`crates/ui/src/app.rs`) does subscribe and apply live updates — this row was stale, the earlier "client doesn't subscribe" claim is no longer true |
 | Engine vs engine play | Not tested | Infrastructure exists but no test coverage |
 | Multiple engine implementations | Reference only | Only GreedyEngine exists; arch supports plugging in more |
 | Engine benchmarking | Not built | Engine trait supports it; CLI for benchmarking not implemented |
-| Player identity (user accounts) | Schema exists | Tables created but login/auth not implemented |
+| Player identity (user accounts) | Implemented | Register/login/validate work end-to-end, with a real login UI (web + desktop) and seat-ownership enforcement on `submit_action`. See `authentication.md`'s status section for exactly what's still missing (email verification, forgot-password, ownership checks on other endpoints) |
 | Spectator mode | Not implemented | No spectator_id in schema or endpoints |
 | Audit log | Not implemented | Schema exists (audit_log table), not used |
 | Versioned engine contract | Not tested | Version strings exist in metadata, no migration tested |
+| Engine turn timeout | Implemented | Engine runs via `spawn_blocking` raced against a 5s `tokio::time::timeout`; a timed-out engine auto-passes rather than stalling the game. No test yet forces the timeout branch itself |
 | Save/load game state | Partial | Save works; load requires manual game ID (no UI) |
 | CLI client | Not built | Architecture supports it; Dioxus CLI would compile it |
 | Mobile client | Not built | Architecture supports Dioxus mobile target |
-| Timed play | Not implemented | time_budget_ms in EngineRequest but not enforced |
+| Timed play | Not implemented (for humans) | Engine-side timeout exists (above); no equivalent per-turn clock for human players |
 
 ### ⚠️ Partially Implemented
 
@@ -188,18 +193,23 @@ The project has successfully implemented the core MVP architecture: a server-aut
 **Engine Execution**:
 - EngineRegistry holds engines
 - GreedyEngine compiles and produces moves
-- Server calls `run_engine_turns()` after game start
-- Engine moves submitted to authoritative game state
-- **Missing**: time limits, sandboxing, diagnostics/explanation output
+- Server calls `run_engine_turns()` after game start, human moves, and suggest-move
+- Engine moves submitted to authoritative game state through the same `apply_*` methods a human action goes through — no special-cased trust path
+- Runs via `tokio::task::spawn_blocking` (CPU-bound work off the async runtime) raced against a 5s `tokio::time::timeout`; a timeout auto-passes the seat rather than stalling the game
+- **Missing**: sandboxing, diagnostics/explanation output, a test that actually forces the timeout branch
 
 **Authentication**:
-- ✅ Schema includes players table (id, display_name, email, recovery_secret_hash, created_at, updated_at, last_seen_at)
+- ✅ Schema includes players table (id, display_name **[unique]**, email, password_hash, created_at, updated_at, last_seen_at)
 - ✅ Schema includes sessions table (id, player_id, token_hash, created_at, last_seen_at, expires_at)
-- ✅ POST /auth/register - Create new player account
-- ✅ POST /auth/login - Restore player account with recovery secret
-- ⚠️ POST /auth/validate - Endpoint exists but not fully implemented (session lookup needs optimization)
-- ✅ Player accounts persist with hashed secrets
-- ⚠️ Email not verified in MVP (captured for future use)
+- ✅ POST /auth/register — creates a new player, rejects a duplicate `display_name` with a clear error, hashes the password with argon2
+- ✅ POST /auth/login — verifies against the argon2 hash; returns the same generic error whether the name is unknown or the password is wrong, to avoid leaking which names are registered
+- ✅ POST /auth/validate — fully implemented (previously a stub returning "not yet implemented"); resolves a bearer token to a player
+- ✅ Bearer-token auth (`Authorization: Bearer <token>`) is threaded through the client for every action-submitting request
+- ✅ Seat-ownership enforcement: if a game is created while authenticated, the creator's first human seat is bound to their player id; `submit_action` then rejects any other (or no) authenticated caller for that seat. Anonymous game creation still works exactly as before, fully open — this was a deliberate backward-compatibility choice, not an oversight
+- ✅ Login/Register UI exists in `crates/ui` (web + desktop), with "Remember me" (pre-fills display name next time) and "Stay logged in" (persists the session token) checkboxes
+- ⚠️ Only `submit_action` checks ownership — `start_game`, `preview_move`, `suggest_move`, and the WebSocket events endpoint don't check identity at all yet
+- ⚠️ Email not verified in MVP (captured for future use); no "forgot password" flow exists
+- ⚠️ Claiming a *second* human seat (inviting someone else in) isn't wired to the invitation-accept flow — see the Game Invitations notes below, unchanged
 
 **Game Invitations**:
 - ✅ Schema includes game_invitations table (id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, responded_at)
@@ -243,8 +253,8 @@ The project has successfully implemented the core MVP architecture: a server-aut
    - Invalid move rejections could log rule violation reason
 
 2. **Testing**
-   - No integration tests for end-to-end game flow
-   - Engine move generation not tested against reference rules
+   - Real coverage now exists: 32 tests across the workspace (see the MVP Checklist above for the breakdown), including HTTP-level integration tests and the security-relevant seat-ownership/uniqueness tests
+   - Still missing: engine-vs-engine play, a test that forces the engine timeout branch, anything beyond `submit_action` for auth/ownership, and any test of the WebSocket events path
 
 3. **Observability**
    - No structured logging
@@ -259,28 +269,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 
 ## Verification
 
-### Recent Successful Operations
-
-1. **Database initialization**: ✅
-   - Server started, migrations ran successfully
-   - games, game_participants, game_moves tables created
-   - Database file initialized (65 KB)
-
-2. **Game creation**: ✅
-   ```
-   POST /games with CreateGameRequest
-   Response: GameStateDto with id, status:waiting, participants list
-   ```
-
-3. **Desktop client**: ✅
-   - Launches and connects to backend on port 3000
-   - Displays game UI (board, rack, sidebar)
-   - Can create game via "New Human vs Engine" button
-
-4. **Web UI build**: 🔄
-   - Currently compiling (57/297 crates at 80s)
-   - Clean build after removing corrupted wasm-dev artifacts
-   - Expected to serve at localhost:8080 when complete
+Both clients (web via `dx serve`, desktop via `cargo run -p scrabble-ui --features desktop`) connect to the backend and support the full game loop: create/select a game, place tiles, pass, exchange, resign, play against the greedy engine, and log in/register with a persisted session. `cargo test` at the workspace root runs all 32 tests; see `operations.md` for exact commands to run each piece.
 
 ---
 
@@ -288,32 +277,32 @@ The project has successfully implemented the core MVP architecture: a server-aut
 
 ### MVP (Current Target)
 
-Status: **~85% Complete**
+Status: **Core loop solid; player identity now real, not just schema**
 
-✅ Mostly Done:
-- Server-owned game state
-- Rule enforcement
-- Human vs engine games
-- Shared rules library
-- Basic game operations (create, move, pass, resign)
-- Persistence (SQLite)
-- Two client types (web + desktop)
-
-🔄 In Progress:
-- Web UI build (finalizing)
-- Engine move execution (working, not tested)
+✅ Done:
+- Server-owned game state, rule enforcement
+- Human vs engine games, shared rules library
+- All four player actions (place, pass, exchange, resign)
+- Persistence (SQLite), two client types (web + desktop)
+- Live updates over WebSocket (server broadcasts, client subscribes and applies)
+- Real test coverage (32 tests, see above)
+- Engine turn timeout (auto-pass on a slow engine rather than stalling)
+- Player accounts: register/login/validate, argon2 password hashing, unique display names, a real login UI with "remember me"/"stay logged in"
+- Seat-ownership enforcement on `submit_action` for games created while logged in
 
 ❌ Not Yet:
-- Live updates (WebSocket not wired to UI)
-- Robust error messages
-- Test coverage
+- Ownership enforcement beyond `submit_action` (start/preview/suggest/WebSocket)
+- Forgot-password / email verification flows
+- Claiming a second human seat via invitations (accept doesn't auto-place the player yet)
+- Structured logging / engine decision diagnostics
+- Engine-vs-engine test coverage
 
 ### v1 (Next Phase)
 
 Expected next focus:
 - Multiple engine implementations
 - Engine benchmarking CLI
-- Player authentication
+- Finish the invitations → seat-claiming flow
 - Full move validation test suite
 - Client-side preview validation
 
@@ -321,6 +310,4 @@ Expected next focus:
 
 ## Conclusion
 
-The architecture plan is **well-executed**. The codebase correctly separates concerns, uses the right technologies (Rust, Axum, Dioxus, SQLite), and has the foundation to support all documented features. The main gaps are in UI integration (WebSocket events), testing, and optional features (auth, spectator, timed play).
-
-The desktop client is already working end-to-end. Once the web UI build completes, both clients should be able to create games and play against the server.
+The architecture plan is **well-executed**. The codebase correctly separates concerns, uses the right technologies (Rust, Axum, Dioxus, SQLite), and has the foundation to support all documented features. Both clients work end-to-end today, including a real login/register flow with seat-ownership protection. The main remaining gaps are the parts of auth/identity not yet extended past `submit_action`, the invitations-to-seat-claiming handoff, observability (structured logging), and optional features (spectator mode, timed play for humans, engine benchmarking).

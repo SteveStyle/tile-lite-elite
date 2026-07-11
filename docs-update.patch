@@ -1,0 +1,688 @@
+diff --git a/IMPLEMENTATION_STATUS.md b/IMPLEMENTATION_STATUS.md
+index 8767fbc..47d5e1c 100644
+--- a/IMPLEMENTATION_STATUS.md
++++ b/IMPLEMENTATION_STATUS.md
+@@ -42,20 +42,22 @@ The project has successfully implemented the core MVP architecture: a server-aut
+ - **Purpose**: Game lifecycle, turn sequencing, persistence, engine proxy
+ - **Status**: ✅ Implemented
+ - **Contents**:
+-  - `app.rs` - Axum router, HTTP handlers (create_game, list_games, get_game, start_game, submit_action, game_events)
+-  - `game_state.rs` - GameSession, ParticipantState, EngineRegistry
+-  - `persistence.rs` - SQLite migrations, save/load game
+-- **Notes**: Server is properly authoritative; all rule validation happens server-side
++  - `app.rs` - Axum router, HTTP handlers (create_game, list_games, get_game, start_game, submit_action, preview_move, suggest_move, game_events, register_player, login_player, validate_session, invite/accept/reject invitation), plus the auth helpers (argon2 password hashing, sha256 token hashing, bearer-token resolution)
++  - `game_state.rs` - GameSession, ParticipantState, EngineRegistry; `maybe_run_engine_turn` is async, running the engine via `spawn_blocking` with a timeout
++  - `persistence.rs` - SQLite migrations, save/load game, session/player lookups
++- **Notes**: Server is properly authoritative; all rule validation happens server-side. Engine-originated moves flow through the exact same `apply_*` methods a human's HTTP action does — no special-cased trust path for engines.
+ 
+ #### `crates/ui/`
+ - **Purpose**: Web and desktop presentation layers (Dioxus framework)
+ - **Status**: ✅ Implemented
+ - **Contents**:
+-  - `app.rs` - RootApp component (1200 lines), game state management, event handlers
+-  - `main.rs` - Application entry point
+-  - `components/` - Reusable UI components (board_view, rack_view, sidebar)
+-  - `views/home.rs` - Main game UI layout
+-- **Notes**: Dual-target (web WASM + desktop native), uses same codebase via feature flags
++  - `app.rs` - RootApp component, three-column layout composition (Games / board+rack / Seats+Recent Moves), game state management, event handlers, auth session state
++  - `main.rs` - Application entry point (desktop window: 1400×1150 default, 800×600 minimum)
++  - `local_storage.rs` - Cross-platform persistence for "remember me" / "stay logged in" (browser localStorage on web, a plain JSON config file on desktop — not encrypted either way)
++  - `time_format.rs` - Relative-time formatting for the games list ("3m ago")
++  - `components/` - `board_view`, `rack_view`, `sidebar` (Seats + Recent Moves), `games_panel` (game management + selectable list), `auth_panel` (Login/Register widget)
++  - `views/home.rs` - Center-column game view (board, rack, staged-move controls, turn actions); trimmed of the original hero/marketing copy and technical details (server URL, "Client Role" explanation) during a UI cleanup pass
++- **Notes**: Dual-target (web WASM + desktop native), uses same codebase via feature flags. Layout is a CSS Grid with each column independently scrollable within a viewport-relative height, since the 15×15 board plus rack can exceed a typical window's height.
+ 
+ ---
+ 
+@@ -101,9 +103,10 @@ The project has successfully implemented the core MVP architecture: a server-aut
+   - Available via GameStateDto
+ 
+ - [x] Deterministic tests for move legality and scoring
+-  - rules-shared includes examples/ directory
+-  - basic_flow.rs shows test patterns
+-  - No full test suite documented yet
++  - rules-shared: 20 unit tests (anchors, cross-checks, dictionary lookup, move generation including blanks, bingo bonus, gap rejection)
++  - server-game: 11 integration tests against the real Axum router (create/list/get, human move + engine auto-reply, persistence reload, all four player actions, wrong-turn/not-found/illegal-move rejection, seat-ownership enforcement, display-name uniqueness)
++  - engine-core: 1 test (greedy engine opening move)
++  - 32 tests total, all passing as of the last full run
+ 
+ ### ✅ Clients
+ 
+@@ -136,6 +139,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
+   - games table: id, status, variant, language, board_layout, turn_number, current_seat, winner_seat, random_seed, snapshot_json
+   - game_participants: seat_number, kind, display_name, player_id, engine_id, score, joined_at, left_at
+   - game_moves: move_number, seat_number, move_type, main_word, score_delta, description
++  - players: display_name (unique), email, password_hash (argon2)
+ 
+ ### ✅ Server Infrastructure
+ 
+@@ -145,10 +149,10 @@ The project has successfully implemented the core MVP architecture: a server-aut
+   - CORS enabled (CorsLayer::permissive())
+ 
+ - [x] REST API shape correct
+-  - POST /games with CreateGameRequest
+-  - GET /games returns list of game IDs
++  - POST /games with CreateGameRequest (binds the creator's first human seat if authenticated; anonymous creation still works, fully open)
++  - GET /games returns `Vec<GameSummaryDto>` (id, status, participants, current seat, last-activity time) — not bare IDs
+   - GET /games/{id} returns GameStateDto
+-  - POST /games/{id}/actions with GameActionRequest
++  - POST /games/{id}/actions with GameActionRequest — rejects a claimed seat if the caller isn't its owner
+   - All responses are JSON, serde-compatible
+ 
+ - [x] Reconnect support
+@@ -163,18 +167,19 @@ The project has successfully implemented the core MVP architecture: a server-aut
+ 
+ | Feature | Status | Notes |
+ |---------|--------|-------|
+-| WebSocket events for live updates | Partial | Route exists (`/games/{game_id}/events`) but client doesn't subscribe |
++| WebSocket events for live updates | Implemented client-side | Server broadcasts, and the client (`crates/ui/src/app.rs`) does subscribe and apply live updates — this row was stale, the earlier "client doesn't subscribe" claim is no longer true |
+ | Engine vs engine play | Not tested | Infrastructure exists but no test coverage |
+ | Multiple engine implementations | Reference only | Only GreedyEngine exists; arch supports plugging in more |
+ | Engine benchmarking | Not built | Engine trait supports it; CLI for benchmarking not implemented |
+-| Player identity (user accounts) | Schema exists | Tables created but login/auth not implemented |
++| Player identity (user accounts) | Implemented | Register/login/validate work end-to-end, with a real login UI (web + desktop) and seat-ownership enforcement on `submit_action`. See `authentication.md`'s status section for exactly what's still missing (email verification, forgot-password, ownership checks on other endpoints) |
+ | Spectator mode | Not implemented | No spectator_id in schema or endpoints |
+ | Audit log | Not implemented | Schema exists (audit_log table), not used |
+ | Versioned engine contract | Not tested | Version strings exist in metadata, no migration tested |
++| Engine turn timeout | Implemented | Engine runs via `spawn_blocking` raced against a 5s `tokio::time::timeout`; a timed-out engine auto-passes rather than stalling the game. No test yet forces the timeout branch itself |
+ | Save/load game state | Partial | Save works; load requires manual game ID (no UI) |
+ | CLI client | Not built | Architecture supports it; Dioxus CLI would compile it |
+ | Mobile client | Not built | Architecture supports Dioxus mobile target |
+-| Timed play | Not implemented | time_budget_ms in EngineRequest but not enforced |
++| Timed play | Not implemented (for humans) | Engine-side timeout exists (above); no equivalent per-turn clock for human players |
+ 
+ ### ⚠️ Partially Implemented
+ 
+@@ -188,18 +193,23 @@ The project has successfully implemented the core MVP architecture: a server-aut
+ **Engine Execution**:
+ - EngineRegistry holds engines
+ - GreedyEngine compiles and produces moves
+-- Server calls `run_engine_turns()` after game start
+-- Engine moves submitted to authoritative game state
+-- **Missing**: time limits, sandboxing, diagnostics/explanation output
++- Server calls `run_engine_turns()` after game start, human moves, and suggest-move
++- Engine moves submitted to authoritative game state through the same `apply_*` methods a human action goes through — no special-cased trust path
++- Runs via `tokio::task::spawn_blocking` (CPU-bound work off the async runtime) raced against a 5s `tokio::time::timeout`; a timeout auto-passes the seat rather than stalling the game
++- **Missing**: sandboxing, diagnostics/explanation output, a test that actually forces the timeout branch
+ 
+ **Authentication**:
+-- ✅ Schema includes players table (id, display_name, email, recovery_secret_hash, created_at, updated_at, last_seen_at)
++- ✅ Schema includes players table (id, display_name **[unique]**, email, password_hash, created_at, updated_at, last_seen_at)
+ - ✅ Schema includes sessions table (id, player_id, token_hash, created_at, last_seen_at, expires_at)
+-- ✅ POST /auth/register - Create new player account
+-- ✅ POST /auth/login - Restore player account with recovery secret
+-- ⚠️ POST /auth/validate - Endpoint exists but not fully implemented (session lookup needs optimization)
+-- ✅ Player accounts persist with hashed secrets
+-- ⚠️ Email not verified in MVP (captured for future use)
++- ✅ POST /auth/register — creates a new player, rejects a duplicate `display_name` with a clear error, hashes the password with argon2
++- ✅ POST /auth/login — verifies against the argon2 hash; returns the same generic error whether the name is unknown or the password is wrong, to avoid leaking which names are registered
++- ✅ POST /auth/validate — fully implemented (previously a stub returning "not yet implemented"); resolves a bearer token to a player
++- ✅ Bearer-token auth (`Authorization: Bearer <token>`) is threaded through the client for every action-submitting request
++- ✅ Seat-ownership enforcement: if a game is created while authenticated, the creator's first human seat is bound to their player id; `submit_action` then rejects any other (or no) authenticated caller for that seat. Anonymous game creation still works exactly as before, fully open — this was a deliberate backward-compatibility choice, not an oversight
++- ✅ Login/Register UI exists in `crates/ui` (web + desktop), with "Remember me" (pre-fills display name next time) and "Stay logged in" (persists the session token) checkboxes
++- ⚠️ Only `submit_action` checks ownership — `start_game`, `preview_move`, `suggest_move`, and the WebSocket events endpoint don't check identity at all yet
++- ⚠️ Email not verified in MVP (captured for future use); no "forgot password" flow exists
++- ⚠️ Claiming a *second* human seat (inviting someone else in) isn't wired to the invitation-accept flow — see the Game Invitations notes below, unchanged
+ 
+ **Game Invitations**:
+ - ✅ Schema includes game_invitations table (id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, responded_at)
+@@ -243,8 +253,8 @@ The project has successfully implemented the core MVP architecture: a server-aut
+    - Invalid move rejections could log rule violation reason
+ 
+ 2. **Testing**
+-   - No integration tests for end-to-end game flow
+-   - Engine move generation not tested against reference rules
++   - Real coverage now exists: 32 tests across the workspace (see the MVP Checklist above for the breakdown), including HTTP-level integration tests and the security-relevant seat-ownership/uniqueness tests
++   - Still missing: engine-vs-engine play, a test that forces the engine timeout branch, anything beyond `submit_action` for auth/ownership, and any test of the WebSocket events path
+ 
+ 3. **Observability**
+    - No structured logging
+@@ -259,28 +269,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
+ 
+ ## Verification
+ 
+-### Recent Successful Operations
+-
+-1. **Database initialization**: ✅
+-   - Server started, migrations ran successfully
+-   - games, game_participants, game_moves tables created
+-   - Database file initialized (65 KB)
+-
+-2. **Game creation**: ✅
+-   ```
+-   POST /games with CreateGameRequest
+-   Response: GameStateDto with id, status:waiting, participants list
+-   ```
+-
+-3. **Desktop client**: ✅
+-   - Launches and connects to backend on port 3000
+-   - Displays game UI (board, rack, sidebar)
+-   - Can create game via "New Human vs Engine" button
+-
+-4. **Web UI build**: 🔄
+-   - Currently compiling (57/297 crates at 80s)
+-   - Clean build after removing corrupted wasm-dev artifacts
+-   - Expected to serve at localhost:8080 when complete
++Both clients (web via `dx serve`, desktop via `cargo run -p scrabble-ui --features desktop`) connect to the backend and support the full game loop: create/select a game, place tiles, pass, exchange, resign, play against the greedy engine, and log in/register with a persisted session. `cargo test` at the workspace root runs all 32 tests; see `operations.md` for exact commands to run each piece.
+ 
+ ---
+ 
+@@ -288,32 +277,32 @@ The project has successfully implemented the core MVP architecture: a server-aut
+ 
+ ### MVP (Current Target)
+ 
+-Status: **~85% Complete**
+-
+-✅ Mostly Done:
+-- Server-owned game state
+-- Rule enforcement
+-- Human vs engine games
+-- Shared rules library
+-- Basic game operations (create, move, pass, resign)
+-- Persistence (SQLite)
+-- Two client types (web + desktop)
++Status: **Core loop solid; player identity now real, not just schema**
+ 
+-🔄 In Progress:
+-- Web UI build (finalizing)
+-- Engine move execution (working, not tested)
++✅ Done:
++- Server-owned game state, rule enforcement
++- Human vs engine games, shared rules library
++- All four player actions (place, pass, exchange, resign)
++- Persistence (SQLite), two client types (web + desktop)
++- Live updates over WebSocket (server broadcasts, client subscribes and applies)
++- Real test coverage (32 tests, see above)
++- Engine turn timeout (auto-pass on a slow engine rather than stalling)
++- Player accounts: register/login/validate, argon2 password hashing, unique display names, a real login UI with "remember me"/"stay logged in"
++- Seat-ownership enforcement on `submit_action` for games created while logged in
+ 
+ ❌ Not Yet:
+-- Live updates (WebSocket not wired to UI)
+-- Robust error messages
+-- Test coverage
++- Ownership enforcement beyond `submit_action` (start/preview/suggest/WebSocket)
++- Forgot-password / email verification flows
++- Claiming a second human seat via invitations (accept doesn't auto-place the player yet)
++- Structured logging / engine decision diagnostics
++- Engine-vs-engine test coverage
+ 
+ ### v1 (Next Phase)
+ 
+ Expected next focus:
+ - Multiple engine implementations
+ - Engine benchmarking CLI
+-- Player authentication
++- Finish the invitations → seat-claiming flow
+ - Full move validation test suite
+ - Client-side preview validation
+ 
+@@ -321,6 +310,4 @@ Expected next focus:
+ 
+ ## Conclusion
+ 
+-The architecture plan is **well-executed**. The codebase correctly separates concerns, uses the right technologies (Rust, Axum, Dioxus, SQLite), and has the foundation to support all documented features. The main gaps are in UI integration (WebSocket events), testing, and optional features (auth, spectator, timed play).
+-
+-The desktop client is already working end-to-end. Once the web UI build completes, both clients should be able to create games and play against the server.
++The architecture plan is **well-executed**. The codebase correctly separates concerns, uses the right technologies (Rust, Axum, Dioxus, SQLite), and has the foundation to support all documented features. Both clients work end-to-end today, including a real login/register flow with seat-ownership protection. The main remaining gaps are the parts of auth/identity not yet extended past `submit_action`, the invitations-to-seat-claiming handoff, observability (structured logging), and optional features (spectator mode, timed play for humans, engine benchmarking).
+diff --git a/docs/authentication-and-invitations.md b/docs/authentication-and-invitations.md
+index 8699966..018792f 100644
+--- a/docs/authentication-and-invitations.md
++++ b/docs/authentication-and-invitations.md
+@@ -20,7 +20,7 @@ Create a new player account.
+ {
+   "display_name": "Alice",
+   "email": "alice@example.com",
+-  "recovery_secret": "my-secret-phrase"
++  "password": "my-secret-phrase"
+ }
+ ```
+ 
+@@ -35,24 +35,24 @@ Create a new player account.
+ ```
+ 
+ **Errors:**
+-- `400 Bad Request` — Invalid input or player already exists
++- `400 Bad Request` — missing/empty field, or `display_name` is already taken (enforced at the DB level — see `schema.md`)
+ 
+ **Notes:**
+-- Store the `session_token` securely on the client (e.g., localStorage for web, secure storage on desktop)
+-- The `recovery_secret` is hashed server-side; use it to restore your account on another device
+-- Email is captured for future account recovery; no verification required in MVP
++- Store the `session_token` on the client — real browser `localStorage` on web, a plain (unencrypted) JSON file under the OS config directory on desktop. Neither is a secure secret store; see `authentication-examples.md` for the caveat.
++- The `password` is hashed with argon2 server-side; use it to log back in on another device.
++- Email is captured for future account recovery; no verification required in MVP, and no "forgot password" flow exists yet.
+ 
+-### Login with Recovery Secret
++### Login with Password
+ 
+ **Endpoint:** `POST /auth/login`
+ 
+-Restore an existing player account using display name + recovery secret.
++Restore an existing player account using display name + password.
+ 
+ **Request:**
+ ```json
+ {
+   "display_name": "Alice",
+-  "recovery_secret": "my-secret-phrase"
++  "password": "my-secret-phrase"
+ }
+ ```
+ 
+@@ -67,19 +67,18 @@ Restore an existing player account using display name + recovery secret.
+ ```
+ 
+ **Errors:**
+-- `400 Bad Request` — Invalid recovery secret
+-- `404 Not Found` — Player not found
++- `400 Bad Request` — `"Incorrect name or password"`, returned identically whether the display name doesn't exist or the password is wrong. This is deliberate: a distinct 404-for-unknown-name response would let a caller enumerate registered display names. There is no separate 404 case.
+ 
+ **Notes:**
+ - Use this endpoint when opening the app on a new device
+ - Each login generates a fresh session token
+-- No password; just the recovery secret and display name
++- Just display name + password — no separate recovery mechanism yet beyond this
+ 
+ ### Validate Session
+ 
+ **Endpoint:** `POST /auth/validate`
+ 
+-Check if a session token is still valid (not yet implemented in MVP).
++Check if a session token is still valid, and return the associated player.
+ 
+ **Request:**
+ ```json
+@@ -265,9 +264,9 @@ Decline an invitation to join a game.
+ 
+ ### `players` table
+ - `id` — Unique player identifier
+-- `display_name` — Player username
++- `display_name` — Player username, **unique** (enforced at the DB level, so two players can never collide under the same name)
+ - `email` — Contact email (for recovery)
+-- `recovery_secret_hash` — Hashed recovery secret (not the raw secret)
++- `password_hash` — argon2-hashed password (not the raw password)
+ - `created_at` — Registration timestamp
+ - `updated_at` — Last profile update
+ - `last_seen_at` — Last activity timestamp
+@@ -275,10 +274,10 @@ Decline an invitation to join a game.
+ ### `sessions` table
+ - `id` — Unique session identifier
+ - `player_id` — Reference to `players.id`
+-- `token_hash` — Hashed session token (not the raw token)
++- `token_hash` — sha256-hashed session token (not the raw token)
+ - `created_at` — Session creation timestamp
+ - `last_seen_at` — Last activity timestamp
+-- `expires_at` — Optional expiration (not yet used in MVP)
++- `expires_at` — Optional expiration (not yet set by any endpoint — sessions are currently non-expiring)
+ 
+ ### `game_invitations` table
+ - `id` — Unique invitation identifier
+@@ -294,11 +293,11 @@ Unique constraint: `(game_id, invited_player_id, seat_number)`
+ 
+ ## Security Notes
+ 
+-- All secrets (recovery_secret, session_token) are hashed using a DefaultHasher before storage
+-- In production, use bcrypt or scrypt instead of DefaultHasher
+-- Session tokens are opaque UUIDs; clients must treat them like passwords
+-- Email is unverified in MVP; future versions can add verification flow
+-- Invitations carry no authentication; game-level access control is handled separately
++- Passwords are hashed with **argon2** (deliberately slow, salted — resists brute-force guessing of human-chosen passwords).
++- Session tokens are hashed with **sha256** before storage — deliberately fast, since a session token is a high-entropy UUID rather than a human-chosen secret, and the hash needs to support a lookup on every authenticated request.
++- Session tokens are opaque UUIDs; clients must treat them like passwords.
++- Email is unverified in MVP; future versions can add verification flow.
++- Invitations carry no authentication; game-level access control is handled separately (and, as of the seat-ownership work, only `submit_action` actually enforces it — see `authentication.md`'s status section).
+ 
+ ## Future Enhancements
+ 
+diff --git a/docs/authentication-examples.md b/docs/authentication-examples.md
+index 42094ac..1af71ae 100644
+--- a/docs/authentication-examples.md
++++ b/docs/authentication-examples.md
+@@ -22,7 +22,7 @@ curl -X POST http://127.0.0.1:3000/auth/register \
+   -d '{
+     "display_name": "Alice",
+     "email": "alice@example.com",
+-    "recovery_secret": "alice-secret-phrase-123"
++    "password": "alice-secret-phrase-123"
+   }'
+ ```
+ 
+@@ -46,7 +46,7 @@ curl -X POST http://127.0.0.1:3000/auth/register \
+   -d '{
+     "display_name": "Bob",
+     "email": "bob@example.com",
+-    "recovery_secret": "bob-secret-phrase-456"
++    "password": "bob-secret-phrase-456"
+   }'
+ ```
+ 
+@@ -194,14 +194,14 @@ Now both Alice and Bob are in the game and can play!
+ 
+ ### Step 1: Alice Logs in
+ 
+-Assume Alice is on a new laptop. She retrieves her account using her display name + recovery secret:
++Assume Alice is on a new laptop. She retrieves her account using her display name + password:
+ 
+ ```bash
+ curl -X POST http://127.0.0.1:3000/auth/login \
+   -H "Content-Type: application/json" \
+   -d '{
+     "display_name": "Alice",
+-    "recovery_secret": "alice-secret-phrase-123"
++    "password": "alice-secret-phrase-123"
+   }'
+ ```
+ 
+@@ -276,23 +276,23 @@ curl -X POST http://127.0.0.1:3000/games/game-123-abc/invite \
+ }
+ ```
+ 
+-### Invalid Recovery Secret
++### Invalid Password
+ 
+-If Alice tries to log in with the wrong recovery secret:
++If Alice tries to log in with the wrong password:
+ 
+ ```bash
+ curl -X POST http://127.0.0.1:3000/auth/login \
+   -H "Content-Type: application/json" \
+   -d '{
+     "display_name": "Alice",
+-    "recovery_secret": "wrong-secret"
++    "password": "wrong-secret"
+   }'
+ ```
+ 
+ **Response:** `400 Bad Request`
+ ```json
+ {
+-  "message": "Invalid recovery secret"
++  "message": "Incorrect name or password"
+ }
+ ```
+ 
+@@ -310,7 +310,7 @@ const response = await fetch('http://127.0.0.1:3000/auth/register', {
+   body: JSON.stringify({
+     display_name: 'Alice',
+     email: 'alice@example.com',
+-    recovery_secret: 'alice-secret-phrase-123'
++    password: 'alice-secret-phrase-123'
+   })
+ });
+ 
+@@ -323,23 +323,25 @@ localStorage.setItem('player_id', player_id);
+ 
+ ### Desktop Client
+ 
+-Store the session token in the application's secure storage (platform-dependent):
+-
+-- **Linux/macOS**: Consider `keychain` or encrypted file
+-- **Windows**: Consider `Credential Manager` or encrypted file
+-- For MVP: encrypted local file or secure directory
++**As actually implemented**: a plain JSON file under the OS config directory (via the `dirs` crate — e.g. `~/.config/scrabble-px/auth.json` on Linux), holding the remembered display name and, if "Stay logged in" was checked, the raw session token. This is **not** encrypted or OS-keychain-backed — anyone with filesystem access to that account can read a logged-in session token straight out of the file. Fine for a hobby project on a personal machine; revisit before this is ever exposed to a shared or untrusted machine.
+ 
+ ```rust
+-// Pseudocode
+-let response = register_player("Alice", "alice@example.com", "secret").await?;
+-secure_storage::write("session_token", &response.session_token)?;
+-secure_storage::write("player_id", &response.player_id)?;
++// crates/ui/src/local_storage.rs, roughly:
++let response = register_player(server_url, "Alice", "alice@example.com", "secret").await?;
++local_storage::save(&StoredAuth {
++    remembered_name: Some("Alice".to_string()),
++    session_token: Some(response.session_token),
++});
+ ```
+ 
++The web client's equivalent uses real browser `localStorage` (via `gloo-storage`), which has the same "not really a secret store" caveat — anything in `localStorage` is readable by any script with page access.
++
+ ## Next Steps
+ 
+-- Implement session validation endpoint (`POST /auth/validate`) for full reconnect support
+-- Add email verification flow with short codes
+-- Integrate authentication UI into web/desktop clients
+-- Implement automatic seat assignment when invitation is accepted
+-- Add player search / discovery endpoint
++- ~~Implement session validation endpoint (`POST /auth/validate`)~~ — done.
++- ~~Integrate authentication UI into web/desktop clients~~ — done (Login/Register tabs, Remember me / Stay logged in checkboxes).
++- Add email verification flow with short codes.
++- Build the "forgot password" flow (`/auth/forgot-password`, `/auth/reset-password`) — currently nothing sends a reset link at all.
++- Implement automatic seat assignment when invitation is accepted (see `authentication-and-invitations.md`).
++- Extend seat-ownership checks beyond `submit_action` to `start_game`, `preview_move`, `suggest_move`, and the WebSocket events endpoint.
++- Add player search / discovery endpoint.
+diff --git a/docs/authentication.md b/docs/authentication.md
+index 3961b01..10c9dcf 100644
+--- a/docs/authentication.md
++++ b/docs/authentication.md
+@@ -1,5 +1,21 @@
+ # Authentication And Player Recognition
+ 
++## Current Status (as of the seat-ownership work)
++
++What's actually implemented, vs. the aspirational design below:
++
++- ✅ Player/session split, with bearer-token sessions (`Authorization: Bearer <token>`) — matches the model described here.
++- ✅ Password hashing uses argon2 (not a lightweight PIN scheme) — despite this doc's "short passphrase" framing below, the actual `password` field is a real password with no length/strength cap in the API.
++- ✅ `display_name` is enforced unique at the DB level (this doc doesn't mention that requirement explicitly, but it's load-bearing: without it, two players with the same name would collide unpredictably at login).
++- ✅ Login/register UI exists (web + desktop), with "Remember me" (prefills display name only) and "Stay logged in" (persists the session token) checkboxes.
++- ✅ **Seat ownership enforcement**: if a game is created while logged in, the creator's seat is bound to their player id, and `submit_action` rejects any request for that seat from a different (or no) authenticated player. Games created anonymously stay fully open, unchanged from before this existed.
++- ⚠️ Email verification: schema exists (`email_verification_*` columns), nothing sends or checks a code yet.
++- ⚠️ Password-reset-via-email ("forgot password" flow): not built. No `/auth/forgot-password` or `/auth/reset-password` endpoint exists yet.
++- ⚠️ Only `submit_action` enforces seat ownership. `start_game`, `preview_move`, `suggest_move`, and the WebSocket events endpoint do not check identity at all yet.
++- ⚠️ Claiming a *second* human seat (inviting someone else into your game) isn't wired up — see `authentication-and-invitations.md`. Only the creator's own seat gets bound automatically.
++
++The rest of this document is the original design reasoning and is still broadly accurate in spirit — read it as direction, not as a literal description of what exists.
++
+ ## Goal
+ 
+ A player should be recognized each time they connect.
+@@ -13,7 +29,7 @@ Use two distinct concepts:
+ - `player`: the persistent identity of the person using the system
+ - `session`: a temporary connection token that proves the current client is allowed to act as that player
+ 
+-For connecting from a different client, add a small recovery secret such as a PIN or short passphrase. The secret should be easy enough to enter without much friction, but strong enough to prevent accidental impersonation.
++For connecting from a different client, add a small password such as a PIN or short passphrase. The secret should be easy enough to enter without much friction, but strong enough to prevent accidental impersonation.
+ 
+ Email should always be captured. It is part of the recovery model, and it gives the player a stable way to restore identity on a different client. The MVP does not need to verify it immediately.
+ 
+@@ -30,14 +46,14 @@ The server should recognize a returning player by validating their session token
+ - The client stores the opaque token locally.
+ - On later connections, the client presents the token.
+ - If the token is valid, the server recognizes the same player.
+-- If the token is missing or invalid, the client can restore identity by entering the same display name plus recovery secret, or become a new anonymous player if that flow is allowed.
++- If the token is missing or invalid, the client can restore identity by entering the same display name plus password, or become a new anonymous player if that flow is allowed.
+ 
+ ## Recommended UX
+ 
+ Keep the first-run flow short:
+ 
+ - choose a display name
+-- create or accept a short recovery secret
++- create or accept a short password
+ - add an email address for recovery
+ - optionally trust this device so future connects are automatic
+ 
+@@ -48,9 +64,9 @@ The email should include a short verification code.
+ On another client, the player can restore identity by entering:
+ 
+ - the display name, or a lookup handle if we later add one
+-- the recovery secret
++- the password
+ 
+-This gives the player a low-friction way to identify themselves without a full account/password system.
++This gives the player a low-friction way to identify themselves, without the heavier flows (email verification gates, password-strength rules, etc.) a general-purpose account system would need.
+ 
+ ## What Should Persist
+ 
+@@ -62,7 +78,7 @@ Persist:
+ - email verification code hash or equivalent
+ - email verification status and verified time
+ - email may be unverified initially, especially for local play
+-- recovery secret hash or equivalent verifier
++- password hash or equivalent verifier
+ - authentication/session tokens as hashes
+ - last seen time
+ - any stable display name or preferred name
+@@ -84,21 +100,21 @@ For a hobby project, keep this simple:
+ - one email address per player for recovery
+ - email can remain unverified in the MVP
+ - one opaque session token per client/device identity
+-- one short recovery secret for cross-client restore
++- one short password for cross-client restore
+ - reconnect support based on that token
+ 
+-This avoids a full account system while still letting the server recognize a returning player.
++This avoids the heavier flows (email verification gates, password-strength rules, etc.) a general-purpose account system would need, while still letting the server recognize a returning player.
+ 
+ ## Security Notes
+ 
+ - Store only token hashes in SQLite.
+-- Store only recovery-secret hashes in SQLite.
++- Store only password hashes in SQLite.
+ - Store verification-code hashes in SQLite.
+ - Defer email verification unless we later need account recovery or remote hosting.
+ - Send verification email without blocking normal play.
+ - Rotate or expire tokens if needed.
+ - Treat the token like a password-equivalent secret.
+-- Treat the recovery secret like a lightweight password-equivalent secret.
++- Treat the password like a lightweight password-equivalent secret.
+ - Keep the token transport protected if the app is exposed beyond a local network.
+ 
+ ## Interaction With Game Data
+diff --git a/docs/components-and-interactions.md b/docs/components-and-interactions.md
+index 8c57fb7..f2e199c 100644
+--- a/docs/components-and-interactions.md
++++ b/docs/components-and-interactions.md
+@@ -89,3 +89,4 @@ sequenceDiagram
+ - The server remains authoritative for the final legality and scoring decision.
+ - Clients and proxies use shared rules only for prediction, feedback, and move evaluation before submission.
+ - Engine-vs-engine games use the same proxy path as human-vs-engine games.
++- **The "Engine Proxy" and "Engine Registry" boxes above are in-process Rust modules within `server-game`, not separate services** — `G->>X` in the sequence diagram is a plain function call (`maybe_run_engine_turn`), not a network hop. An engine's chosen action flows through the exact same `apply_*` methods a human client's HTTP action does, so the server stays authoritative either way; there's just no OS-process or IPC boundary between "Game Service" and "Engine". See `technology-decisions.md`'s Engine boundary row for the reasoning (type safety and simplicity over sandboxing, given the only engine author is the project owner).
+diff --git a/docs/history.md b/docs/history.md
+index c78f3d4..cf33760 100644
+--- a/docs/history.md
++++ b/docs/history.md
+@@ -27,6 +27,12 @@ This phase clarified the intended product shape:
+ 
+ ## Phase 3: Productization
+ 
+-The next step is to turn the prototype logic into a server-owned game platform with pluggable engines and multiple client types.
++The next step was to turn the prototype logic into a server-owned game platform with pluggable engines and multiple client types.
+ 
+-This is the point where the project stops being a single game loop and becomes a reusable multiplayer system.
++This is the point where the project stopped being a single game loop and became a reusable multiplayer system.
++
++**This phase is now substantially built**: an Axum server holds authoritative game state, a shared pure-Rust rules crate handles legality and scoring, a `ScrabbleEngine` trait lets engines plug in (GreedyEngine is the reference implementation), and both a web and a desktop client run against the same API. See `IMPLEMENTATION_STATUS.md` for the detailed, current breakdown of what's done versus what's still open.
++
++## Phase 4: Player Identity
++
++With the core game loop working, the next gap was that anyone with a game's URL could act as any seat in it — there was no real notion of "this request is genuinely from the player who owns this seat." This phase added real player accounts (register/login with argon2-hashed passwords, unique display names so two people can't collide under the same name), bearer-token sessions, a login UI with "remember me"/"stay logged in", and seat-ownership enforcement so a claimed seat can only be acted on by the player who created it. Anonymous play still works unchanged, by design — this was additive, not a breaking change to how the app worked before. See `authentication.md` for what's done versus still open (email verification, forgot-password, and extending ownership checks beyond the core move-submission endpoint are the main remaining pieces).
+diff --git a/docs/operations.md b/docs/operations.md
+index 6c9fb8e..e9d5ec5 100644
+--- a/docs/operations.md
++++ b/docs/operations.md
+@@ -126,6 +126,21 @@ cargo build -p scrabble-ui --features desktop
+ | `SCRABBLE_PX_API_BASE_URL` | `http://127.0.0.1:3000` | Backend URL used by clients |
+ | `SCRABBLE_UI_PORT` | `8080` | Web dev server port |
+ 
++## Resetting the Database
++
++Occasionally useful during development — for example, after a schema change that only takes effect on a fresh database (see the migration limitation note in `schema.md`), or just to clear out test data.
++
++```bash
++./scripts/services.sh stop
++rm -f data/scrabble-px.sqlite3 data/scrabble-px.sqlite3-wal data/scrabble-px.sqlite3-shm
++./scripts/services.sh start
++```
++
++Notes:
++- The server **must** be stopped first — it holds an open connection and an in-memory copy of every active game, so deleting the file while it's running has no visible effect until restart.
++- The `-wal`/`-shm` files are SQLite's write-ahead-log sidecar files. They may not exist depending on journal mode; `rm -f` won't complain either way.
++- `persistence::connect` explicitly sets `create_if_missing(true)`, so the server recreates the file with a fresh schema on startup. (Without this, connecting to a missing file fails with `SqliteError { code: 14, message: "unable to open database file" }` — this bit us once in practice.)
++
+ ## Known Build Issues
+ 
+ ### sccache hangs the WASM build
+diff --git a/docs/roadmap.md b/docs/roadmap.md
+index 7efe9fa..a252beb 100644
+--- a/docs/roadmap.md
++++ b/docs/roadmap.md
+@@ -2,27 +2,27 @@
+ 
+ ## MVP
+ 
+-- Server-owned game state and rule enforcement
+-- Human-vs-human, human-vs-engine, and engine-vs-engine games
+-- One stable engine interface for plug-ins
+-- Shared pure rules library used by server, clients, and engine proxies for legality and score previews
+-- Game creation, join, start, resign, pass, exchange tiles, and move history
+-- Server-side scoring and legality checks
+-- Web client first
+-- Basic reconnect support
+-- Deterministic tests for move legality, scoring, and endgame flow
++- Server-owned game state and rule enforcement ✅
++- Human-vs-human, human-vs-engine, and engine-vs-engine games (engine-vs-engine untested, not unbuilt)
++- One stable engine interface for plug-ins ✅
++- Shared pure rules library used by server, clients, and engine proxies for legality and score previews ✅
++- Game creation, join, start, resign, pass, exchange tiles, and move history ✅
++- Server-side scoring and legality checks ✅
++- Web client first ✅ (desktop client also built, ahead of this list)
++- Basic reconnect support ✅ (GET /games/{id} reloads full state; session restore on client relaunch via "stay logged in")
++- Deterministic tests for move legality, scoring, and endgame flow ✅ — 32 tests, see `IMPLEMENTATION_STATUS.md`
+ 
+ ## v1
+ 
+-- Multiple engine implementations with selectable seat assignment
++- Multiple engine implementations with selectable seat assignment (only GreedyEngine exists so far)
+ - Engine benchmarking and head-to-head runs
+-- CLI and desktop clients using the same API
+-- Player identity separate from client device/session identity
++- CLI and desktop clients using the same API (desktop ✅, CLI not built)
++- Player identity separate from client device/session identity ✅ — register/login/validate, seat-ownership enforcement on `submit_action`; see `authentication.md` for exactly what's still partial (email verification, forgot-password, ownership checks on other endpoints)
+ - Lobby flow for private and public games
+-- Save/load game state
++- Save/load game state (save works; load requires knowing the game id, no discovery UI beyond the games list)
+ - Spectator mode
+ - Audit log of moves and server decisions
+-- Versioned engine contract
++- Versioned engine contract (version strings exist, no migration path tested)
+ 
+ ## Later
+ 
+diff --git a/docs/schema.md b/docs/schema.md
+index 16f6744..e7d0d55 100644
+--- a/docs/schema.md
++++ b/docs/schema.md
+@@ -118,12 +118,12 @@ Persistent player identity records.
+ Fields:
+ 
+ - `id` text primary key
+-- `display_name` text not null
++- `display_name` text not null, **unique** (enforced at the DB level — two players cannot register the same display name)
+ - `email` text not null
+ - `email_verification_code_hash` text null
+ - `email_verification_sent_at` text null
+ - `email_verified_at` text null
+-- `recovery_secret_hash` text not null
++- `password_hash` text not null (argon2; see `authentication.md`)
+ - `created_at` text not null
+ - `updated_at` text not null
+ - `last_seen_at` text null
+@@ -182,3 +182,5 @@ The snapshot and saved-game tables can be added when replay, restore, or manual
+ The exact representation of `board_json`, `bag_json`, and `racks_json` can evolve.
+ 
+ That data can stay compact and versioned so older games can still be replayed even if the live game model changes later.
++
++**Migration limitation**: tables are created via `create table if not exists` in `persistence::migrate()` — there is no real migration system. A schema change (like the `players.display_name` uniqueness constraint above) only takes effect on a *freshly created* database file; an existing on-disk database silently keeps its old schema. When a schema change matters, delete the local SQLite file (see `operations.md`) and let the server recreate it on next start.
+diff --git a/docs/technology-decisions.md b/docs/technology-decisions.md
+index 2b2d70b..28b883b 100644
+--- a/docs/technology-decisions.md
++++ b/docs/technology-decisions.md
+@@ -38,5 +38,5 @@ If we want the lowest-risk starting point, the first pass should be:
+ - Axum for the server API
+ - SQLite for storage
+ - Shared pure rules crate with embedded word lists
+-- Separate engine process behind a proxy
++- In-process engine trait, compiled in (not a separate process — see the Engine boundary row above)
+ - HTTP plus WebSocket transport

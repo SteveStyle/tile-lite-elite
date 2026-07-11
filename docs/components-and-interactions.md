@@ -89,3 +89,4 @@ sequenceDiagram
 - The server remains authoritative for the final legality and scoring decision.
 - Clients and proxies use shared rules only for prediction, feedback, and move evaluation before submission.
 - Engine-vs-engine games use the same proxy path as human-vs-engine games.
+- **The "Engine Proxy" and "Engine Registry" boxes above are in-process Rust modules within `server-game`, not separate services** — `G->>X` in the sequence diagram is a plain function call (`maybe_run_engine_turn`), not a network hop. An engine's chosen action flows through the exact same `apply_*` methods a human client's HTTP action does, so the server stays authoritative either way; there's just no OS-process or IPC boundary between "Game Service" and "Engine". See `technology-decisions.md`'s Engine boundary row for the reasoning (type safety and simplicity over sandboxing, given the only engine author is the project owner).

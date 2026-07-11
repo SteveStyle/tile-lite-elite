@@ -126,6 +126,21 @@ cargo build -p scrabble-ui --features desktop
 | `SCRABBLE_PX_API_BASE_URL` | `http://127.0.0.1:3000` | Backend URL used by clients |
 | `SCRABBLE_UI_PORT` | `8080` | Web dev server port |
 
+## Resetting the Database
+
+Occasionally useful during development — for example, after a schema change that only takes effect on a fresh database (see the migration limitation note in `schema.md`), or just to clear out test data.
+
+```bash
+./scripts/services.sh stop
+rm -f data/scrabble-px.sqlite3 data/scrabble-px.sqlite3-wal data/scrabble-px.sqlite3-shm
+./scripts/services.sh start
+```
+
+Notes:
+- The server **must** be stopped first — it holds an open connection and an in-memory copy of every active game, so deleting the file while it's running has no visible effect until restart.
+- The `-wal`/`-shm` files are SQLite's write-ahead-log sidecar files. They may not exist depending on journal mode; `rm -f` won't complain either way.
+- `persistence::connect` explicitly sets `create_if_missing(true)`, so the server recreates the file with a fresh schema on startup. (Without this, connecting to a missing file fails with `SqliteError { code: 14, message: "unable to open database file" }` — this bit us once in practice.)
+
 ## Known Build Issues
 
 ### sccache hangs the WASM build

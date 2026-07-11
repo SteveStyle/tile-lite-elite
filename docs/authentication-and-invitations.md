@@ -20,7 +20,7 @@ Create a new player account.
 {
   "display_name": "Alice",
   "email": "alice@example.com",
-  "recovery_secret": "my-secret-phrase"
+  "password": "my-secret-phrase"
 }
 ```
 
@@ -35,24 +35,24 @@ Create a new player account.
 ```
 
 **Errors:**
-- `400 Bad Request` — Invalid input or player already exists
+- `400 Bad Request` — missing/empty field, or `display_name` is already taken (enforced at the DB level — see `schema.md`)
 
 **Notes:**
-- Store the `session_token` securely on the client (e.g., localStorage for web, secure storage on desktop)
-- The `recovery_secret` is hashed server-side; use it to restore your account on another device
-- Email is captured for future account recovery; no verification required in MVP
+- Store the `session_token` on the client — real browser `localStorage` on web, a plain (unencrypted) JSON file under the OS config directory on desktop. Neither is a secure secret store; see `authentication-examples.md` for the caveat.
+- The `password` is hashed with argon2 server-side; use it to log back in on another device.
+- Email is captured for future account recovery; no verification required in MVP, and no "forgot password" flow exists yet.
 
-### Login with Recovery Secret
+### Login with Password
 
 **Endpoint:** `POST /auth/login`
 
-Restore an existing player account using display name + recovery secret.
+Restore an existing player account using display name + password.
 
 **Request:**
 ```json
 {
   "display_name": "Alice",
-  "recovery_secret": "my-secret-phrase"
+  "password": "my-secret-phrase"
 }
 ```
 
@@ -67,19 +67,18 @@ Restore an existing player account using display name + recovery secret.
 ```
 
 **Errors:**
-- `400 Bad Request` — Invalid recovery secret
-- `404 Not Found` — Player not found
+- `400 Bad Request` — `"Incorrect name or password"`, returned identically whether the display name doesn't exist or the password is wrong. This is deliberate: a distinct 404-for-unknown-name response would let a caller enumerate registered display names. There is no separate 404 case.
 
 **Notes:**
 - Use this endpoint when opening the app on a new device
 - Each login generates a fresh session token
-- No password; just the recovery secret and display name
+- Just display name + password — no separate recovery mechanism yet beyond this
 
 ### Validate Session
 
 **Endpoint:** `POST /auth/validate`
 
-Check if a session token is still valid (not yet implemented in MVP).
+Check if a session token is still valid, and return the associated player.
 
 **Request:**
 ```json
@@ -265,9 +264,9 @@ Decline an invitation to join a game.
 
 ### `players` table
 - `id` — Unique player identifier
-- `display_name` — Player username
+- `display_name` — Player username, **unique** (enforced at the DB level, so two players can never collide under the same name)
 - `email` — Contact email (for recovery)
-- `recovery_secret_hash` — Hashed recovery secret (not the raw secret)
+- `password_hash` — argon2-hashed password (not the raw password)
 - `created_at` — Registration timestamp
 - `updated_at` — Last profile update
 - `last_seen_at` — Last activity timestamp
@@ -275,10 +274,10 @@ Decline an invitation to join a game.
 ### `sessions` table
 - `id` — Unique session identifier
 - `player_id` — Reference to `players.id`
-- `token_hash` — Hashed session token (not the raw token)
+- `token_hash` — sha256-hashed session token (not the raw token)
 - `created_at` — Session creation timestamp
 - `last_seen_at` — Last activity timestamp
-- `expires_at` — Optional expiration (not yet used in MVP)
+- `expires_at` — Optional expiration (not yet set by any endpoint — sessions are currently non-expiring)
 
 ### `game_invitations` table
 - `id` — Unique invitation identifier
@@ -294,11 +293,11 @@ Unique constraint: `(game_id, invited_player_id, seat_number)`
 
 ## Security Notes
 
-- All secrets (recovery_secret, session_token) are hashed using a DefaultHasher before storage
-- In production, use bcrypt or scrypt instead of DefaultHasher
-- Session tokens are opaque UUIDs; clients must treat them like passwords
-- Email is unverified in MVP; future versions can add verification flow
-- Invitations carry no authentication; game-level access control is handled separately
+- Passwords are hashed with **argon2** (deliberately slow, salted — resists brute-force guessing of human-chosen passwords).
+- Session tokens are hashed with **sha256** before storage — deliberately fast, since a session token is a high-entropy UUID rather than a human-chosen secret, and the hash needs to support a lookup on every authenticated request.
+- Session tokens are opaque UUIDs; clients must treat them like passwords.
+- Email is unverified in MVP; future versions can add verification flow.
+- Invitations carry no authentication; game-level access control is handled separately (and, as of the seat-ownership work, only `submit_action` actually enforces it — see `authentication.md`'s status section).
 
 ## Future Enhancements
 

@@ -118,12 +118,12 @@ Persistent player identity records.
 Fields:
 
 - `id` text primary key
-- `display_name` text not null
+- `display_name` text not null, **unique** (enforced at the DB level — two players cannot register the same display name)
 - `email` text not null
 - `email_verification_code_hash` text null
 - `email_verification_sent_at` text null
 - `email_verified_at` text null
-- `recovery_secret_hash` text not null
+- `password_hash` text not null (argon2; see `authentication.md`)
 - `created_at` text not null
 - `updated_at` text not null
 - `last_seen_at` text null
@@ -182,3 +182,5 @@ The snapshot and saved-game tables can be added when replay, restore, or manual 
 The exact representation of `board_json`, `bag_json`, and `racks_json` can evolve.
 
 That data can stay compact and versioned so older games can still be replayed even if the live game model changes later.
+
+**Migration limitation**: tables are created via `create table if not exists` in `persistence::migrate()` — there is no real migration system. A schema change (like the `players.display_name` uniqueness constraint above) only takes effect on a *freshly created* database file; an existing on-disk database silently keeps its old schema. When a schema change matters, delete the local SQLite file (see `operations.md`) and let the server recreate it on next start.

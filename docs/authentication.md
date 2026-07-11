@@ -1,5 +1,21 @@
 # Authentication And Player Recognition
 
+## Current Status (as of the seat-ownership work)
+
+What's actually implemented, vs. the aspirational design below:
+
+- ✅ Player/session split, with bearer-token sessions (`Authorization: Bearer <token>`) — matches the model described here.
+- ✅ Password hashing uses argon2 (not a lightweight PIN scheme) — despite this doc's "short passphrase" framing below, the actual `password` field is a real password with no length/strength cap in the API.
+- ✅ `display_name` is enforced unique at the DB level (this doc doesn't mention that requirement explicitly, but it's load-bearing: without it, two players with the same name would collide unpredictably at login).
+- ✅ Login/register UI exists (web + desktop), with "Remember me" (prefills display name only) and "Stay logged in" (persists the session token) checkboxes.
+- ✅ **Seat ownership enforcement**: if a game is created while logged in, the creator's seat is bound to their player id, and `submit_action` rejects any request for that seat from a different (or no) authenticated player. Games created anonymously stay fully open, unchanged from before this existed.
+- ⚠️ Email verification: schema exists (`email_verification_*` columns), nothing sends or checks a code yet.
+- ⚠️ Password-reset-via-email ("forgot password" flow): not built. No `/auth/forgot-password` or `/auth/reset-password` endpoint exists yet.
+- ⚠️ Only `submit_action` enforces seat ownership. `start_game`, `preview_move`, `suggest_move`, and the WebSocket events endpoint do not check identity at all yet.
+- ⚠️ Claiming a *second* human seat (inviting someone else into your game) isn't wired up — see `authentication-and-invitations.md`. Only the creator's own seat gets bound automatically.
+
+The rest of this document is the original design reasoning and is still broadly accurate in spirit — read it as direction, not as a literal description of what exists.
+
 ## Goal
 
 A player should be recognized each time they connect.
@@ -13,7 +29,7 @@ Use two distinct concepts:
 - `player`: the persistent identity of the person using the system
 - `session`: a temporary connection token that proves the current client is allowed to act as that player
 
-For connecting from a different client, add a small recovery secret such as a PIN or short passphrase. The secret should be easy enough to enter without much friction, but strong enough to prevent accidental impersonation.
+For connecting from a different client, add a small password such as a PIN or short passphrase. The secret should be easy enough to enter without much friction, but strong enough to prevent accidental impersonation.
 
 Email should always be captured. It is part of the recovery model, and it gives the player a stable way to restore identity on a different client. The MVP does not need to verify it immediately.
 
@@ -30,14 +46,14 @@ The server should recognize a returning player by validating their session token
 - The client stores the opaque token locally.
 - On later connections, the client presents the token.
 - If the token is valid, the server recognizes the same player.
-- If the token is missing or invalid, the client can restore identity by entering the same display name plus recovery secret, or become a new anonymous player if that flow is allowed.
+- If the token is missing or invalid, the client can restore identity by entering the same display name plus password, or become a new anonymous player if that flow is allowed.
 
 ## Recommended UX
 
 Keep the first-run flow short:
 
 - choose a display name
-- create or accept a short recovery secret
+- create or accept a short password
 - add an email address for recovery
 - optionally trust this device so future connects are automatic
 
@@ -48,9 +64,9 @@ The email should include a short verification code.
 On another client, the player can restore identity by entering:
 
 - the display name, or a lookup handle if we later add one
-- the recovery secret
+- the password
 
-This gives the player a low-friction way to identify themselves without a full account/password system.
+This gives the player a low-friction way to identify themselves, without the heavier flows (email verification gates, password-strength rules, etc.) a general-purpose account system would need.
 
 ## What Should Persist
 
@@ -62,7 +78,7 @@ Persist:
 - email verification code hash or equivalent
 - email verification status and verified time
 - email may be unverified initially, especially for local play
-- recovery secret hash or equivalent verifier
+- password hash or equivalent verifier
 - authentication/session tokens as hashes
 - last seen time
 - any stable display name or preferred name
@@ -84,21 +100,21 @@ For a hobby project, keep this simple:
 - one email address per player for recovery
 - email can remain unverified in the MVP
 - one opaque session token per client/device identity
-- one short recovery secret for cross-client restore
+- one short password for cross-client restore
 - reconnect support based on that token
 
-This avoids a full account system while still letting the server recognize a returning player.
+This avoids the heavier flows (email verification gates, password-strength rules, etc.) a general-purpose account system would need, while still letting the server recognize a returning player.
 
 ## Security Notes
 
 - Store only token hashes in SQLite.
-- Store only recovery-secret hashes in SQLite.
+- Store only password hashes in SQLite.
 - Store verification-code hashes in SQLite.
 - Defer email verification unless we later need account recovery or remote hosting.
 - Send verification email without blocking normal play.
 - Rotate or expire tokens if needed.
 - Treat the token like a password-equivalent secret.
-- Treat the recovery secret like a lightweight password-equivalent secret.
+- Treat the password like a lightweight password-equivalent secret.
 - Keep the token transport protected if the app is exposed beyond a local network.
 
 ## Interaction With Game Data

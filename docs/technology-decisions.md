@@ -38,5 +38,5 @@ If we want the lowest-risk starting point, the first pass should be:
 - Axum for the server API
 - SQLite for storage
 - Shared pure rules crate with embedded word lists
-- Separate engine process behind a proxy
+- In-process engine trait, compiled in (not a separate process — see the Engine boundary row above)
 - HTTP plus WebSocket transport
