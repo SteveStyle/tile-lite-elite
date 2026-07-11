@@ -1,5 +1,5 @@
 [workspace]
-resolver="2"
+resolver="3"
 members=["crates/*", "old-crates/*"]
 default-members=["crates/*"]
 [workspace.dependencies]
@@ -19,4 +19,4 @@ inherits = "dev"
 inherits = "dev"
 
 [workspace.package]
-edition="2021"
+edition="2024"
