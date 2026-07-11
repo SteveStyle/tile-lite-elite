@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 mod app;
 mod components;
+mod local_storage;
 mod time_format;
 mod views;
 

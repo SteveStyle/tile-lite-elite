@@ -15,6 +15,7 @@ use gloo_net::{
 #[cfg(not(target_arch = "wasm32"))]
 use tokio_tungstenite::connect_async;
 
+use crate::components::auth_panel::AuthPanel;
 use crate::components::games_panel::GamesPanel;
 use crate::components::sidebar::Sidebar;
 use crate::views::Home;
@@ -60,6 +61,7 @@ pub fn RootApp() -> Element {
         .to_string();
     let mut game = use_signal(|| None::<GameStateDto>);
     let mut game_summaries = use_signal(Vec::<api::GameSummaryDto>::new);
+    let mut session = use_signal(|| None::<api::PlayerSessionDto>);
     let mut is_loading = use_signal(|| false);
     let mut info_message = use_signal(|| Some("Loading games from server...".to_string()));
     let mut error_message = use_signal(|| None::<String>);
@@ -73,6 +75,28 @@ pub fn RootApp() -> Element {
         bootstrapped.set(true);
         let server_url = server_url.clone();
         spawn(async move {
+            let stored = crate::local_storage::load();
+            if let Some(token) = stored.session_token.clone() {
+                match validate_session(&server_url, &token).await {
+                    Ok(player) => {
+                        session.set(Some(api::PlayerSessionDto {
+                            player_id: player.id,
+                            session_token: token,
+                            display_name: player.display_name,
+                            email: player.email,
+                        }));
+                    }
+                    Err(_) => {
+                        // Stored token is no longer valid — drop it, but
+                        // keep any remembered display name.
+                        crate::local_storage::save(&crate::local_storage::StoredAuth {
+                            remembered_name: stored.remembered_name.clone(),
+                            session_token: None,
+                        });
+                    }
+                }
+            }
+
             is_loading.set(true);
             error_message.set(None);
             match load_game_summaries(&server_url).await {
@@ -171,6 +195,36 @@ pub fn RootApp() -> Element {
         div { class: "app-shell",
             header { class: "topbar",
                 p { class: "topbar-kicker", "Scrabble PX" }
+                AuthPanel {
+                    server_url: server_url.clone(),
+                    session: session().clone(),
+                    on_authenticated: move |(new_session, remember, stay): (api::PlayerSessionDto, bool, bool)| {
+                        let stored = crate::local_storage::StoredAuth {
+                            remembered_name: if remember {
+                                Some(new_session.display_name.clone())
+                            } else {
+                                None
+                            },
+                            session_token: if stay {
+                                Some(new_session.session_token.clone())
+                            } else {
+                                None
+                            },
+                        };
+                        crate::local_storage::save(&stored);
+                        info_message.set(Some(format!("Logged in as {}", new_session.display_name)));
+                        session.set(Some(new_session));
+                    },
+                    on_logout: move |_| {
+                        let stored = crate::local_storage::load();
+                        crate::local_storage::save(&crate::local_storage::StoredAuth {
+                            remembered_name: stored.remembered_name,
+                            session_token: None,
+                        });
+                        session.set(None);
+                        info_message.set(Some("Logged out".to_string()));
+                    },
+                }
             }
 
             div { class: "workspace-shell",
@@ -199,10 +253,11 @@ pub fn RootApp() -> Element {
                     },
                     on_new_game: move |_| {
                         let server_url = server_url_for_create.clone();
+                        let token = session().map(|current| current.session_token.clone());
                         spawn(async move {
                             is_loading.set(true);
                             error_message.set(None);
-                            match create_default_game(&server_url).await {
+                            match create_default_game(&server_url, token.as_deref()).await {
                                 Ok(created) => {
                                     info_message.set(None);
                                     dragging_tile_id.set(None);
@@ -324,11 +379,12 @@ pub fn RootApp() -> Element {
                     on_start: move |_| {
                         let server_url = server_url_for_start.clone();
                         let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
                         if let Some(current_game) = current_game {
                             spawn(async move {
                                 is_loading.set(true);
                                 error_message.set(None);
-                                match start_game(&server_url, &current_game.id).await {
+                                match start_game(&server_url, &current_game.id, token.as_deref()).await {
                                     Ok(updated) => {
                                         info_message.set(None);
                                         dragging_tile_id.set(None);
@@ -346,11 +402,12 @@ pub fn RootApp() -> Element {
                     on_submit_suggested: move |_| {
                         let server_url = server_url_for_suggested.clone();
                         let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
                         if let Some(current_game) = current_game {
                             spawn(async move {
                                 is_loading.set(true);
                                 error_message.set(None);
-                                match submit_suggested_move(&server_url, &current_game).await {
+                                match submit_suggested_move(&server_url, &current_game, token.as_deref()).await {
                                     Ok(updated) => {
                                         info_message.set(Some("Submitted suggested move.".to_string()));
                                         dragging_tile_id.set(None);
@@ -368,11 +425,12 @@ pub fn RootApp() -> Element {
                     on_pass: move |_| {
                         let server_url = server_url_for_pass.clone();
                         let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
                         if let Some(current_game) = current_game {
                             spawn(async move {
                                 is_loading.set(true);
                                 error_message.set(None);
-                                match submit_pass(&server_url, &current_game).await {
+                                match submit_pass(&server_url, &current_game, token.as_deref()).await {
                                     Ok(updated) => {
                                         info_message.set(Some("Submitted pass action.".to_string()));
                                         dragging_tile_id.set(None);
@@ -391,6 +449,7 @@ pub fn RootApp() -> Element {
                         let server_url = server_url_for_manual.clone();
                         let current_game = game().clone();
                         let staged = staged_placements().clone();
+                        let token = session().map(|current| current.session_token.clone());
                         if let Some(current_game) = current_game {
                             spawn(async move {
                                 is_loading.set(true);
@@ -400,6 +459,7 @@ pub fn RootApp() -> Element {
                                         &current_game,
                                         &staged,
                                         DirectionDto::Horizontal,
+                                        token.as_deref(),
                                     )
                                     .await
                                 {
@@ -502,11 +562,44 @@ async fn load_game_summaries(server_url: &str) -> Result<Vec<api::GameSummaryDto
     get_json::<Vec<api::GameSummaryDto>>(&format!("{server_url}/games")).await
 }
 
+pub(crate) async fn register_player(
+    server_url: &str,
+    display_name: &str,
+    email: &str,
+    password: &str,
+) -> Result<api::PlayerSessionDto, String> {
+    let request = api::RegisterPlayerRequest {
+        display_name: display_name.to_string(),
+        email: email.to_string(),
+        password: password.to_string(),
+    };
+    post_json(&format!("{server_url}/auth/register"), None, &request).await
+}
+
+pub(crate) async fn login_player(
+    server_url: &str,
+    display_name: &str,
+    password: &str,
+) -> Result<api::PlayerSessionDto, String> {
+    let request = api::LoginPlayerRequest {
+        display_name: display_name.to_string(),
+        password: password.to_string(),
+    };
+    post_json(&format!("{server_url}/auth/login"), None, &request).await
+}
+
+async fn validate_session(server_url: &str, session_token: &str) -> Result<api::PlayerDto, String> {
+    let request = api::ValidateSessionRequest {
+        session_token: session_token.to_string(),
+    };
+    post_json(&format!("{server_url}/auth/validate"), None, &request).await
+}
+
 async fn load_game_by_id(server_url: &str, game_id: &str) -> Result<GameStateDto, String> {
     get_json::<GameStateDto>(&format!("{server_url}/games/{game_id}")).await
 }
 
-async fn create_default_game(server_url: &str) -> Result<GameStateDto, String> {
+async fn create_default_game(server_url: &str, token: Option<&str>) -> Result<GameStateDto, String> {
     let request = CreateGameRequest {
         seats: vec![
             CreateSeatRequest {
@@ -526,30 +619,36 @@ async fn create_default_game(server_url: &str) -> Result<GameStateDto, String> {
         board_layout: None,
     };
 
-    post_json(&format!("{server_url}/games"), &request).await
+    post_json(&format!("{server_url}/games"), token, &request).await
 }
 
-async fn start_game(server_url: &str, game_id: &str) -> Result<GameStateDto, String> {
+async fn start_game(server_url: &str, game_id: &str, token: Option<&str>) -> Result<GameStateDto, String> {
     post_json(
         &format!("{server_url}/games/{game_id}/start"),
+        token,
         &StartGameRequest::default(),
     )
     .await
 }
 
-async fn submit_pass(server_url: &str, game: &GameStateDto) -> Result<GameStateDto, String> {
+async fn submit_pass(
+    server_url: &str,
+    game: &GameStateDto,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
     let request = GameActionRequest {
         seat_number: game.current_seat,
         action: api::PlayerActionDto::Pass,
     };
-    post_json(&format!("{server_url}/games/{}/actions", game.id), &request).await
+    post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
 }
 
 async fn submit_suggested_move(
     server_url: &str,
     game: &GameStateDto,
+    token: Option<&str>,
 ) -> Result<GameStateDto, String> {
-    post_json::<(), _>(&format!("{server_url}/games/{}/suggest", game.id), &()).await
+    post_json::<(), _>(&format!("{server_url}/games/{}/suggest", game.id), token, &()).await
 }
 
 async fn submit_manual_move(
@@ -557,17 +656,18 @@ async fn submit_manual_move(
     game: &GameStateDto,
     staged: &[StagedPlacementView],
     direction: DirectionDto,
+    token: Option<&str>,
 ) -> Result<GameStateDto, String> {
     let request = build_manual_move_request(game, staged, direction)?;
-    post_json(&format!("{server_url}/games/{}/actions", game.id), &request).await
+    post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
 }
 
-async fn post_json<T, R>(url: &str, payload: &T) -> Result<R, String>
+async fn post_json<T, R>(url: &str, token: Option<&str>, payload: &T) -> Result<R, String>
 where
     T: serde::Serialize + ?Sized,
     R: serde::de::DeserializeOwned,
 {
-    post_json_impl(url, payload).await
+    post_json_impl(url, token, payload).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -615,17 +715,16 @@ where
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-async fn post_json_impl<T, R>(url: &str, payload: &T) -> Result<R, String>
+async fn post_json_impl<T, R>(url: &str, token: Option<&str>, payload: &T) -> Result<R, String>
 where
     T: serde::Serialize + ?Sized,
     R: serde::de::DeserializeOwned,
 {
-    let response = reqwest::Client::new()
-        .post(url)
-        .json(payload)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut request = reqwest::Client::new().post(url).json(payload);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = request.send().await.map_err(|error| error.to_string())?;
     if !response.status().is_success() {
         let msg = response
             .json::<api::ApiError>()
@@ -638,12 +737,16 @@ where
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn post_json_impl<T, R>(url: &str, payload: &T) -> Result<R, String>
+async fn post_json_impl<T, R>(url: &str, token: Option<&str>, payload: &T) -> Result<R, String>
 where
     T: serde::Serialize + ?Sized,
     R: serde::de::DeserializeOwned,
 {
-    let response = Request::post(url)
+    let mut builder = Request::post(url);
+    if let Some(token) = token {
+        builder = builder.header("Authorization", &format!("Bearer {token}"));
+    }
+    let response = builder
         .json(payload)
         .map_err(|error| error.to_string())?
         .send()
