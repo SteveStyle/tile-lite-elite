@@ -395,12 +395,14 @@ pub struct ValidatedMove {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MoveError {
     InvalidMove,
-    InvalidWord(String),
+    /// One or more words formed by this placement — the main word and/or
+    /// any cross words — aren't in the dictionary. Always at least one
+    /// entry; the main word (if invalid) comes first.
+    InvalidWord(Vec<String>),
     InvalidPosition,
     InvalidDirection,
     TilesDoNotFit,
     TilesDoNotConnect,
-    LetterNotAllowedInPosition,
 }
 
 #[cfg(test)]

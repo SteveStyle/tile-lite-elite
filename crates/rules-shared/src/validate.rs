@@ -177,6 +177,7 @@ impl<D: Dictionary> RulesEngine<'_, D> {
 
         let mut word = String::new();
         let mut cross_words = Vec::new();
+        let mut invalid_words = Vec::new();
         let mut main_word_score: Score = 0;
         let mut cross_word_score: Score = 0;
         let mut word_multiplier: Score = 1;
@@ -200,8 +201,19 @@ impl<D: Dictionary> RulesEngine<'_, D> {
                         Direction::Horizontal => cached.horizontal,
                         Direction::Vertical => cached.vertical,
                     };
+                    // Don't bail out on the first bad cross word: keep
+                    // walking so every simultaneously-invalid word (the
+                    // main word and any other cross words) gets collected
+                    // and named too, instead of only ever reporting
+                    // whichever one happens to be checked first.
                     if !cross_check.allows(letter) {
-                        return Err(MoveError::LetterNotAllowedInPosition);
+                        invalid_words.push(build_cross_word(
+                            state.board,
+                            current,
+                            candidate.direction,
+                            letter,
+                            self.rules,
+                        ));
                     }
 
                     saw_placement = true;
@@ -243,7 +255,10 @@ impl<D: Dictionary> RulesEngine<'_, D> {
         }
 
         if !saw_placement || !self.dictionary.is_word(&word) {
-            return Err(MoveError::InvalidWord(word));
+            invalid_words.insert(0, word.clone());
+        }
+        if !invalid_words.is_empty() {
+            return Err(MoveError::InvalidWord(invalid_words));
         }
 
         let bingo_bonus = if placements.len() == self.rules.rack_size as usize {
@@ -516,8 +531,8 @@ mod tests {
     use crate::cache::RuleCache;
     use crate::dictionary::SowpodsDictionary;
     use crate::model::{
-        Direction, Letter, MoveCandidate, Position, Premium, Rack, Tile, TilePlacement,
-        VariantRules,
+        Direction, Letter, MoveCandidate, MoveError, Position, Premium, Rack, Tile,
+        TilePlacement, VariantRules,
     };
 
     fn sample_rules() -> VariantRules {
@@ -612,6 +627,104 @@ mod tests {
 
         let preview = engine.preview_move(&state, &candidate);
         assert!(!preview.legal);
+    }
+
+    /// Same board as `preview_rejects_disallowed_cross_letter`, but this
+    /// placement is a *single* tile with no horizontal neighbors, so its
+    /// own "main word" is just "Z" — also not a dictionary word. Validation
+    /// used to short-circuit on the first bad word it found (the cross
+    /// word "CZT"), silently never checking or reporting that the main
+    /// word was independently invalid too. It should now name both.
+    #[test]
+    fn validate_move_names_every_simultaneously_invalid_word_not_just_the_first() {
+        let rules = sample_rules();
+        let dictionary = SowpodsDictionary::new();
+        let engine = RulesEngine {
+            rules: &rules,
+            dictionary: &dictionary,
+        };
+        let mut board = BoardState::default();
+        let mut cache = RuleCache::default();
+        let pos = Position::new(7, 7);
+
+        board.set(
+            Position::new(7, 6),
+            BoardCell::Filled(FilledCell {
+                letter: Letter::from('C'),
+                is_blank: false,
+            }),
+        );
+        board.set(
+            Position::new(7, 8),
+            BoardCell::Filled(FilledCell {
+                letter: Letter::from('T'),
+                is_blank: false,
+            }),
+        );
+        board.set(
+            pos,
+            BoardCell::Empty(EmptyCell {
+                premium: Premium::Blank,
+            }),
+        );
+        cache.recompute_anchor_flags(&board, &rules);
+        cache.recompute_cross_check(&board, pos, Direction::Horizontal, &rules, &dictionary);
+
+        let state = RulesPosition {
+            board: &board,
+            cache: &cache,
+            rack: None,
+        };
+        let candidate = MoveCandidate {
+            start: pos,
+            direction: Direction::Horizontal,
+            tiles: vec![TilePlacement {
+                offset: 0,
+                tile: Tile::Letter(Letter::from('Z')),
+            }],
+        };
+
+        let error = engine.validate_move(&state, &candidate).unwrap_err();
+        assert_eq!(
+            error,
+            MoveError::InvalidWord(vec!["Z".to_string(), "CZT".to_string()])
+        );
+    }
+
+    #[test]
+    fn validate_move_names_the_main_word_when_it_is_the_only_problem() {
+        let rules = sample_rules();
+        let dictionary = SowpodsDictionary::new();
+        let engine = RulesEngine {
+            rules: &rules,
+            dictionary: &dictionary,
+        };
+        let board = BoardState::default();
+        let mut cache = RuleCache::default();
+        cache.recompute_anchor_flags(&board, &rules);
+
+        let state = RulesPosition {
+            board: &board,
+            cache: &cache,
+            rack: None,
+        };
+        let candidate = MoveCandidate {
+            start: Position::new(7, 7),
+            direction: Direction::Horizontal,
+            tiles: vec![
+                TilePlacement {
+                    offset: 0,
+                    tile: Tile::Letter(Letter::from('Q')),
+                },
+                TilePlacement {
+                    offset: 1,
+                    tile: Tile::Letter(Letter::from('X')),
+                },
+            ],
+        };
+
+        let error = engine.validate_move(&state, &candidate).unwrap_err();
+        assert_eq!(error, MoveError::InvalidWord(vec!["QX".to_string()]));
     }
 
     #[test]

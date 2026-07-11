@@ -510,27 +510,26 @@ impl GameSession {
 /// that never displaces the rack. Shared by the `/preview` endpoint and the
 /// real move-submission path so both give the same wording for the same
 /// mistake.
-///
-/// Note: `InvalidWord` only ever names the *main* word. A cross word that
-/// isn't in the dictionary is rejected earlier, as `LetterNotAllowedInPosition`,
-/// without capturing its text — the rule cache only tracks a per-letter
-/// allow/disallow mask at each square, not the word itself. Reporting every
-/// simultaneously-invalid word by name (main and cross together) would need
-/// that tracked through validation instead of short-circuiting on the first
-/// one.
 pub fn format_move_error(error: &rules_shared::MoveError) -> String {
     match error {
-        rules_shared::MoveError::InvalidWord(word) => {
-            format!("{word} is not in the dictionary.")
-        }
-        rules_shared::MoveError::LetterNotAllowedInPosition => {
-            "That would form a word that's not in the dictionary.".to_string()
+        rules_shared::MoveError::InvalidWord(words) => {
+            let verb = if words.len() == 1 { "is" } else { "are" };
+            format!("{} {verb} not in the dictionary.", format_word_list(words))
         }
         rules_shared::MoveError::InvalidMove
         | rules_shared::MoveError::InvalidPosition
         | rules_shared::MoveError::InvalidDirection
         | rules_shared::MoveError::TilesDoNotFit
         | rules_shared::MoveError::TilesDoNotConnect => "Incorrect tile placement.".to_string(),
+    }
+}
+
+/// English list join: "A" / "A and B" / "A, B and C".
+fn format_word_list(words: &[String]) -> String {
+    match words {
+        [] => String::new(),
+        [only] => only.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -727,5 +726,50 @@ struct PositionDtoToRules;
 impl PositionDtoToRules {
     fn convert(position: PositionDto) -> rules_shared::Position {
         rules_shared::Position::new(position.x, position.y)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_move_error;
+    use rules_shared::MoveError;
+
+    #[test]
+    fn names_a_single_invalid_word() {
+        assert_eq!(
+            format_move_error(&MoveError::InvalidWord(vec!["QX".to_string()])),
+            "QX is not in the dictionary."
+        );
+    }
+
+    #[test]
+    fn names_every_simultaneously_invalid_word() {
+        assert_eq!(
+            format_move_error(&MoveError::InvalidWord(vec![
+                "Z".to_string(),
+                "CZT".to_string()
+            ])),
+            "Z and CZT are not in the dictionary."
+        );
+        assert_eq!(
+            format_move_error(&MoveError::InvalidWord(vec![
+                "AA".to_string(),
+                "BB".to_string(),
+                "CC".to_string()
+            ])),
+            "AA, BB and CC are not in the dictionary."
+        );
+    }
+
+    #[test]
+    fn placement_errors_collapse_to_one_generic_message() {
+        assert_eq!(
+            format_move_error(&MoveError::TilesDoNotConnect),
+            "Incorrect tile placement."
+        );
+        assert_eq!(
+            format_move_error(&MoveError::InvalidPosition),
+            "Incorrect tile placement."
+        );
     }
 }
