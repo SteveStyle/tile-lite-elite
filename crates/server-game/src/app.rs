@@ -757,8 +757,17 @@ fn now_iso() -> String {
 /// Hobby-project default; not yet configurable per engine or per game.
 const ENGINE_TURN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Safety ceiling on engine turns run per trigger (a `/start` or `/actions`
+/// call). This isn't meant to be hit in practice: `maybe_run_engine_turn`
+/// already stops as soon as the current seat isn't an engine, and a real
+/// game is bounded by its tile bag (well under 200 turns even worst-case).
+/// It exists only to keep a future buggy engine from hanging a request
+/// forever in an all-engine game, where there's no human seat to naturally
+/// break the loop.
+const MAX_ENGINE_TURNS_PER_TRIGGER: usize = 400;
+
 async fn run_engine_turns(game: &mut GameSession, engines: &EngineRegistry) -> Result<(), ApiProblem> {
-    for _ in 0..game.participants.len() {
+    for _ in 0..MAX_ENGINE_TURNS_PER_TRIGGER {
         let advanced = game
             .maybe_run_engine_turn(engines, ENGINE_TURN_TIMEOUT)
             .await
@@ -1029,7 +1038,14 @@ mod tests {
             let game = games
                 .get_mut(&created.id)
                 .expect("created game should exist in memory");
-            game.bag.clear();
+            // Leave plenty of filler tiles in the bag so neither seat's rack
+            // can go fully empty after refilling (rack refills top up to
+            // the full rack size, not just to the tile count played, so
+            // this needs to comfortably outlast both Alice's and a
+            // possible follow-up refill for Bob/Greedy). This test is about
+            // the engine-reply plumbing, not the separate go-out endgame
+            // path (see `human_going_out_with_empty_bag_finishes_game_with_rack_penalty`).
+            game.bag = vec![rules_shared::Tile::Letter(Letter::from('X')); 20];
             game.participants[0].rack = rack_with_letters(&['A', 'T']);
             game.participants[1].rack = rack_with_letters(&['Q']);
         }
@@ -1072,6 +1088,120 @@ mod tests {
             "place" | "pass"
         ));
         assert!(updated.board.iter().any(|cell| cell.letter.is_some()));
+    }
+
+    #[tokio::test]
+    async fn human_going_out_with_empty_bag_finishes_game_with_rack_penalty() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let created: GameStateDto = read_json(
+            send_json(
+                app.clone(),
+                Method::POST,
+                "/games",
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Bob".to_string(),
+                            engine_id: None,
+                        },
+                    ],
+                    seed: Some(77),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let started: GameStateDto = read_json(
+            send_json(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(started.status, api::GameStatus::Active);
+
+        // Empty bag + Alice's rack holding exactly the tiles she's about to
+        // play means she goes out this move: the game should end
+        // immediately (no engine/Bob follow-up turn) with the standard
+        // rack-penalty adjustment — Bob loses the value of his leftover
+        // rack, Alice gains it.
+        {
+            let mut games = state.games.write().await;
+            let game = games
+                .get_mut(&created.id)
+                .expect("created game should exist in memory");
+            game.bag.clear();
+            game.participants[0].rack = rack_with_letters(&['A', 'T']);
+            game.participants[1].rack = rack_with_letters(&['Q']);
+        }
+
+        let rules = VariantRules::official();
+        let board = board_from_dto(&started.board).expect("board dto should reconstruct");
+        let position = GameState::from_board(board, &rules, &*SOWPODS);
+        let player_rack = rack_with_letters(&['A', 'T']);
+        let engine = RulesEngine {
+            rules: &rules,
+            dictionary: &*SOWPODS,
+        };
+        let candidate = engine
+            .enumerate_legal_moves(&position, &player_rack)
+            .next()
+            .expect("opening rack should have a legal move");
+
+        let move_response = send_json(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", created.id),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Place {
+                    candidate: move_candidate_to_dto(&candidate),
+                },
+            },
+        )
+        .await;
+        assert_eq!(move_response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(move_response).await;
+
+        assert_eq!(updated.status, api::GameStatus::Finished);
+        assert_eq!(updated.winner_seat, Some(0));
+        assert_eq!(
+            updated.moves.len(),
+            1,
+            "game should end before any follow-up turn is taken"
+        );
+
+        let move_score = updated.moves[0].score_delta;
+        let alice = updated
+            .participants
+            .iter()
+            .find(|participant| participant.seat_number == 0)
+            .expect("Alice's seat should exist");
+        let bob = updated
+            .participants
+            .iter()
+            .find(|participant| participant.seat_number == 1)
+            .expect("Bob's seat should exist");
+        // Bob's leftover rack is a single 'Q' (value 10 in the official
+        // distribution): he loses it, Alice (who went out) gains it.
+        assert_eq!(bob.score, -10);
+        assert_eq!(alice.score, move_score + 10);
     }
 
     #[tokio::test]
@@ -1487,5 +1617,69 @@ mod tests {
         )
         .await;
         assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn engine_vs_engine_game_runs_to_completion() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let created: GameStateDto = read_json(
+            send_json(
+                app.clone(),
+                Method::POST,
+                "/games",
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy One".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy Two".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                        },
+                    ],
+                    seed: Some(777),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created.status, api::GameStatus::Waiting);
+
+        // A single /start call should drive both engine seats all the way
+        // to game-over: no human ever exists to trigger a follow-up round,
+        // so `run_engine_turns` has to run the whole game in one go.
+        let response = send_json(
+            app,
+            Method::POST,
+            &format!("/games/{}/start", created.id),
+            &StartGameRequest::default(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let finished: GameStateDto = read_json(response).await;
+
+        assert_eq!(finished.status, api::GameStatus::Finished);
+        assert!(
+            !finished.moves.is_empty(),
+            "expected the engines to have played at least one move before the game ended"
+        );
+        assert!(
+            finished.moves.iter().any(|record| record.move_type == "place"),
+            "expected at least one engine to place tiles rather than only pass, got moves: {:?}",
+            finished.moves
+        );
+        assert!(
+            finished.participants.iter().any(|participant| participant.score != 0),
+            "expected at least one participant to have a non-zero score by game end"
+        );
     }
 }

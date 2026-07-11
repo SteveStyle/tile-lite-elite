@@ -21,6 +21,8 @@ struct PersistedGame {
     bag: Vec<Tile>,
     participants: Vec<ParticipantState>,
     moves: Vec<MoveRecord>,
+    #[serde(default)]
+    consecutive_scoreless_turns: u8,
 }
 
 pub async fn connect(database_url: &str) -> Result<Pool<Sqlite>, sqlx::Error> {
@@ -182,6 +184,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         bag: session.bag.clone(),
         participants: session.participants.clone(),
         moves: session.moves.clone(),
+        consecutive_scoreless_turns: session.consecutive_scoreless_turns,
     })
     .expect("game session should serialize");
 
@@ -308,6 +311,7 @@ pub async fn load_game(pool: &Pool<Sqlite>, id: &str) -> Result<Option<GameSessi
             bag: persisted.bag,
             participants: persisted.participants,
             moves: persisted.moves,
+            consecutive_scoreless_turns: persisted.consecutive_scoreless_turns,
         }
     }))
 }

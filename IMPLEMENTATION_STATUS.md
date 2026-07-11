@@ -92,6 +92,12 @@ The project has successfully implemented the core MVP architecture: a server-aut
   - POST /games/{id}/actions - submit moves/passes/exchanges
   - PlayerActionDto enum: PlaceTiles, Pass, Exchange, Resign
 
+- [x] Standard end-of-game rules (beyond resignation)
+  - Going out: a player emptying their rack with the bag already empty ends the game immediately — everyone's score is reduced by the value of the tiles left on their rack, and the player who went out additionally receives the sum of everyone else's leftover rack value
+  - Pass-out: 6 consecutive scoreless plays (passes or exchanges), summed across all seats, also ends the game (no bonus, same per-rack deduction) — the standard tournament rule, equivalent to each player passing 3 times in a row heads-up; the counter resets on any scoring placement
+  - `GameSession::finish_game` computes the winner as the highest final score, or `None` on an exact tie
+  - Previously the only way a game reached `Finished` was manual resignation; engines never resign, so engine-vs-engine games could not end on their own before this
+
 - [x] Server-side scoring and legality
   - MoveValidator enforces rules
   - Score calculation via score.rs
@@ -104,9 +110,9 @@ The project has successfully implemented the core MVP architecture: a server-aut
 
 - [x] Deterministic tests for move legality and scoring
   - rules-shared: 20 unit tests (anchors, cross-checks, dictionary lookup, move generation including blanks, bingo bonus, gap rejection)
-  - server-game: 11 integration tests against the real Axum router (create/list/get, human move + engine auto-reply, persistence reload, all four player actions, wrong-turn/not-found/illegal-move rejection, seat-ownership enforcement, display-name uniqueness)
+  - server-game: 13 integration tests against the real Axum router (create/list/get, human move + engine auto-reply, persistence reload, all four player actions, wrong-turn/not-found/illegal-move rejection, seat-ownership enforcement, display-name uniqueness, going out with an empty bag finishes the game with the correct rack-penalty scoring, a two-engine game runs to completion off a single `/start` call)
   - engine-core: 1 test (greedy engine opening move)
-  - 32 tests total, all passing as of the last full run
+  - 34 tests total, all passing as of the last full run
 
 ### ✅ Clients
 
@@ -168,7 +174,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 | Feature | Status | Notes |
 |---------|--------|-------|
 | WebSocket events for live updates | Implemented client-side | Server broadcasts, and the client (`crates/ui/src/app.rs`) does subscribe and apply live updates — this row was stale, the earlier "client doesn't subscribe" claim is no longer true |
-| Engine vs engine play | Not tested | Infrastructure exists but no test coverage |
+| Engine vs engine play | Tested | `engine_vs_engine_game_runs_to_completion` creates a two-`greedy-v1` game and asserts a single `/start` call drives it to `Finished`. Required fixing two real gaps first: no natural end-of-game condition existed at all (see "Standard end-of-game rules" above), and `run_engine_turns` was capped at `participants.len()` iterations per trigger — fine for human+engine games (a human seat always breaks the loop) but meant an all-engine game only ever advanced one round per `/start` and then stalled forever with no human to trigger another. Now uncapped (with a generous 400-iteration safety ceiling against a hypothetical buggy engine) |
 | Multiple engine implementations | Reference only | Only GreedyEngine exists; arch supports plugging in more |
 | Engine benchmarking | Not built | Engine trait supports it; CLI for benchmarking not implemented |
 | Player identity (user accounts) | Implemented | Register/login/validate work end-to-end, with a real login UI (web + desktop) and seat-ownership enforcement on `submit_action`. See `authentication.md`'s status section for exactly what's still missing (email verification, forgot-password, ownership checks on other endpoints) |
@@ -253,7 +259,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
    - Invalid move rejections could log rule violation reason
 
 2. **Testing**
-   - Real coverage now exists: 32 tests across the workspace (see the MVP Checklist above for the breakdown), including HTTP-level integration tests and the security-relevant seat-ownership/uniqueness tests
+   - Real coverage now exists: 34 tests across the workspace (see the MVP Checklist above for the breakdown), including HTTP-level integration tests and the security-relevant seat-ownership/uniqueness tests
    - Still missing: engine-vs-engine play, a test that forces the engine timeout branch, anything beyond `submit_action` for auth/ownership, and any test of the WebSocket events path
 
 3. **Observability**
@@ -269,7 +275,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 
 ## Verification
 
-Both clients (web via `dx serve`, desktop via `cargo run -p scrabble-ui --features desktop`) connect to the backend and support the full game loop: create/select a game, place tiles, pass, exchange, resign, play against the greedy engine, and log in/register with a persisted session. `cargo test` at the workspace root runs all 32 tests; see `operations.md` for exact commands to run each piece.
+Both clients (web via `dx serve`, desktop via `cargo run -p scrabble-ui --features desktop`) connect to the backend and support the full game loop: create/select a game, place tiles, pass, exchange, resign, play against the greedy engine, and log in/register with a persisted session. `cargo test` at the workspace root runs all 34 tests; see `operations.md` for exact commands to run each piece.
 
 ---
 
@@ -285,17 +291,18 @@ Status: **Core loop solid; player identity now real, not just schema**
 - All four player actions (place, pass, exchange, resign)
 - Persistence (SQLite), two client types (web + desktop)
 - Live updates over WebSocket (server broadcasts, client subscribes and applies)
-- Real test coverage (32 tests, see above)
+- Real test coverage (34 tests, see above)
 - Engine turn timeout (auto-pass on a slow engine rather than stalling)
 - Player accounts: register/login/validate, argon2 password hashing, unique display names, a real login UI with "remember me"/"stay logged in"
 - Seat-ownership enforcement on `submit_action` for games created while logged in
+- Standard end-of-game rules: going-out rack-penalty scoring and 6-scoreless-turn pass-out (previously only resignation could end a game)
+- Engine-vs-engine test coverage (a two-engine game now runs to completion off one `/start` call)
 
 ❌ Not Yet:
 - Ownership enforcement beyond `submit_action` (start/preview/suggest/WebSocket)
 - Forgot-password / email verification flows
 - Claiming a second human seat via invitations (accept doesn't auto-place the player yet)
 - Structured logging / engine decision diagnostics
-- Engine-vs-engine test coverage
 
 ### v1 (Next Phase)
 

@@ -66,6 +66,12 @@ pub struct ParticipantState {
     pub resigned: bool,
 }
 
+/// Number of consecutive scoreless plays (passes or exchanges), summed
+/// across all seats, that ends the game with no one going out. This is the
+/// standard tournament rule; in heads-up (2-player) play it amounts to each
+/// player passing three times in a row.
+const SCORELESS_TURN_LIMIT: u8 = 6;
+
 #[derive(Debug, Clone)]
 pub struct GameSession {
     pub id: String,
@@ -82,6 +88,7 @@ pub struct GameSession {
     pub bag: Vec<Tile>,
     pub participants: Vec<ParticipantState>,
     pub moves: Vec<MoveRecord>,
+    pub consecutive_scoreless_turns: u8,
 }
 
 impl GameSession {
@@ -110,6 +117,7 @@ impl GameSession {
             bag,
             participants,
             moves: Vec::new(),
+            consecutive_scoreless_turns: 0,
         }
     }
 
@@ -228,6 +236,7 @@ impl GameSession {
 
         participant.score += validated.score.total as i32;
         refill_rack(&mut participant.rack, &mut self.bag, self.rules.rack_size);
+        let went_out = participant.rack.is_empty();
         self.moves.push(MoveRecord {
             move_number: self.turn_number,
             seat_number,
@@ -239,7 +248,12 @@ impl GameSession {
                 participant.display_name, validated.preview.main_word, validated.score.total
             ),
         });
-        self.advance_turn();
+        self.consecutive_scoreless_turns = 0;
+        if went_out {
+            self.finish_game(Some(seat_number));
+        } else {
+            self.advance_turn();
+        }
         Ok(())
     }
 
@@ -257,7 +271,12 @@ impl GameSession {
             score_delta: 0,
             description: format!("{} passed", participant.display_name),
         });
-        self.advance_turn();
+        self.consecutive_scoreless_turns += 1;
+        if self.consecutive_scoreless_turns >= SCORELESS_TURN_LIMIT {
+            self.finish_game(None);
+        } else {
+            self.advance_turn();
+        }
         Ok(())
     }
 
@@ -293,7 +312,12 @@ impl GameSession {
                 tiles.len()
             ),
         });
-        self.advance_turn();
+        self.consecutive_scoreless_turns += 1;
+        if self.consecutive_scoreless_turns >= SCORELESS_TURN_LIMIT {
+            self.finish_game(None);
+        } else {
+            self.advance_turn();
+        }
         Ok(())
     }
 
@@ -400,6 +424,59 @@ impl GameSession {
         }
 
         Ok(true)
+    }
+
+    /// Ends the game via the standard endgame scoring adjustment: every
+    /// participant's score is reduced by the value of the tiles left on
+    /// their rack, and if `goer_out` went out (emptied their rack while
+    /// tiles remained for everyone else), they additionally receive the sum
+    /// of every other rack's value. `goer_out` is `None` when the game ends
+    /// by a scoreless-turn streak instead, in which case only the
+    /// deductions apply.
+    fn finish_game(&mut self, goer_out: Option<u8>) {
+        let letter_values = self.rules.letter_values;
+        let rack_value = |rack: &Rack| -> i32 {
+            rack.counts
+                .iter()
+                .zip(letter_values.iter())
+                .map(|(&count, &value)| count as i32 * value as i32)
+                .sum::<i32>()
+        };
+
+        let mut opponents_total = 0i32;
+        for participant in &mut self.participants {
+            let value = rack_value(&participant.rack);
+            if Some(participant.seat_number) != goer_out {
+                opponents_total += value;
+            }
+            participant.score -= value;
+        }
+        if let Some(seat) = goer_out {
+            if let Some(participant) = self
+                .participants
+                .iter_mut()
+                .find(|participant| participant.seat_number == seat)
+            {
+                participant.score += opponents_total;
+            }
+        }
+
+        self.status = GameStatus::Finished;
+        self.winner_seat = self.compute_winner_seat();
+    }
+
+    fn compute_winner_seat(&self) -> Option<u8> {
+        let max_score = self.participants.iter().map(|p| p.score).max()?;
+        let mut leaders = self
+            .participants
+            .iter()
+            .filter(|participant| participant.score == max_score);
+        let first = leaders.next()?;
+        if leaders.next().is_some() {
+            None
+        } else {
+            Some(first.seat_number)
+        }
     }
 
     fn advance_turn(&mut self) {
