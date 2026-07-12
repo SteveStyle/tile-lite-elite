@@ -23,6 +23,18 @@ struct PersistedGame {
     moves: Vec<MoveRecord>,
     #[serde(default)]
     consecutive_scoreless_turns: u8,
+    #[serde(default = "default_move_time_limit_seconds")]
+    move_time_limit_seconds: u64,
+    // Defaults to "now" rather than e.g. "0" — an old snapshot predating
+    // this field has no real turn-start time to recover, and defaulting to
+    // the epoch would make it look instantly overdue the moment it's
+    // reloaded, retiring whoever's turn it is before they get a chance.
+    #[serde(default = "now_iso")]
+    turn_started_at: String,
+}
+
+fn default_move_time_limit_seconds() -> u64 {
+    crate::game_state::DEFAULT_MOVE_TIME_LIMIT_SECONDS
 }
 
 pub async fn connect(database_url: &str) -> Result<Pool<Sqlite>, sqlx::Error> {
@@ -153,13 +165,12 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
         "create table if not exists game_invitations (
             id text primary key,
             game_id text not null,
-            invited_player_id text not null,
+            invited_player_id text,
             inviting_player_id text not null,
             seat_number integer not null,
             status text not null,
             created_at text not null,
-            responded_at text,
-            unique(game_id, invited_player_id, seat_number)
+            responded_at text
         )",
     )
     .execute(pool)
@@ -185,6 +196,8 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         participants: session.participants.clone(),
         moves: session.moves.clone(),
         consecutive_scoreless_turns: session.consecutive_scoreless_turns,
+        move_time_limit_seconds: session.move_time_limit_seconds,
+        turn_started_at: session.turn_started_at.clone(),
     })
     .expect("game session should serialize");
 
@@ -312,6 +325,8 @@ pub async fn load_game(pool: &Pool<Sqlite>, id: &str) -> Result<Option<GameSessi
             participants: persisted.participants,
             moves: persisted.moves,
             consecutive_scoreless_turns: persisted.consecutive_scoreless_turns,
+            move_time_limit_seconds: persisted.move_time_limit_seconds,
+            turn_started_at: persisted.turn_started_at,
         }
     }))
 }
@@ -403,6 +418,21 @@ pub async fn update_player_password(
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Signs out every session for this player — used after a self-service
+/// password change, so a leaked/stolen session token stops working the
+/// moment the account holder reacts to it, rather than staying valid
+/// indefinitely alongside the new password.
+pub async fn invalidate_sessions_for_player(
+    pool: &Pool<Sqlite>,
+    player_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("delete from sessions where player_id = ?1")
+        .bind(player_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Deletes a player along with their sessions and invitations, but
@@ -692,7 +722,9 @@ pub async fn update_session_last_seen(pool: &Pool<Sqlite>, id: &str) -> Result<(
 pub struct InvitationRecord {
     pub id: String,
     pub game_id: String,
-    pub invited_player_id: String,
+    /// `None` means an open/stranger invitation — visible to any logged-in
+    /// player, first to accept claims the seat.
+    pub invited_player_id: Option<String>,
     pub inviting_player_id: String,
     pub seat_number: u8,
     pub status: String,
@@ -700,11 +732,27 @@ pub struct InvitationRecord {
     pub responded_at: Option<String>,
 }
 
+fn invitation_from_row(row: sqlx::sqlite::SqliteRow) -> InvitationRecord {
+    InvitationRecord {
+        id: row.get(0),
+        game_id: row.get(1),
+        invited_player_id: row.get(2),
+        inviting_player_id: row.get(3),
+        seat_number: row.get::<i64, _>(4) as u8,
+        status: row.get(5),
+        created_at: row.get(6),
+        responded_at: row.get(7),
+    }
+}
+
+const INVITATION_COLUMNS: &str =
+    "id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, responded_at";
+
 pub async fn create_invitation(
     pool: &Pool<Sqlite>,
     id: &str,
     game_id: &str,
-    invited_player_id: &str,
+    invited_player_id: Option<&str>,
     inviting_player_id: &str,
     seat_number: u8,
 ) -> Result<InvitationRecord, sqlx::Error> {
@@ -725,7 +773,7 @@ pub async fn create_invitation(
     Ok(InvitationRecord {
         id: id.to_string(),
         game_id: game_id.to_string(),
-        invited_player_id: invited_player_id.to_string(),
+        invited_player_id: invited_player_id.map(str::to_string),
         inviting_player_id: inviting_player_id.to_string(),
         seat_number,
         status: "pending".to_string(),
@@ -738,27 +786,47 @@ pub async fn get_invitations_for_player(
     pool: &Pool<Sqlite>,
     player_id: &str,
 ) -> Result<Vec<InvitationRecord>, sqlx::Error> {
-    let rows = sqlx::query(
-        "select id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, responded_at
-         from game_invitations where invited_player_id = ?1",
-    )
+    let rows = sqlx::query(&format!(
+        "select {INVITATION_COLUMNS} from game_invitations where invited_player_id = ?1"
+    ))
     .bind(player_id)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| InvitationRecord {
-            id: r.get(0),
-            game_id: r.get(1),
-            invited_player_id: r.get(2),
-            inviting_player_id: r.get(3),
-            seat_number: r.get::<i64, _>(4) as u8,
-            status: r.get(5),
-            created_at: r.get(6),
-            responded_at: r.get(7),
-        })
-        .collect())
+    Ok(rows.into_iter().map(invitation_from_row).collect())
+}
+
+/// Pending open/stranger invitations — visible to every logged-in player,
+/// not just one specific invitee.
+pub async fn get_open_invitations(pool: &Pool<Sqlite>) -> Result<Vec<InvitationRecord>, sqlx::Error> {
+    let rows = sqlx::query(&format!(
+        "select {INVITATION_COLUMNS} from game_invitations
+         where invited_player_id is null and status = 'pending'"
+    ))
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(invitation_from_row).collect())
+}
+
+/// The still-pending invitation (if any) already outstanding for this seat —
+/// used to stop a seat from being double-invited while one invite is still
+/// awaiting a response.
+pub async fn get_pending_invitation_for_seat(
+    pool: &Pool<Sqlite>,
+    game_id: &str,
+    seat_number: u8,
+) -> Result<Option<InvitationRecord>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "select {INVITATION_COLUMNS} from game_invitations
+         where game_id = ?1 and seat_number = ?2 and status = 'pending'"
+    ))
+    .bind(game_id)
+    .bind(seat_number as i64)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(invitation_from_row))
 }
 
 pub async fn update_invitation_status(
@@ -774,6 +842,74 @@ pub async fn update_invitation_status(
         .execute(pool)
         .await?;
     Ok(())
+}
+
+pub enum ClaimInvitationError {
+    NotFound,
+    /// Already responded to (accepted/rejected/cancelled) or, for an open
+    /// invitation, already claimed by someone else in a race.
+    NoLongerAvailable,
+    /// A named invitation belongs to a specific player; anyone else trying
+    /// to accept it hits this instead of silently taking their seat.
+    NotYourInvitation,
+}
+
+/// Atomically accepts an invitation and reports who now owns it. Race-safe
+/// for open invitations: the `where status = 'pending'` guard means if two
+/// players accept the same open seat at once, only the first `UPDATE` finds
+/// a matching row — the second sees 0 rows affected and gets
+/// `NoLongerAvailable` instead of silently overwriting the first claim.
+pub async fn claim_invitation(
+    pool: &Pool<Sqlite>,
+    invitation_id: &str,
+    claimant_player_id: &str,
+) -> Result<InvitationRecord, ClaimInvitationError> {
+    let existing = sqlx::query(&format!(
+        "select {INVITATION_COLUMNS} from game_invitations where id = ?1"
+    ))
+    .bind(invitation_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|_| ClaimInvitationError::NotFound)?
+    .map(invitation_from_row)
+    .ok_or(ClaimInvitationError::NotFound)?;
+
+    // Only check "is this actually your invitation" while it's still
+    // pending. Once accepted, an open invitation's `invited_player_id` has
+    // been backfilled to whoever claimed it — checking that here would
+    // misreport a late second acceptor as "not your invitation" instead of
+    // "no longer available".
+    if existing.status == "pending" {
+        if let Some(named) = &existing.invited_player_id {
+            if named != claimant_player_id {
+                return Err(ClaimInvitationError::NotYourInvitation);
+            }
+        }
+    }
+
+    let now = now_iso();
+    let result = sqlx::query(
+        "update game_invitations
+         set status = 'accepted', responded_at = ?1, invited_player_id = coalesce(invited_player_id, ?2)
+         where id = ?3 and status = 'pending'",
+    )
+    .bind(&now)
+    .bind(claimant_player_id)
+    .bind(invitation_id)
+    .execute(pool)
+    .await
+    .map_err(|_| ClaimInvitationError::NoLongerAvailable)?;
+
+    if result.rows_affected() == 0 {
+        return Err(ClaimInvitationError::NoLongerAvailable);
+    }
+
+    Ok(InvitationRecord {
+        invited_player_id: Some(claimant_player_id.to_string()),
+        status: "accepted".to_string(),
+        responded_at: Some(now),
+        ..existing
+    })
 }
 
 fn now_iso() -> String {

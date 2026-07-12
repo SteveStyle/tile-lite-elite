@@ -5,10 +5,10 @@ use std::time::Duration;
 use std::net::SocketAddr;
 
 use api::{
-    AdminGameSummaryDto, AdminResetPasswordRequest, ApiError, CreateGameRequest,
-    GameActionRequest, GameEventDto, GameInvitationDto, InvitationStatus, InvitePlayerRequest,
-    LoginPlayerRequest, PlayerActionDto, PlayerDto, PlayerSessionDto, PreviewMoveRequest,
-    RegisterPlayerRequest, StartGameRequest, ValidateSessionRequest,
+    AdminGameSummaryDto, AdminResetPasswordRequest, ApiError, ChangePasswordRequest,
+    CreateGameRequest, GameActionRequest, GameEventDto, GameInvitationDto, InvitationStatus,
+    InvitePlayerRequest, LoginPlayerRequest, PlayerActionDto, PlayerDto, PlayerSessionDto,
+    PreviewMoveRequest, RegisterPlayerRequest, StartGameRequest, ValidateSessionRequest,
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Path, Query, Request, State, WebSocketUpgrade};
@@ -85,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/register", post(register_player))
         .route("/auth/login", post(login_player))
         .route("/auth/validate", post(validate_session))
+        .route("/auth/change-password", post(change_password))
         // Games
         .route("/games", post(create_game).get(list_games))
         .route("/games/{game_id}", get(get_game))
@@ -128,22 +129,78 @@ async fn list_engines(State(state): State<AppState>) -> Json<Vec<api::EngineProf
     Json(state.engines.metadata())
 }
 
-async fn list_games(State(state): State<AppState>) -> Result<Json<Vec<api::GameSummaryDto>>, ApiProblem> {
+async fn list_games(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<api::GameSummaryDto>>, ApiProblem> {
+    // The list is inherently personal — which games show up depends on who's
+    // asking — so there's no meaningful "browse everything" mode anymore.
+    let caller_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to see your games"))?;
+
+    expire_overdue_turns(&state).await;
+
     let last_activity = persistence::last_activity_by_game(&state.db)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    let named_invitations = persistence::get_invitations_for_player(&state.db, &caller_player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    let open_invitations = persistence::get_open_invitations(&state.db)
         .await
         .map_err(ApiProblem::from_sqlx)?;
 
     let games = state.games.read().await;
-    let mut summaries: Vec<api::GameSummaryDto> = games
-        .values()
-        .map(|game| {
-            let last_activity_at = last_activity
-                .get(&game.id)
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string());
-            game.to_summary_dto(last_activity_at)
-        })
-        .collect();
+    let mut summaries: Vec<api::GameSummaryDto> = Vec::new();
+
+    for game in games.values() {
+        let last_activity_at = last_activity
+            .get(&game.id)
+            .cloned()
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let is_participant = game
+            .participants
+            .iter()
+            .any(|p| p.player_id.as_deref() == Some(caller_player_id.as_str()));
+        if is_participant {
+            let relationship = if game.status == api::GameStatus::Active
+                && game
+                    .participants
+                    .get(game.current_seat as usize)
+                    .and_then(|p| p.player_id.as_deref())
+                    == Some(caller_player_id.as_str())
+            {
+                api::GameRelationship::YourTurn
+            } else {
+                api::GameRelationship::Participant
+            };
+            let mut summary = game.to_summary_dto(last_activity_at);
+            summary.relationship = relationship;
+            summaries.push(summary);
+            continue;
+        }
+
+        if let Some(invitation) = named_invitations
+            .iter()
+            .find(|inv| inv.game_id == game.id && inv.status == "pending")
+        {
+            let mut summary = game.to_summary_dto(last_activity_at);
+            summary.relationship = api::GameRelationship::InvitedByName;
+            summary.invitation_id = Some(invitation.id.clone());
+            summaries.push(summary);
+            continue;
+        }
+
+        if let Some(invitation) = open_invitations.iter().find(|inv| inv.game_id == game.id) {
+            let mut summary = game.to_summary_dto(last_activity_at);
+            summary.relationship = api::GameRelationship::InvitedOpen;
+            summary.invitation_id = Some(invitation.id.clone());
+            summaries.push(summary);
+        }
+    }
+
     summaries.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
 
     Ok(Json(summaries))
@@ -158,13 +215,46 @@ async fn create_game(
         return Err(ApiProblem::bad_request("At least one seat is required"));
     }
 
-    // If the creator is logged in, they own the first human seat, so nobody
-    // else can act as "them" later. Anonymous creation (no session) still
-    // works and produces an unclaimed game, same as before this change —
-    // claiming additional seats for other players is a separate invitation
-    // flow this doesn't attempt to solve yet.
-    let creator_player_id = authenticated_player_id(&state, &headers).await;
-    let mut creator_seat_claimed = false;
+    // Every seat now needs a real accepting/claiming party (the creator
+    // themselves, a named invitee, or a stranger who accepts an open
+    // invitation) — there's no more "anonymous, open to whoever clicks it"
+    // seat, so creating a game requires being signed in.
+    let creator_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to create a game"))?;
+
+    let creator_claims = request
+        .seats
+        .iter()
+        .filter(|seat| seat.kind == api::SeatKind::Human && matches!(seat.claim, Some(api::SeatClaim::Creator)))
+        .count();
+    if creator_claims > 1 {
+        return Err(ApiProblem::bad_request(
+            "Only one seat can be claimed by the creator",
+        ));
+    }
+    if request
+        .seats
+        .iter()
+        .any(|seat| seat.kind == api::SeatKind::Human && seat.claim.is_none())
+    {
+        return Err(ApiProblem::bad_request(
+            "Every human seat needs a claim: creator, named, or open",
+        ));
+    }
+
+    // Resolve every named invitee up front, before creating anything, so a
+    // typo'd name fails cleanly instead of leaving a half-built game behind.
+    let mut named_invitees: HashMap<u8, persistence::PlayerRecord> = HashMap::new();
+    for (seat_number, seat) in request.seats.iter().enumerate() {
+        if let Some(api::SeatClaim::Named { display_name }) = &seat.claim {
+            let player = persistence::get_player_by_name(&state.db, display_name)
+                .await
+                .map_err(ApiProblem::from_sqlx)?
+                .ok_or_else(|| ApiProblem::not_found(format!("No player named '{display_name}'")))?;
+            named_invitees.insert(seat_number as u8, player);
+        }
+    }
 
     let rules = rules_shared::VariantRules::official();
     let participants = request
@@ -172,11 +262,9 @@ async fn create_game(
         .into_iter()
         .enumerate()
         .map(|(seat_number, seat)| {
-            let player_id = if !creator_seat_claimed && seat.kind == api::SeatKind::Human {
-                creator_seat_claimed = true;
-                creator_player_id.clone()
-            } else {
-                None
+            let player_id = match &seat.claim {
+                Some(api::SeatClaim::Creator) => Some(creator_player_id.clone()),
+                _ => None,
             };
             ParticipantState {
                 seat_number: seat_number as u8,
@@ -196,12 +284,43 @@ async fn create_game(
     // constant, so every game created through the UI (which never sends a
     // seed) dealt the exact same racks in the exact same order, every game.
     let seed = request.seed.unwrap_or_else(rand::random);
-    let game = GameSession::new(Uuid::new_v4().to_string(), participants, seed, rules);
+    let move_time_limit_seconds = request
+        .move_time_limit_seconds
+        .unwrap_or(crate::game_state::DEFAULT_MOVE_TIME_LIMIT_SECONDS);
+    let game = GameSession::new(
+        Uuid::new_v4().to_string(),
+        participants,
+        seed,
+        rules,
+        move_time_limit_seconds,
+    );
     let dto = game.to_dto();
 
     persistence::save_game(&state.db, &game)
         .await
         .map_err(ApiProblem::from_sqlx)?;
+
+    // Every Human seat that isn't the creator's needs a pending invitation:
+    // named if a specific invitee was resolved above, open otherwise.
+    for participant in &game.participants {
+        if participant.kind != api::SeatKind::Human || participant.player_id.is_some() {
+            continue;
+        }
+        let invited_player_id = named_invitees
+            .get(&participant.seat_number)
+            .map(|player| player.id.as_str());
+        persistence::create_invitation(
+            &state.db,
+            &Uuid::new_v4().to_string(),
+            &game.id,
+            invited_player_id,
+            &creator_player_id,
+            participant.seat_number,
+        )
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    }
+
     state.games.write().await.insert(game.id.clone(), game);
     Ok(Json(dto))
 }
@@ -210,6 +329,8 @@ async fn get_game(
     Path(game_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    expire_overdue_turn(&state, &game_id).await;
+
     let games = state.games.read().await;
     let game = games
         .get(&game_id)
@@ -231,12 +352,22 @@ async fn start_game(
             .get_mut(&game_id)
             .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
 
-        // A fully anonymous game (no claimed seats) stays open to anyone,
-        // same as before this change. Once any seat is claimed, only a
-        // player who owns one of those seats can start the match — same
-        // "unclaimed stays open, claimed is owner-only" rule submit_action
-        // already applies per-seat, just evaluated game-wide here since
-        // starting isn't a per-seat action.
+        // Every human seat needs a real occupant (creator or an accepted
+        // invitation) before play can start — an unclaimed human seat means
+        // an invitation is still outstanding, not "open to anyone".
+        if game
+            .participants
+            .iter()
+            .any(|p| p.kind == api::SeatKind::Human && p.player_id.is_none())
+        {
+            return Err(ApiProblem::bad_request(
+                "Every seat must be filled before the game can start",
+            ));
+        }
+
+        // A game with no human seats at all (engine vs engine) has no
+        // meaningful owner, so any signed-in caller may start it. Otherwise
+        // only a player seated in the game can.
         let claimed_owners: Vec<&str> = game
             .participants
             .iter()
@@ -274,22 +405,26 @@ async fn submit_action(
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
     let caller_player_id = authenticated_player_id(&state, &headers).await;
 
+    expire_overdue_turn(&state, &game_id).await;
+
     let dto = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
             .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
 
-        // Unclaimed seats (no player_id bound at game creation) stay open
-        // to anyone, same as before this change. A claimed seat can only
-        // be acted on by the player who owns it.
-        if let Some(owner_id) = game
+        // A human seat can only be acted on by the player who owns it — an
+        // unclaimed human seat means an invitation is still outstanding, not
+        // "open to anyone" (engine seats have no owner and aren't reachable
+        // through this endpoint in normal play).
+        if let Some(seat) = game
             .participants
             .iter()
             .find(|participant| participant.seat_number == request.seat_number)
-            .and_then(|participant| participant.player_id.as_ref())
         {
-            if caller_player_id.as_deref() != Some(owner_id.as_str()) {
+            if seat.kind == api::SeatKind::Human
+                && caller_player_id.as_deref() != seat.player_id.as_deref()
+            {
                 return Err(ApiProblem::unauthorized(
                     "This seat belongs to a different player",
                 ));
@@ -339,6 +474,7 @@ async fn preview_move(
     Json(request): Json<PreviewMoveRequest>,
 ) -> Result<Json<api::PreviewMoveResponse>, ApiProblem> {
     let caller_player_id = authenticated_player_id(&state, &headers).await;
+    expire_overdue_turn(&state, &game_id).await;
     let games = state.games.read().await;
     let game = games
         .get(&game_id)
@@ -346,13 +482,12 @@ async fn preview_move(
 
     // Previewing a seat you don't own would otherwise let a caller probe
     // an opponent's exact rack contents by repeatedly guessing candidate
-    // placements and reading back legality/score.
-    if let Some(owner_id) = game
-        .participants
-        .get(request.seat_number as usize)
-        .and_then(|participant| participant.player_id.as_ref())
-    {
-        if caller_player_id.as_deref() != Some(owner_id.as_str()) {
+    // placements and reading back legality/score. An unclaimed human seat
+    // means an invitation is still outstanding, so it's nobody's to preview.
+    if let Some(seat) = game.participants.get(request.seat_number as usize) {
+        if seat.kind == api::SeatKind::Human
+            && caller_player_id.as_deref() != seat.player_id.as_deref()
+        {
             return Err(ApiProblem::unauthorized(
                 "This seat belongs to a different player",
             ));
@@ -421,6 +556,8 @@ async fn suggest_move(
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
     let caller_player_id = authenticated_player_id(&state, &headers).await;
 
+    expire_overdue_turn(&state, &game_id).await;
+
     let dto = {
         let mut games = state.games.write().await;
         let game = games
@@ -440,12 +577,10 @@ async fn suggest_move(
                 "Current seat is not human-controlled",
             ));
         }
-        if let Some(owner_id) = participant.player_id.as_ref() {
-            if caller_player_id.as_deref() != Some(owner_id.as_str()) {
-                return Err(ApiProblem::unauthorized(
-                    "This seat belongs to a different player",
-                ));
-            }
+        if caller_player_id.as_deref() != participant.player_id.as_deref() {
+            return Err(ApiProblem::unauthorized(
+                "This seat belongs to a different player",
+            ));
         }
 
         let rack = participant.rack;
@@ -645,62 +780,142 @@ async fn validate_session(
     }))
 }
 
+async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ChangePasswordRequest>,
+) -> Result<StatusCode, ApiProblem> {
+    let player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to change your password"))?;
+
+    if request.new_password.is_empty() {
+        return Err(ApiProblem::bad_request("A new password is required"));
+    }
+
+    let player = persistence::get_player_by_id(&state.db, &player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?
+        .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
+
+    // Requiring the current password (rather than trusting the session
+    // token alone) matters specifically for "remember me" sessions, which
+    // can sit valid on a device for a long time — proving you still know
+    // the password is what makes this a deliberate account action rather
+    // than something a stolen token alone can do.
+    if !verify_password(&request.current_password, &player.password_hash) {
+        return Err(ApiProblem::bad_request("Current password is incorrect"));
+    }
+
+    let new_hash = hash_password(&request.new_password)
+        .map_err(|_| ApiProblem::bad_request("Could not process that password"))?;
+    persistence::update_player_password(&state.db, &player_id, &new_hash)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+    // Signs the caller's own session out along with every other one — the
+    // client is expected to send them back to the login screen. This is
+    // deliberate: changing your password should mean starting fresh, not
+    // silently keeping whatever session made the request.
+    persistence::invalidate_sessions_for_player(&state.db, &player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ========== Game Invitation Handlers ==========
 
 async fn invite_player_to_game(
     Path(game_id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<InvitePlayerRequest>,
 ) -> Result<Json<GameInvitationDto>, ApiProblem> {
-    // Get the game
+    let inviting_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to invite players"))?;
+
     let games = state.games.read().await;
     let game = games
         .get(&game_id)
         .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
 
-    // Verify the game is still in waiting state
     if game.status != api::GameStatus::Waiting {
         return Err(ApiProblem::bad_request(
             "Game must be in waiting state to invite players",
         ));
     }
 
-    // Find the invited player
-    let invited_player = persistence::get_player_by_name(&state.db, &request.invited_display_name)
-        .await
-        .map_err(|_| ApiProblem::bad_request("Database error"))?
-        .ok_or_else(|| ApiProblem::not_found("Invited player not found"))?;
-
-    // For now, assume the first participant is the inviting player
-    let inviting_player_id = game
+    let is_participant = game
         .participants
-        .first()
-        .and_then(|p| p.player_id.clone())
-        .ok_or_else(|| ApiProblem::bad_request("Cannot determine inviting player"))?;
+        .iter()
+        .any(|p| p.player_id.as_deref() == Some(inviting_player_id.as_str()));
+    if !is_participant {
+        return Err(ApiProblem::unauthorized(
+            "Only a player already seated in this game can invite others",
+        ));
+    }
 
-    // Create the invitation
+    let seat = game
+        .participants
+        .iter()
+        .find(|p| p.seat_number == request.seat_number)
+        .ok_or_else(|| ApiProblem::bad_request("No such seat"))?;
+    if seat.kind != api::SeatKind::Human || seat.player_id.is_some() {
+        return Err(ApiProblem::bad_request(
+            "That seat is not open to be invited to",
+        ));
+    }
+    if persistence::get_pending_invitation_for_seat(&state.db, &game_id, request.seat_number)
+        .await
+        .map_err(ApiProblem::from_sqlx)?
+        .is_some()
+    {
+        return Err(ApiProblem::bad_request(
+            "This seat already has a pending invitation",
+        ));
+    }
+
+    // `None` means an open/stranger invitation — any logged-in player may
+    // accept it, not just one specific invitee.
+    let invited_player = match &request.invited_display_name {
+        Some(display_name) => Some(
+            persistence::get_player_by_name(&state.db, display_name)
+                .await
+                .map_err(ApiProblem::from_sqlx)?
+                .ok_or_else(|| ApiProblem::not_found(format!("No player named '{display_name}'")))?,
+        ),
+        None => None,
+    };
+
+    let inviting_player = persistence::get_player_by_id(&state.db, &inviting_player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?
+        .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
+
     let invitation_id = Uuid::new_v4().to_string();
-    let _ = persistence::create_invitation(
+    let record = persistence::create_invitation(
         &state.db,
         &invitation_id,
         &game_id,
-        &invited_player.id,
+        invited_player.as_ref().map(|p| p.id.as_str()),
         &inviting_player_id,
         request.seat_number,
     )
     .await
-    .map_err(|_| ApiProblem::bad_request("Failed to create invitation"))?;
+    .map_err(ApiProblem::from_sqlx)?;
 
     Ok(Json(GameInvitationDto {
-        id: invitation_id,
-        game_id,
-        invited_player_id: invited_player.id,
-        inviting_player_id,
-        seat_number: request.seat_number,
+        id: record.id,
+        game_id: record.game_id,
+        invited_player_id: record.invited_player_id,
+        inviting_player_id: record.inviting_player_id,
+        seat_number: record.seat_number,
         status: InvitationStatus::Pending,
-        created_at: now_iso(),
+        created_at: record.created_at,
         responded_at: None,
-        inviting_player_display_name: game.participants[0].display_name.clone(),
+        inviting_player_display_name: inviting_player.display_name,
     }))
 }
 
@@ -746,23 +961,82 @@ async fn list_player_invitations(
 async fn accept_invitation(
     Path(invitation_id): Path<String>,
     State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, ApiProblem> {
-    persistence::update_invitation_status(&state.db, &invitation_id, "accepted")
+    headers: HeaderMap,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers)
         .await
-        .map_err(|_| ApiProblem::bad_request("Failed to update invitation"))?;
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to accept an invitation"))?;
 
-    Ok(Json(serde_json::json!({
-        "status": "accepted"
-    })))
+    // Race-safe: for an open invitation, this is where "first to accept
+    // wins" is actually decided (an atomic DB update, not a check-then-act
+    // in application code) — see `claim_invitation`.
+    let record = persistence::claim_invitation(&state.db, &invitation_id, &caller_player_id)
+        .await
+        .map_err(|error| match error {
+            persistence::ClaimInvitationError::NotFound => {
+                ApiProblem::not_found("Invitation not found")
+            }
+            persistence::ClaimInvitationError::NoLongerAvailable => ApiProblem::bad_request(
+                "This invitation is no longer available — it may already have been claimed",
+            ),
+            persistence::ClaimInvitationError::NotYourInvitation => {
+                ApiProblem::unauthorized("This invitation was not sent to you")
+            }
+        })?;
+
+    let dto = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&record.game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+        if let Some(participant) = game
+            .participants
+            .iter_mut()
+            .find(|p| p.seat_number == record.seat_number)
+        {
+            participant.player_id = Some(caller_player_id.clone());
+        }
+        let dto = game.to_dto();
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        dto
+    };
+
+    let _ = state.events.send(GameEventDto::StateUpdated { game: dto.clone() });
+    Ok(Json(dto))
 }
 
 async fn reject_invitation(
     Path(invitation_id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to reject an invitation"))?;
+
+    let invitations = persistence::get_invitations_for_player(&state.db, &caller_player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    let invitation = invitations
+        .iter()
+        .find(|inv| inv.id == invitation_id)
+        .ok_or_else(|| {
+            // Either it doesn't exist, or it's an open invitation with no
+            // single invitee — either way, there's nothing for this caller
+            // to reject.
+            ApiProblem::not_found("Invitation not found")
+        })?;
+    if invitation.status != "pending" {
+        return Err(ApiProblem::bad_request(
+            "This invitation has already been responded to",
+        ));
+    }
+
     persistence::update_invitation_status(&state.db, &invitation_id, "rejected")
         .await
-        .map_err(|_| ApiProblem::bad_request("Failed to update invitation"))?;
+        .map_err(ApiProblem::from_sqlx)?;
 
     Ok(Json(serde_json::json!({
         "status": "rejected"
@@ -868,6 +1142,49 @@ async fn run_engine_turns(game: &mut GameSession, engines: &EngineRegistry) -> R
         }
     }
     Ok(())
+}
+
+/// There's no background scheduler in this server, so overdue-turn
+/// retirement is checked lazily: call this at the top of any handler that
+/// reads or acts on live games, and any seat that's overrun its
+/// `move_time_limit_seconds` gets auto-retired (same effect as resigning)
+/// before the rest of the handler runs. Persists and broadcasts every game
+/// it changes.
+async fn expire_overdue_turns(state: &AppState) {
+    let mut finished = Vec::new();
+    {
+        let mut games = state.games.write().await;
+        for game in games.values_mut() {
+            if game.apply_move_timeout() {
+                if let Err(error) = persistence::save_game(&state.db, game).await {
+                    eprintln!("failed to persist timeout retirement for game {}: {error}", game.id);
+                }
+                finished.push(game.to_dto());
+            }
+        }
+    }
+    for dto in finished {
+        let _ = state.events.send(GameEventDto::GameFinished { game: dto });
+    }
+}
+
+/// Same as `expire_overdue_turns` but scoped to one game — cheaper for
+/// handlers that already know which game they care about.
+async fn expire_overdue_turn(state: &AppState, game_id: &str) {
+    let finished = {
+        let mut games = state.games.write().await;
+        let Some(game) = games.get_mut(game_id) else {
+            return;
+        };
+        if !game.apply_move_timeout() {
+            return;
+        }
+        if let Err(error) = persistence::save_game(&state.db, game).await {
+            eprintln!("failed to persist timeout retirement for game {game_id}: {error}");
+        }
+        game.to_dto()
+    };
+    let _ = state.events.send(GameEventDto::GameFinished { game: finished });
 }
 
 // ========== Admin Handlers ==========
@@ -1112,7 +1429,7 @@ impl IntoResponse for ApiProblem {
 mod tests {
     use super::*;
     use crate::game_state::{board_from_dto, move_candidate_to_dto};
-    use api::{CreateSeatRequest, GameStateDto, SeatKind};
+    use api::{CreateSeatRequest, GameStateDto, SeatClaim, SeatKind};
     use axum::body::{Body, to_bytes};
     use axum::http::{Method, Request};
     use rules_shared::{
@@ -1266,27 +1583,33 @@ mod tests {
         let state = create_test_state(&database_url).await;
         let app = build_router(state);
 
-        let response = send_json(
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let response = send_json_auth(
             app.clone(),
             Method::POST,
             "/games",
+            Some(&alice.session_token),
             &CreateGameRequest {
                 seats: vec![
                     CreateSeatRequest {
                         kind: SeatKind::Human,
                         display_name: "Alice".to_string(),
                         engine_id: None,
+                        claim: Some(SeatClaim::Creator),
                     },
                     CreateSeatRequest {
                         kind: SeatKind::Engine,
                         display_name: "Greedy".to_string(),
                         engine_id: Some("greedy-v1".to_string()),
+                        claim: None,
                     },
                 ],
                 seed: Some(1234),
                 variant: None,
                 language: None,
                 board_layout: None,
+                move_time_limit_seconds: None,
             },
         )
         .await;
@@ -1296,7 +1619,13 @@ mod tests {
         assert_eq!(created.status, api::GameStatus::Waiting);
         assert_eq!(created.participants.len(), 2);
 
-        let listed_response = send_empty(app.clone(), Method::GET, "/games").await;
+        let listed_response = send_empty_auth(
+            app.clone(),
+            Method::GET,
+            "/games",
+            Some(&alice.session_token),
+        )
+        .await;
         assert_eq!(listed_response.status(), StatusCode::OK);
         let listed: Vec<api::GameSummaryDto> = read_json(listed_response).await;
         let summary = listed
@@ -1305,6 +1634,7 @@ mod tests {
             .expect("created game should appear in the summary list");
         assert_eq!(summary.status, api::GameStatus::Waiting);
         assert_eq!(summary.participants.len(), 2);
+        assert_eq!(summary.relationship, api::GameRelationship::Participant);
         assert!(
             !summary.last_activity_at.is_empty() && summary.last_activity_at != "unknown",
             "expected a real timestamp, got {:?}",
@@ -1328,45 +1658,70 @@ mod tests {
         let state = create_test_state(&database_url).await;
         let app = build_router(state);
 
+        let alice = register_player(app.clone(), "Alice").await;
+
         let new_game = CreateGameRequest {
             seats: vec![
                 CreateSeatRequest {
                     kind: SeatKind::Human,
                     display_name: "Alice".to_string(),
                     engine_id: None,
+                    claim: Some(SeatClaim::Creator),
                 },
                 CreateSeatRequest {
-                    kind: SeatKind::Human,
-                    display_name: "Bob".to_string(),
-                    engine_id: None,
+                    kind: SeatKind::Engine,
+                    display_name: "Greedy".to_string(),
+                    engine_id: Some("greedy-v1".to_string()),
+                    claim: None,
                 },
             ],
             seed: None,
             variant: None,
             language: None,
             board_layout: None,
+            move_time_limit_seconds: None,
         };
 
-        let first: GameStateDto =
-            read_json(send_json(app.clone(), Method::POST, "/games", &new_game).await).await;
-        let second: GameStateDto =
-            read_json(send_json(app.clone(), Method::POST, "/games", &new_game).await).await;
+        let first: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &new_game,
+            )
+            .await,
+        )
+        .await;
+        let second: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &new_game,
+            )
+            .await,
+        )
+        .await;
 
         let first_started: GameStateDto = read_json(
-            send_json(
+            send_json_auth(
                 app.clone(),
                 Method::POST,
                 &format!("/games/{}/start", first.id),
+                Some(&alice.session_token),
                 &StartGameRequest::default(),
             )
             .await,
         )
         .await;
         let second_started: GameStateDto = read_json(
-            send_json(
+            send_json_auth(
                 app,
                 Method::POST,
                 &format!("/games/{}/start", second.id),
+                Some(&alice.session_token),
                 &StartGameRequest::default(),
             )
             .await,
@@ -1385,38 +1740,45 @@ mod tests {
         let state = create_test_state(&database_url).await;
         let app = build_router(state.clone());
 
+        let alice = register_player(app.clone(), "Alice").await;
+
         let created: GameStateDto = read_json(
-            send_json(
+            send_json_auth(
                 app.clone(),
                 Method::POST,
                 "/games",
+                Some(&alice.session_token),
                 &CreateGameRequest {
                     seats: vec![
                         CreateSeatRequest {
                             kind: SeatKind::Human,
                             display_name: "Alice".to_string(),
                             engine_id: None,
+                            claim: Some(SeatClaim::Creator),
                         },
                         CreateSeatRequest {
                             kind: SeatKind::Engine,
                             display_name: "Greedy".to_string(),
                             engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
                         },
                     ],
                     seed: Some(77),
                     variant: None,
                     language: None,
                     board_layout: None,
+                    move_time_limit_seconds: None,
                 },
             )
             .await,
         )
         .await;
 
-        let started_response = send_json(
+        let started_response = send_json_auth(
             app.clone(),
             Method::POST,
             &format!("/games/{}/start", created.id),
+            Some(&alice.session_token),
             &StartGameRequest::default(),
         )
         .await;
@@ -1454,10 +1816,11 @@ mod tests {
             .next()
             .expect("opening rack should have a legal move");
 
-        let move_response = send_json(
+        let move_response = send_json_auth(
             app,
             Method::POST,
             &format!("/games/{}/actions", created.id),
+            Some(&alice.session_token),
             &GameActionRequest {
                 seat_number: 0,
                 action: PlayerActionDto::Place {
@@ -1487,45 +1850,8 @@ mod tests {
         let state = create_test_state(&database_url).await;
         let app = build_router(state.clone());
 
-        let created: GameStateDto = read_json(
-            send_json(
-                app.clone(),
-                Method::POST,
-                "/games",
-                &CreateGameRequest {
-                    seats: vec![
-                        CreateSeatRequest {
-                            kind: SeatKind::Human,
-                            display_name: "Alice".to_string(),
-                            engine_id: None,
-                        },
-                        CreateSeatRequest {
-                            kind: SeatKind::Human,
-                            display_name: "Bob".to_string(),
-                            engine_id: None,
-                        },
-                    ],
-                    seed: Some(77),
-                    variant: None,
-                    language: None,
-                    board_layout: None,
-                },
-            )
-            .await,
-        )
-        .await;
-
-        let started: GameStateDto = read_json(
-            send_json(
-                app.clone(),
-                Method::POST,
-                &format!("/games/{}/start", created.id),
-                &StartGameRequest::default(),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(started.status, api::GameStatus::Active);
+        let started = create_two_human_game(app.clone()).await;
+        let created_id = started.game.id.clone();
 
         // Empty bag + Alice's rack holding exactly the tiles she's about to
         // play means she goes out this move: the game should end
@@ -1535,7 +1861,7 @@ mod tests {
         {
             let mut games = state.games.write().await;
             let game = games
-                .get_mut(&created.id)
+                .get_mut(&created_id)
                 .expect("created game should exist in memory");
             game.bag.clear();
             game.participants[0].rack = rack_with_letters(&['A', 'T']);
@@ -1543,7 +1869,7 @@ mod tests {
         }
 
         let rules = VariantRules::official();
-        let board = board_from_dto(&started.board).expect("board dto should reconstruct");
+        let board = board_from_dto(&started.game.board).expect("board dto should reconstruct");
         let position = GameState::from_board(board, &rules, &*SOWPODS);
         let player_rack = rack_with_letters(&['A', 'T']);
         let engine = RulesEngine {
@@ -1555,10 +1881,11 @@ mod tests {
             .next()
             .expect("opening rack should have a legal move");
 
-        let move_response = send_json(
+        let move_response = send_json_auth(
             app,
             Method::POST,
-            &format!("/games/{}/actions", created.id),
+            &format!("/games/{}/actions", created_id),
+            Some(&started.alice.session_token),
             &GameActionRequest {
                 seat_number: 0,
                 action: PlayerActionDto::Place {
@@ -1601,21 +1928,26 @@ mod tests {
         let state = create_test_state(&database_url).await;
         let app = build_router(state.clone());
 
+        let alice = register_player(app.clone(), "Alice").await;
+
         let created: GameStateDto = read_json(
-            send_json(
+            send_json_auth(
                 app.clone(),
                 Method::POST,
                 "/games",
+                Some(&alice.session_token),
                 &CreateGameRequest {
                     seats: vec![CreateSeatRequest {
                         kind: SeatKind::Human,
                         display_name: "Alice".to_string(),
                         engine_id: None,
+                        claim: Some(SeatClaim::Creator),
                     }],
                     seed: Some(999),
                     variant: None,
                     language: None,
                     board_layout: None,
+                    move_time_limit_seconds: None,
                 },
             )
             .await,
@@ -1623,10 +1955,11 @@ mod tests {
         .await;
 
         let _started: GameStateDto = read_json(
-            send_json(
+            send_json_auth(
                 app,
                 Method::POST,
                 &format!("/games/{}/start", created.id),
+                Some(&alice.session_token),
                 &StartGameRequest::default(),
             )
             .await,
@@ -1643,47 +1976,108 @@ mod tests {
         assert_eq!(restored.participants.len(), 1);
     }
 
-    async fn create_two_human_game(app: Router) -> GameStateDto {
-        let created: GameStateDto = read_json(
+    async fn register_player(app: Router, display_name: &str) -> PlayerSessionDto {
+        read_json(
             send_json(
+                app,
+                Method::POST,
+                "/auth/register",
+                &RegisterPlayerRequest {
+                    display_name: display_name.to_string(),
+                    email: format!("{}@example.com", display_name.to_lowercase()),
+                    password: "correct horse battery staple".to_string(),
+                },
+            )
+            .await,
+        )
+        .await
+    }
+
+    /// The result of building a real 2-human game end to end through the
+    /// invitation flow: Alice creates it (claiming seat 0 and leaving seat 1
+    /// open to strangers), Bob discovers and accepts the open seat, then
+    /// either of them starts it. Both sessions are returned since, under the
+    /// per-seat ownership model, every action from here on needs the
+    /// matching seat owner's token.
+    struct TwoHumanGame {
+        game: GameStateDto,
+        alice: PlayerSessionDto,
+        bob: PlayerSessionDto,
+    }
+
+    async fn create_two_human_game(app: Router) -> TwoHumanGame {
+        let alice = register_player(app.clone(), "Alice").await;
+        let bob = register_player(app.clone(), "Bob").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
                 app.clone(),
                 Method::POST,
                 "/games",
+                Some(&alice.session_token),
                 &CreateGameRequest {
                     seats: vec![
                         CreateSeatRequest {
                             kind: SeatKind::Human,
                             display_name: "Alice".to_string(),
                             engine_id: None,
+                            claim: Some(SeatClaim::Creator),
                         },
                         CreateSeatRequest {
                             kind: SeatKind::Human,
-                            display_name: "Bob".to_string(),
+                            display_name: "Open seat".to_string(),
                             engine_id: None,
+                            claim: Some(SeatClaim::Open),
                         },
                     ],
                     seed: Some(42),
                     variant: None,
                     language: None,
                     board_layout: None,
+                    move_time_limit_seconds: None,
                 },
             )
             .await,
         )
         .await;
 
+        // Bob discovers the open seat via his personalized games list, then
+        // accepts it — exercising the exact path a real client would use,
+        // not a shortcut into persistence.
+        let bob_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&bob.session_token)).await,
+        )
+        .await;
+        let invitation = bob_games
+            .iter()
+            .find(|summary| summary.id == created.id)
+            .expect("the open seat should appear in Bob's games list")
+            .invitation_id
+            .clone()
+            .expect("an invited-open entry should carry an invitation id");
+
+        let accept_response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/invitations/{invitation}/accept"),
+            Some(&bob.session_token),
+        )
+        .await;
+        assert_eq!(accept_response.status(), StatusCode::OK);
+
         let started: GameStateDto = read_json(
-            send_json(
+            send_json_auth(
                 app,
                 Method::POST,
                 &format!("/games/{}/start", created.id),
+                Some(&alice.session_token),
                 &StartGameRequest::default(),
             )
             .await,
         )
         .await;
         assert_eq!(started.status, api::GameStatus::Active);
-        started
+        TwoHumanGame { game: started, alice, bob }
     }
 
     #[tokio::test]
@@ -1693,12 +2087,13 @@ mod tests {
         let app = build_router(state.clone());
 
         let started = create_two_human_game(app.clone()).await;
-        assert_eq!(started.current_seat, 0);
+        assert_eq!(started.game.current_seat, 0);
 
-        let response = send_json(
+        let response = send_json_auth(
             app,
             Method::POST,
-            &format!("/games/{}/actions", started.id),
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.alice.session_token),
             &GameActionRequest {
                 seat_number: 0,
                 action: PlayerActionDto::Pass,
@@ -1727,14 +2122,15 @@ mod tests {
         // deterministically (mirrors the pattern used by the Place-move test above).
         {
             let mut games = state.games.write().await;
-            let game = games.get_mut(&started.id).expect("game should exist");
+            let game = games.get_mut(&started.game.id).expect("game should exist");
             game.participants[0].rack = rack_with_letters(&['A', 'T']);
         }
 
-        let response = send_json(
+        let response = send_json_auth(
             app,
             Method::POST,
-            &format!("/games/{}/actions", started.id),
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.alice.session_token),
             &GameActionRequest {
                 seat_number: 0,
                 action: PlayerActionDto::Exchange {
@@ -1762,10 +2158,11 @@ mod tests {
 
         let started = create_two_human_game(app.clone()).await;
 
-        let response = send_json(
+        let response = send_json_auth(
             app,
             Method::POST,
-            &format!("/games/{}/actions", started.id),
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.alice.session_token),
             &GameActionRequest {
                 seat_number: 0,
                 action: PlayerActionDto::Resign,
@@ -1787,12 +2184,15 @@ mod tests {
         let app = build_router(state.clone());
 
         let started = create_two_human_game(app.clone()).await;
-        assert_eq!(started.current_seat, 0);
+        assert_eq!(started.game.current_seat, 0);
 
-        let response = send_json(
+        // Bob owns seat 1, so this clears the ownership check and reaches
+        // the turn-order check underneath it.
+        let response = send_json_auth(
             app,
             Method::POST,
-            &format!("/games/{}/actions", started.id),
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.bob.session_token),
             &GameActionRequest {
                 seat_number: 1,
                 action: PlayerActionDto::Pass,
@@ -1842,10 +2242,11 @@ mod tests {
             tiles: vec![],
         };
 
-        let response = send_json(
+        let response = send_json_auth(
             app.clone(),
             Method::POST,
-            &format!("/games/{}/actions", started.id),
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.alice.session_token),
             &GameActionRequest {
                 seat_number: 0,
                 action: PlayerActionDto::Place {
@@ -1859,7 +2260,7 @@ mod tests {
 
         // Turn should not have advanced after a rejected move.
         let fetched: GameStateDto = read_json(
-            send_empty(app, Method::GET, &format!("/games/{}", started.id)).await,
+            send_empty(app, Method::GET, &format!("/games/{}", started.game.id)).await,
         )
         .await;
         assert_eq!(fetched.current_seat, 0);
@@ -1915,17 +2316,20 @@ mod tests {
                             kind: SeatKind::Human,
                             display_name: "Alice".to_string(),
                             engine_id: None,
+                            claim: Some(SeatClaim::Creator),
                         },
                         CreateSeatRequest {
                             kind: SeatKind::Engine,
                             display_name: "Greedy".to_string(),
                             engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
                         },
                     ],
                     seed: Some(7),
                     variant: None,
                     language: None,
                     board_layout: None,
+                    move_time_limit_seconds: None,
                 },
             )
             .await,
@@ -2013,15 +2417,19 @@ mod tests {
         .await;
 
         let seat_one = match seat_one_kind {
+            // Never exercised as Human by any current caller — left open
+            // (unclaimed) purely so the request stays valid to build.
             SeatKind::Human => CreateSeatRequest {
                 kind: SeatKind::Human,
                 display_name: "Player 2".to_string(),
                 engine_id: None,
+                claim: Some(SeatClaim::Open),
             },
             SeatKind::Engine => CreateSeatRequest {
                 kind: SeatKind::Engine,
                 display_name: "Greedy".to_string(),
                 engine_id: Some("greedy-v1".to_string()),
+                claim: None,
             },
         };
 
@@ -2037,6 +2445,7 @@ mod tests {
                             kind: SeatKind::Human,
                             display_name: "Alice".to_string(),
                             engine_id: None,
+                            claim: Some(SeatClaim::Creator),
                         },
                         seat_one,
                     ],
@@ -2044,6 +2453,7 @@ mod tests {
                     variant: None,
                     language: None,
                     board_layout: None,
+                    move_time_limit_seconds: None,
                 },
             )
             .await,
@@ -2088,16 +2498,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anonymous_game_start_still_works_for_anyone() {
-        // Games created without being logged in have no claimed seats, so
-        // starting one must stay open — same backward-compatibility
-        // guarantee as anonymous creation and unclaimed-seat actions.
+    async fn creating_a_game_without_auth_is_rejected() {
+        // Every seat now needs a real claiming party, so there's no more
+        // "anonymous, open to anyone" game to create.
         let database_url = test_database_url();
         let state = create_test_state(&database_url).await;
         let app = build_router(state);
 
-        let started = create_two_human_game(app).await;
-        assert_eq!(started.status, api::GameStatus::Active);
+        let response = send_json(
+            app,
+            Method::POST,
+            "/games",
+            &CreateGameRequest {
+                seats: vec![CreateSeatRequest {
+                    kind: SeatKind::Engine,
+                    display_name: "Greedy".to_string(),
+                    engine_id: Some("greedy-v1".to_string()),
+                    claim: None,
+                }],
+                seed: None,
+                variant: None,
+                language: None,
+                board_layout: None,
+                move_time_limit_seconds: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn listing_games_without_auth_is_rejected() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_empty(app, Method::GET, "/games").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
@@ -2211,6 +2648,8 @@ mod tests {
             current_seat: 0,
             winner_seat: None,
             bag_count: 100,
+            move_time_limit_seconds: 0,
+            turn_started_at: "0".to_string(),
             participants: Vec::new(),
             board: Vec::new(),
             racks: Vec::new(),
@@ -2259,28 +2698,34 @@ mod tests {
         let state = create_test_state(&database_url).await;
         let app = build_router(state.clone());
 
+        let owner = register_player(app.clone(), "Referee").await;
+
         let created: GameStateDto = read_json(
-            send_json(
+            send_json_auth(
                 app.clone(),
                 Method::POST,
                 "/games",
+                Some(&owner.session_token),
                 &CreateGameRequest {
                     seats: vec![
                         CreateSeatRequest {
                             kind: SeatKind::Engine,
                             display_name: "Greedy One".to_string(),
                             engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
                         },
                         CreateSeatRequest {
                             kind: SeatKind::Engine,
                             display_name: "Greedy Two".to_string(),
                             engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
                         },
                     ],
                     seed: Some(777),
                     variant: None,
                     language: None,
                     board_layout: None,
+                    move_time_limit_seconds: None,
                 },
             )
             .await,
@@ -2290,11 +2735,14 @@ mod tests {
 
         // A single /start call should drive both engine seats all the way
         // to game-over: no human ever exists to trigger a follow-up round,
-        // so `run_engine_turns` has to run the whole game in one go.
-        let response = send_json(
+        // so `run_engine_turns` has to run the whole game in one go. Neither
+        // seat is claimed (both are engines), so any signed-in caller may
+        // start it.
+        let response = send_json_auth(
             app,
             Method::POST,
             &format!("/games/{}/start", created.id),
+            Some(&owner.session_token),
             &StartGameRequest::default(),
         )
         .await;
@@ -2405,17 +2853,20 @@ mod tests {
                             kind: SeatKind::Human,
                             display_name: "Alice".to_string(),
                             engine_id: None,
+                            claim: Some(SeatClaim::Creator),
                         },
                         CreateSeatRequest {
                             kind: SeatKind::Engine,
                             display_name: "Greedy".to_string(),
                             engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
                         },
                     ],
                     seed: Some(7),
                     variant: None,
                     language: None,
                     board_layout: None,
+                    move_time_limit_seconds: None,
                 },
             )
             .await,
@@ -2541,28 +2992,29 @@ mod tests {
         .await;
         let listed_game = listed
             .iter()
-            .find(|game| game.id == created.id)
+            .find(|game| game.id == created.game.id)
             .expect("created game should be listed");
         assert!(!listed_game.created_at.is_empty());
 
         let delete_response = send_admin::<()>(
             app.clone(),
             Method::DELETE,
-            &format!("/admin/games/{}", created.id),
+            &format!("/admin/games/{}", created.game.id),
             loopback_peer(),
             None,
         )
         .await;
         assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
 
-        let fetch_after = send_empty(app.clone(), Method::GET, &format!("/games/{}", created.id)).await;
+        let fetch_after =
+            send_empty(app.clone(), Method::GET, &format!("/games/{}", created.game.id)).await;
         assert_eq!(fetch_after.status(), StatusCode::NOT_FOUND);
 
         let listed_after: Vec<AdminGameSummaryDto> = read_json(
             send_admin::<()>(app, Method::GET, "/admin/games", loopback_peer(), None).await,
         )
         .await;
-        assert!(!listed_after.iter().any(|game| game.id == created.id));
+        assert!(!listed_after.iter().any(|game| game.id == created.game.id));
     }
 
     #[tokio::test]
@@ -2572,12 +3024,12 @@ mod tests {
         let app = build_router(state);
 
         let started = create_two_human_game(app.clone()).await;
-        assert_eq!(started.status, api::GameStatus::Active);
+        assert_eq!(started.game.status, api::GameStatus::Active);
 
         let response = send_admin::<()>(
             app.clone(),
             Method::POST,
-            &format!("/admin/games/{}/force-end", started.id),
+            &format!("/admin/games/{}/force-end", started.game.id),
             loopback_peer(),
             None,
         )
@@ -2586,8 +3038,510 @@ mod tests {
         let ended: GameStateDto = read_json(response).await;
         assert_eq!(ended.status, api::GameStatus::Finished);
 
-        let fetched: GameStateDto =
-            read_json(send_empty(app, Method::GET, &format!("/games/{}", started.id)).await).await;
+        let fetched: GameStateDto = read_json(
+            send_empty(app, Method::GET, &format!("/games/{}", started.game.id)).await,
+        )
+        .await;
         assert_eq!(fetched.status, api::GameStatus::Finished);
+    }
+
+    #[tokio::test]
+    async fn creating_a_game_with_an_unknown_named_invitee_is_rejected() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            "/games",
+            Some(&alice.session_token),
+            &CreateGameRequest {
+                seats: vec![
+                    CreateSeatRequest {
+                        kind: SeatKind::Human,
+                        display_name: "Alice".to_string(),
+                        engine_id: None,
+                        claim: Some(SeatClaim::Creator),
+                    },
+                    CreateSeatRequest {
+                        kind: SeatKind::Human,
+                        display_name: "Nobody".to_string(),
+                        engine_id: None,
+                        claim: Some(SeatClaim::Named {
+                            display_name: "Nobody".to_string(),
+                        }),
+                    },
+                ],
+                seed: Some(1),
+                variant: None,
+                language: None,
+                board_layout: None,
+                move_time_limit_seconds: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn only_one_creator_seat_is_allowed() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            "/games",
+            Some(&alice.session_token),
+            &CreateGameRequest {
+                seats: vec![
+                    CreateSeatRequest {
+                        kind: SeatKind::Human,
+                        display_name: "Alice".to_string(),
+                        engine_id: None,
+                        claim: Some(SeatClaim::Creator),
+                    },
+                    CreateSeatRequest {
+                        kind: SeatKind::Human,
+                        display_name: "Also Alice?".to_string(),
+                        engine_id: None,
+                        claim: Some(SeatClaim::Creator),
+                    },
+                ],
+                seed: Some(1),
+                variant: None,
+                language: None,
+                board_layout: None,
+                move_time_limit_seconds: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn named_invitation_shows_up_and_claims_the_seat_on_accept() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let bob = register_player(app.clone(), "Bob").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Bob".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Named {
+                                display_name: "Bob".to_string(),
+                            }),
+                        },
+                    ],
+                    seed: Some(1),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created.participants[1].player_id, None);
+
+        let bob_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&bob.session_token)).await,
+        )
+        .await;
+        let summary = bob_games
+            .iter()
+            .find(|summary| summary.id == created.id)
+            .expect("Bob should see the game he was named-invited to");
+        assert_eq!(summary.relationship, api::GameRelationship::InvitedByName);
+        let invitation_id = summary.invitation_id.clone().expect("invitation id");
+
+        // A stranger who wasn't invited can't accept Bob's named invitation.
+        let mallory = register_player(app.clone(), "Mallory").await;
+        let stolen = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/invitations/{invitation_id}/accept"),
+            Some(&mallory.session_token),
+        )
+        .await;
+        assert_eq!(stolen.status(), StatusCode::UNAUTHORIZED);
+
+        let accepted: GameStateDto = read_json(
+            send_empty_auth(
+                app,
+                Method::POST,
+                &format!("/invitations/{invitation_id}/accept"),
+                Some(&bob.session_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            accepted.participants[1].player_id.as_deref(),
+            Some(bob.player_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn open_invitation_is_claimed_by_only_the_first_acceptor() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let bob = register_player(app.clone(), "Bob").await;
+        let mallory = register_player(app.clone(), "Mallory").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Open seat".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Open),
+                        },
+                    ],
+                    seed: Some(1),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let mallory_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(
+                app.clone(),
+                Method::GET,
+                "/games",
+                Some(&mallory.session_token),
+            )
+            .await,
+        )
+        .await;
+        let invitation_id = mallory_games
+            .iter()
+            .find(|summary| summary.id == created.id)
+            .expect("the open seat should be visible to any signed-in player")
+            .invitation_id
+            .clone()
+            .expect("invitation id");
+
+        let bob_accept = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/invitations/{invitation_id}/accept"),
+            Some(&bob.session_token),
+        )
+        .await;
+        assert_eq!(bob_accept.status(), StatusCode::OK);
+
+        // Mallory loses the race — the seat is already Bob's.
+        let mallory_accept = send_empty_auth(
+            app,
+            Method::POST,
+            &format!("/invitations/{invitation_id}/accept"),
+            Some(&mallory.session_token),
+        )
+        .await;
+        assert_eq!(mallory_accept.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn rejecting_a_named_invitation_removes_it_without_claiming_the_seat() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let bob = register_player(app.clone(), "Bob").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Bob".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Named {
+                                display_name: "Bob".to_string(),
+                            }),
+                        },
+                    ],
+                    seed: Some(1),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let bob_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&bob.session_token)).await,
+        )
+        .await;
+        let invitation_id = bob_games
+            .iter()
+            .find(|summary| summary.id == created.id)
+            .expect("Bob should see the invitation")
+            .invitation_id
+            .clone()
+            .expect("invitation id");
+
+        let reject_response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/invitations/{invitation_id}/reject"),
+            Some(&bob.session_token),
+        )
+        .await;
+        assert_eq!(reject_response.status(), StatusCode::OK);
+
+        let fetched: GameStateDto =
+            read_json(send_empty(app, Method::GET, &format!("/games/{}", created.id)).await).await;
+        assert_eq!(fetched.participants[1].player_id, None);
+    }
+
+    #[tokio::test]
+    async fn overdue_turn_is_auto_retired_on_next_access() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let bob = register_player(app.clone(), "Bob").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Bob".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Named {
+                                display_name: "Bob".to_string(),
+                            }),
+                        },
+                    ],
+                    seed: Some(1),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: Some(60),
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let bob_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&bob.session_token)).await,
+        )
+        .await;
+        let invitation_id = bob_games
+            .iter()
+            .find(|summary| summary.id == created.id)
+            .expect("invitation id")
+            .invitation_id
+            .clone()
+            .expect("invitation id");
+        send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/invitations/{invitation_id}/accept"),
+            Some(&bob.session_token),
+        )
+        .await;
+
+        let started: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                Some(&alice.session_token),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(started.move_time_limit_seconds, 60);
+        assert_eq!(started.current_seat, 0);
+
+        // Rewind the in-memory turn clock rather than sleeping 60 real
+        // seconds in a test.
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&created.id).expect("game should exist");
+            game.turn_started_at = "0".to_string();
+        }
+
+        let fetched: GameStateDto =
+            read_json(send_empty(app, Method::GET, &format!("/games/{}", created.id)).await).await;
+        assert_eq!(fetched.status, api::GameStatus::Finished);
+        assert_eq!(fetched.winner_seat, Some(1));
+        let last_move = fetched.moves.last().expect("a timeout move should be recorded");
+        assert_eq!(last_move.move_type, "timeout");
+        assert_eq!(last_move.seat_number, 0);
+    }
+
+    #[tokio::test]
+    async fn change_password_requires_auth() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_json(
+            app,
+            Method::POST,
+            "/auth/change-password",
+            &api::ChangePasswordRequest {
+                current_password: "correcthorsebatterystaple".to_string(),
+                new_password: "new-password-entirely".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn change_password_rejects_a_wrong_current_password() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            "/auth/change-password",
+            Some(&alice.session_token),
+            &api::ChangePasswordRequest {
+                current_password: "totally-the-wrong-password".to_string(),
+                new_password: "new-password-entirely".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn change_password_succeeds_and_signs_out_existing_sessions() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            "/auth/change-password",
+            Some(&alice.session_token),
+            &api::ChangePasswordRequest {
+                current_password: "correct horse battery staple".to_string(),
+                new_password: "a brand new password".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The session used to make the change is itself invalidated —
+        // changing your password means starting fresh, not silently
+        // keeping whatever session made the request.
+        let old_session_response =
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&alice.session_token)).await;
+        assert_eq!(old_session_response.status(), StatusCode::UNAUTHORIZED);
+
+        // The old password no longer works...
+        let old_login = send_json(
+            app.clone(),
+            Method::POST,
+            "/auth/login",
+            &LoginPlayerRequest {
+                display_name: "Alice".to_string(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(old_login.status(), StatusCode::BAD_REQUEST);
+
+        // ...but the new one does.
+        let new_login = send_json(
+            app,
+            Method::POST,
+            "/auth/login",
+            &LoginPlayerRequest {
+                display_name: "Alice".to_string(),
+                password: "a brand new password".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(new_login.status(), StatusCode::OK);
     }
 }

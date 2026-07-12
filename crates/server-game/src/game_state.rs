@@ -72,6 +72,10 @@ pub struct ParticipantState {
 /// player passing three times in a row.
 const SCORELESS_TURN_LIMIT: u8 = 6;
 
+/// Default per-move time limit: 72 hours, chosen for async play where
+/// opponents aren't expected to be online at the same time.
+pub const DEFAULT_MOVE_TIME_LIMIT_SECONDS: u64 = 72 * 60 * 60;
+
 #[derive(Debug, Clone)]
 pub struct GameSession {
     pub id: String,
@@ -89,6 +93,11 @@ pub struct GameSession {
     pub participants: Vec<ParticipantState>,
     pub moves: Vec<MoveRecord>,
     pub consecutive_scoreless_turns: u8,
+    pub move_time_limit_seconds: u64,
+    /// Unix seconds (as a string, matching the rest of the codebase's
+    /// timestamp convention) when `current_seat`'s turn began — reset every
+    /// time the turn advances. Meaningless until the game is `Active`.
+    pub turn_started_at: String,
 }
 
 impl GameSession {
@@ -97,6 +106,7 @@ impl GameSession {
         participants: Vec<ParticipantState>,
         random_seed: u64,
         rules: VariantRules,
+        move_time_limit_seconds: u64,
     ) -> Self {
         let state = GameState::new(&rules, &*SOWPODS);
         let mut bag = build_bag(&rules);
@@ -118,6 +128,8 @@ impl GameSession {
             participants,
             moves: Vec::new(),
             consecutive_scoreless_turns: 0,
+            move_time_limit_seconds,
+            turn_started_at: now_unix_seconds().to_string(),
         }
     }
 
@@ -133,6 +145,50 @@ impl GameSession {
         self.status = GameStatus::Active;
         self.turn_number = 1;
         self.current_seat = 0;
+        self.turn_started_at = now_unix_seconds().to_string();
+    }
+
+    /// Auto-retires the current seat if it has sat on its turn past
+    /// `move_time_limit_seconds`, exactly as if that player had resigned —
+    /// same "the game ends the moment anyone leaves" rule `apply_resign`
+    /// already applies, just triggered by a deadline instead of a manual
+    /// action. Returns whether anything changed, so callers know whether to
+    /// persist and broadcast. There's no background scheduler in this
+    /// server, so this is checked lazily whenever a game is touched (see
+    /// `expire_overdue_turns` in `app.rs`) rather than firing exactly on
+    /// the deadline.
+    pub fn apply_move_timeout(&mut self) -> bool {
+        if self.status != GameStatus::Active {
+            return false;
+        }
+        let Ok(started) = self.turn_started_at.parse::<u64>() else {
+            return false;
+        };
+        if now_unix_seconds().saturating_sub(started) < self.move_time_limit_seconds {
+            return false;
+        }
+
+        let seat = self.current_seat;
+        let Some(participant) = self.participants.get_mut(seat as usize) else {
+            return false;
+        };
+        participant.resigned = true;
+        let display_name = participant.display_name.clone();
+        self.moves.push(MoveRecord {
+            move_number: self.turn_number,
+            seat_number: seat,
+            move_type: "timeout".to_string(),
+            main_word: None,
+            score_delta: 0,
+            description: format!("{display_name} was retired for exceeding the move time limit"),
+        });
+        self.winner_seat = self
+            .participants
+            .iter()
+            .find(|other| !other.resigned)
+            .map(|other| other.seat_number);
+        self.status = GameStatus::Finished;
+        true
     }
 
     /// A lightweight summary for games-list views. `last_activity_at` is
@@ -156,6 +212,13 @@ impl GameSession {
                 })
                 .collect(),
             last_activity_at,
+            move_time_limit_seconds: self.move_time_limit_seconds,
+            turn_started_at: self.turn_started_at.clone(),
+            // Caller-relative fields — `list_games` fills these in per
+            // requester since "why does this game show up" depends on who's
+            // asking, not on the game itself.
+            relationship: api::GameRelationship::Participant,
+            invitation_id: None,
         }
     }
 
@@ -170,6 +233,8 @@ impl GameSession {
             current_seat: self.current_seat,
             winner_seat: self.winner_seat,
             bag_count: self.bag.len(),
+            move_time_limit_seconds: self.move_time_limit_seconds,
+            turn_started_at: self.turn_started_at.clone(),
             participants: self
                 .participants
                 .iter()
@@ -487,6 +552,7 @@ impl GameSession {
         let next_seat = ((self.current_seat as usize + 1) % self.participants.len()) as u8;
         self.current_seat = next_seat;
         self.turn_number += 1;
+        self.turn_started_at = now_unix_seconds().to_string();
 
         if self
             .participants
@@ -503,6 +569,14 @@ impl GameSession {
                 .map(|participant| participant.seat_number);
         }
     }
+}
+
+fn now_unix_seconds() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before epoch")
+        .as_secs()
 }
 
 /// Short, player-facing text for a rejected move. Deliberately terse (one

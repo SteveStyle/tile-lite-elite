@@ -73,11 +73,28 @@ pub struct GameActionRequest {
     pub action: PlayerActionDto,
 }
 
+/// How a `Human` seat gets filled at game-creation time. Ignored for
+/// `Engine` seats, which are always filled immediately.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SeatClaim {
+    /// Bound immediately to the authenticated caller creating the game. At
+    /// most one seat per request may use this.
+    Creator,
+    /// Pending until the named player accepts the invitation.
+    Named { display_name: String },
+    /// Pending until any logged-in player accepts — first to accept claims
+    /// the seat.
+    Open,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CreateSeatRequest {
     pub kind: SeatKind,
     pub display_name: String,
     pub engine_id: Option<String>,
+    /// Required for `Human` seats; ignored for `Engine` seats.
+    pub claim: Option<SeatClaim>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +104,9 @@ pub struct CreateGameRequest {
     pub variant: Option<String>,
     pub language: Option<String>,
     pub board_layout: Option<String>,
+    /// How long a seat may sit on its turn before being auto-retired.
+    /// `None` falls back to the server default (72 hours).
+    pub move_time_limit_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -114,6 +134,22 @@ pub struct ParticipantDto {
     pub score: i32,
 }
 
+/// Why a game appears in a particular caller's `GET /games` list — the
+/// server returns one flat, tagged list rather than pre-split buckets, so
+/// the client can group/sort/filter however it wants.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GameRelationship {
+    /// You hold a claimed seat, the game is active, and it's your turn.
+    YourTurn,
+    /// You hold a claimed seat, but it's not (currently) your turn.
+    Participant,
+    /// You've been invited by name to a specific seat.
+    InvitedByName,
+    /// A seat in this game is open to any logged-in player.
+    InvitedOpen,
+}
+
 /// A lightweight summary of a game, cheap enough to fetch in bulk for a
 /// games list. Deliberately excludes the board/rack/move-log detail that
 /// `GameStateDto` carries — fetch the full game by id once it's selected.
@@ -127,6 +163,14 @@ pub struct GameSummaryDto {
     /// storage format) of the most recent move, or the game's creation
     /// time if no moves have been made yet.
     pub last_activity_at: String,
+    pub move_time_limit_seconds: u64,
+    /// Seconds since the Unix epoch when `current_seat`'s turn began.
+    /// Meaningless while `status` isn't `Active`.
+    pub turn_started_at: String,
+    pub relationship: GameRelationship,
+    /// Set when `relationship` is `InvitedByName` or `InvitedOpen` — the
+    /// invitation to accept/reject directly from the list.
+    pub invitation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +207,10 @@ pub struct GameStateDto {
     pub current_seat: u8,
     pub winner_seat: Option<u8>,
     pub bag_count: usize,
+    pub move_time_limit_seconds: u64,
+    /// Seconds since the Unix epoch when `current_seat`'s turn began.
+    /// Meaningless while `status` isn't `Active`.
+    pub turn_started_at: String,
     pub participants: Vec<ParticipantDto>,
     pub board: Vec<BoardCellDto>,
     pub racks: Vec<RackDto>,
@@ -219,6 +267,17 @@ pub struct LoginPlayerRequest {
     pub password: String,
 }
 
+/// Self-service — the caller proves they know the current password rather
+/// than relying solely on holding a valid session token (a "remember me"
+/// token could otherwise be enough to hijack the account by itself).
+/// Distinct from the admin CLI's `AdminResetPasswordRequest`, which is
+/// loopback-gated and doesn't require the old password.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidateSessionRequest {
     pub session_token: String,
@@ -248,7 +307,8 @@ pub enum InvitationStatus {
 pub struct GameInvitationDto {
     pub id: String,
     pub game_id: String,
-    pub invited_player_id: String,
+    /// `None` for an open/stranger invitation.
+    pub invited_player_id: Option<String>,
     pub inviting_player_id: String,
     pub seat_number: u8,
     pub status: InvitationStatus,
@@ -259,7 +319,9 @@ pub struct GameInvitationDto {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InvitePlayerRequest {
-    pub invited_display_name: String,
+    /// `None` invites any logged-in player (open/stranger) rather than one
+    /// specific person by name.
+    pub invited_display_name: Option<String>,
     pub seat_number: u8,
 }
 
