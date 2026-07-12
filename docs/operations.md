@@ -128,24 +128,36 @@ SCRABBLE_PX_API_BASE_URL=http://127.0.0.1:3000 cargo run -p scrabble-ui --featur
 
 ## Admin CLI
 
-`scrabble-admin` (`crates/admin-cli`) is operator tooling for a running server — list/delete users, reset a password, list/delete/force-end games. It's a thin HTTP client against `server-game`'s `/admin/*` endpoints, not a separate implementation, so it can't drift from what the server actually does (cascading deletes, password hashing, etc. all stay server-side).
+The admin CLI — crate `crates/admin-cli`, binary/command name `scrabble-admin` — is operator tooling for a running server: list/delete users, reset a password, list/delete/force-end games. It's a thin HTTP client against `server-game`'s `/admin/*` endpoints, not a separate implementation, so it can't drift from what the server actually does (cascading deletes, password hashing, etc. all stay server-side).
+
+**There's no admin account or token.** The `/admin/*` endpoints only accept requests whose peer address is loopback (`127.0.0.1`/`::1`), regardless of what `SCRABBLE_PX_BIND` is set to — running the CLI *from the server's own terminal* is the access control. This matters specifically because `SCRABBLE_PX_BIND=0.0.0.0:3000` (see the LAN-play example above) would otherwise expose these endpoints to the whole LAN, not just the machine running the server. It also means where you run `scrabble-admin` *from* isn't a preference, it's the only thing that determines whether it works at all — the two cases below are genuinely different, not interchangeable:
+
+**Local dev server** (running directly on this machine, not in a container):
 
 ```bash
-cargo run -p admin-cli -- users list
-cargo run -p admin-cli -- users reset-password <player_id>          # prints a generated password
-cargo run -p admin-cli -- users reset-password <player_id> --password 'a specific one'
-cargo run -p admin-cli -- users delete <player_id>
+./scripts/admin.sh users list
+./scripts/admin.sh users reset-password <player_id>          # prints a generated password
+./scripts/admin.sh users reset-password <player_id> --password 'a specific one'
+./scripts/admin.sh users delete <player_id>
 
-cargo run -p admin-cli -- games list
-cargo run -p admin-cli -- games list --status waiting
-cargo run -p admin-cli -- games list --older-than-days 30
-cargo run -p admin-cli -- games delete <game_id>
-cargo run -p admin-cli -- games force-end <game_id>
+./scripts/admin.sh games list
+./scripts/admin.sh games list --status waiting
+./scripts/admin.sh games list --older-than-days 30
+./scripts/admin.sh games delete <game_id>
+./scripts/admin.sh games force-end <game_id>
 ```
 
-Or build once and run the binary directly: `cargo build -p admin-cli` produces `target/debug/scrabble-admin`.
+`scripts/admin.sh` builds `admin-cli` in **release** mode and runs that binary — a plain `cargo run -p admin-cli` builds and runs a *debug* binary instead, which still works but is worth avoiding out of habit now that a script exists to do the right thing by default.
 
-**There's no admin account or token.** The `/admin/*` endpoints only accept requests whose peer address is loopback (`127.0.0.1`/`::1`), regardless of what `SCRABBLE_PX_BIND` is set to — running the CLI *from the server's own terminal* is the access control. Point `--server`/`SCRABBLE_PX_API_BASE_URL` at anything else and every request 403s, by design. This matters specifically because `SCRABBLE_PX_BIND=0.0.0.0:3000` (see the LAN-play example above) would otherwise expose these endpoints to the whole LAN, not just the machine running the server.
+**The Oracle VM's (or any container deployment's) server**: `scripts/admin.sh` can't reach it — it always targets `127.0.0.1`, and that's a different loopback than the VM's, by design (see above; pointing `--server`/`SCRABBLE_PX_API_BASE_URL` at the VM's public address from your own machine just gets a 403, it isn't a workaround). Run it *inside* the server container instead, where `127.0.0.1` genuinely is that container:
+
+```bash
+ssh -i ~/.ssh/oracle_scrabble ubuntu@129.151.69.246
+cd ~/scrabble-px
+docker compose exec server scrabble-admin games list
+```
+
+That binary is the release build baked into the `runtime-server` image by the `Dockerfile` — there's nothing extra to build or configure on the VM itself.
 
 Deleting a user unclaims their seats (`player_id` set to null on `game_participants`) rather than deleting their games — game history and other players' records survive.
 
@@ -246,11 +258,7 @@ docker run --rm -v scrabble-px_scrabble-data:/data -v "$PWD":/backup debian \
 
 Caddy's obtained TLS certificate lives on its own named volumes (`caddy-data`, `caddy-config`) for the same reason — losing them means a fresh certificate request on next start, not a functional problem, just unnecessary churn against Let's Encrypt's rate limits.
 
-**Admin CLI**: `/admin/*` stays loopback-only exactly as it is locally — a request proxied in from the `web` container isn't a loopback connection, so the server rejects it the same as it would over a LAN. Reach it via:
-
-```bash
-docker compose exec server scrabble-admin games list
-```
+**Admin CLI**: `/admin/*` stays loopback-only exactly as it is locally — a request proxied in from the `web` container isn't a loopback connection, so the server rejects it the same as it would over a LAN. See the [Admin CLI](#admin-cli) section above for how to reach it here (`docker compose exec server scrabble-admin ...`) versus against a local dev server — they're not interchangeable.
 
 **Why one image serves both, same-origin**: the web build is compiled with `SCRABBLE_PX_API_BASE_URL=""` (explicitly empty, not unset — see the Configuration table above), which makes the client derive its API/WebSocket target from whatever origin actually served the page (`crates/ui/src/app.rs`'s `websocket_url`/`same_origin_websocket_url`). That's what lets the same compiled wasm bundle work regardless of the host's IP or domain, with no rebuild needed if either changes — and it sidesteps CORS entirely, since Caddy serves both the static assets and the proxied API from one origin.
 
