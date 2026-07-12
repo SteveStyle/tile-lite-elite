@@ -1,0 +1,42 @@
+services:
+  server:
+    build:
+      context: .
+      target: runtime-server
+    environment:
+      SCRABBLE_PX_BIND: 0.0.0.0:3000
+      SCRABBLE_PX_DATABASE_URL: sqlite:///data/scrabble-px.sqlite3
+    volumes:
+      - scrabble-data:/data
+    restart: unless-stopped
+    # Deliberately no `ports:` — only reachable from the `web` container
+    # over the compose network, and via `docker compose exec server ...`
+    # on the host. That keeps the admin endpoints' existing loopback-only
+    # guard meaningful: a request proxied in from `web` is not loopback and
+    # gets rejected by the app itself, same as it would locally.
+
+  web:
+    build:
+      context: .
+      target: runtime-web
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp" # HTTP/3 (QUIC) — Caddy tries this opportunistically; harmless if the port's blocked upstream, just falls back to HTTP/2.
+    volumes:
+      # Caddy's obtained TLS certificates live here — without this, a
+      # container recreation (not just a restart) would silently re-request
+      # a fresh certificate from Let's Encrypt every time.
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  # Named volume rather than a bind mount, so it isn't tied to a specific
+  # host path — back it up with `docker run --rm -v scrabble-px_scrabble-data:/data
+  # -v "$PWD":/backup debian tar czf /backup/scrabble-data.tgz -C /data .`
+  scrabble-data:
+  caddy-data:
+  caddy-config:

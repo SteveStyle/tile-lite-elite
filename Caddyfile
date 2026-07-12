@@ -1,0 +1,34 @@
+# Serves the built web client as static files, and reverse-proxies API
+# (including the /games/{id}/events WebSocket) to the server container —
+# same origin for both, which is what lets crates/ui build with an empty
+# SCRABBLE_PX_API_BASE_URL (see Dockerfile) instead of a baked-in host.
+#
+# /admin/* is deliberately not listed here: the server only accepts it from
+# loopback callers, and a request proxied in from this container isn't one
+# (see docker-compose.yml). Reach it via
+# `docker compose exec server scrabble-admin ...` instead.
+#
+# A real hostname (not a bare IP — Let's Encrypt won't certificate one) is
+# all Caddy needs to provision and renew HTTPS automatically: giving it a
+# domain here instead of a bare port is the entire config change. Plain
+# :80 requests get redirected to https:// automatically too.
+
+129.151.69.246.sslip.io {
+	encode gzip
+
+	# Caddy's automatic directive ordering runs try_files/file_server before
+	# reverse_proxy by default, regardless of source order — which rewrites
+	# every unmatched-file request (including real API paths, since they're
+	# not files under /srv) to /index.html before the @api matcher below
+	# ever sees the original path. An explicit route{} block runs its
+	# directives in the order written instead, so the API check happens
+	# first and the SPA fallback only applies to what's left.
+	route {
+		@api path /health /engines /auth/* /games /games/* /players/* /invitations/*
+		reverse_proxy @api server:3000
+
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

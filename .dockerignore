@@ -1,0 +1,10 @@
+target
+**/target
+.git
+.logs
+.pid.server
+.pid.web
+data
+.dioxus
+*.log
+node_modules
