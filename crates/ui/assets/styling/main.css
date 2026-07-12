@@ -581,6 +581,92 @@ button:disabled {
     background: rgba(111, 75, 44, 0.14);
 }
 
+.games-list-section {
+    margin-bottom: 18px;
+}
+
+.games-list-section-title {
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: rgba(35, 25, 15, 0.55);
+    margin: 0 0 8px;
+}
+
+.game-row-wrapper {
+    display: grid;
+    gap: 6px;
+}
+
+.game-row-invite-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.game-row-invite-actions .toggle-button,
+.game-row-invite-actions .toggle-button-muted {
+    padding: 6px 12px;
+    font-size: 0.78rem;
+}
+
+.game-builder {
+    display: grid;
+    gap: 12px;
+    padding: 14px;
+    margin-bottom: 16px;
+    border: 1px solid rgba(111, 75, 44, 0.14);
+    border-radius: 16px;
+    background: rgba(255, 255, 255, 0.5);
+}
+
+.seat-draft-list {
+    display: grid;
+    gap: 8px;
+}
+
+.seat-draft-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.seat-draft-kind {
+    font-size: 0.85rem;
+    color: rgba(35, 25, 15, 0.78);
+}
+
+.seat-draft-name-input {
+    padding: 6px 10px;
+    border: 1px solid rgba(111, 75, 44, 0.2);
+    border-radius: 10px;
+    font-size: 0.85rem;
+    flex: 1 1 auto;
+    min-width: 120px;
+}
+
+.seat-draft-remove {
+    padding: 4px 10px;
+    font-size: 0.75rem;
+}
+
+.game-builder-add-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.game-builder-time-limit {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+}
+
+.game-builder-time-limit .seat-draft-name-input {
+    max-width: 90px;
+}
+
 .seat-list,
 .recent-move-list {
     display: grid;
@@ -656,6 +742,13 @@ button:disabled {
 }
 
 .auth-widget {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 10px;
+}
+
+.auth-widget-row {
     display: flex;
     align-items: center;
     gap: 12px;

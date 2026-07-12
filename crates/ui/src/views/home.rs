@@ -15,6 +15,7 @@ pub fn Home(
     info_message: Option<String>,
     error_message: Option<String>,
     rack_tiles: Vec<RackTileView>,
+    can_view_rack: bool,
     staged_placements: Vec<StagedPlacementView>,
     can_stage_moves: bool,
     selected_cell: Option<usize>,
@@ -25,6 +26,7 @@ pub fn Home(
     on_click_rack_tile: EventHandler<usize>,
     on_type_letter: EventHandler<char>,
     on_backspace: EventHandler<()>,
+    on_delete: EventHandler<()>,
     on_clear_staged: EventHandler<()>,
     on_remove_staged: EventHandler<usize>,
     on_set_blank_letter: EventHandler<char>,
@@ -45,7 +47,7 @@ pub fn Home(
     on_confirm_exchange: EventHandler<()>,
     on_cancel_exchange: EventHandler<()>,
 ) -> Element {
-    let has_rack = !game.racks.is_empty();
+    let has_rack = can_view_rack;
     let is_waiting = game.status == GameStatus::Waiting;
     let is_active = game.status == GameStatus::Active;
 
@@ -103,6 +105,10 @@ pub fn Home(
                         event.prevent_default();
                         on_backspace.call(());
                     }
+                    Key::Delete => {
+                        event.prevent_default();
+                        on_delete.call(());
+                    }
                     _ => {}
                 }
             },
@@ -110,6 +116,7 @@ pub fn Home(
                 span { class: "meta-chip", "{format_status(&game)}" }
                 if is_active {
                     span { class: "meta-chip", "Turn: {current_turn_name(&game)}" }
+                    span { class: "meta-chip", "{crate::time_format::format_time_remaining(&game.turn_started_at, game.move_time_limit_seconds)}" }
                 }
                 span { class: "meta-chip", "Bag {game.bag_count}" }
                 if !is_live {

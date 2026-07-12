@@ -38,3 +38,29 @@ pub fn format_relative_time(epoch_seconds_str: &str) -> String {
         format!("{}w ago", diff / 604_800)
     }
 }
+
+/// How long is left on the current turn before the seat gets auto-retired
+/// (see `GameSession::apply_move_timeout` on the server), given when the
+/// turn started and the game's move-time-limit — both in the same "seconds
+/// since the Unix epoch" string format as `format_relative_time`.
+pub fn format_time_remaining(turn_started_at: &str, move_time_limit_seconds: u64) -> String {
+    let Ok(started) = turn_started_at.parse::<u64>() else {
+        return "unknown".to_string();
+    };
+    let deadline = started + move_time_limit_seconds;
+    let now = now_epoch_seconds();
+    if now >= deadline {
+        return "overdue".to_string();
+    }
+    let remaining = deadline - now;
+
+    if remaining < 60 {
+        format!("{remaining}s left")
+    } else if remaining < 3_600 {
+        format!("{}m left", remaining / 60)
+    } else if remaining < 86_400 {
+        format!("{}h left", remaining / 3_600)
+    } else {
+        format!("{}d left", remaining / 86_400)
+    }
+}

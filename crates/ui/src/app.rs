@@ -1,7 +1,7 @@
 use api::{
     BoardCellDto, CreateGameRequest, CreateSeatRequest, DirectionDto, GameActionRequest,
     GameEventDto, GameStateDto, GameStatus, MoveCandidateDto, ParticipantDto, PositionDto,
-    PremiumDto, RackDto, SeatKind, StartGameRequest, TileDto, TilePlacementDto,
+    PremiumDto, RackDto, SeatClaim, SeatKind, StartGameRequest, TileDto, TilePlacementDto,
 };
 use dioxus::prelude::*;
 use futures_util::StreamExt;
@@ -80,9 +80,15 @@ pub struct MovePreviewView {
 
 #[component]
 pub fn RootApp() -> Element {
+    // Set (even to an empty string) at build time — empty means "same
+    // origin as whatever page this was served from" (see `websocket_url`),
+    // used by the container deployment where a reverse proxy serves both
+    // the static build and the API from one host. Unset (the default for
+    // local dev, where `dx serve`'s web client and the backend run as two
+    // separate origins) falls back to the explicit dev address.
     let server_url = option_env!("SCRABBLE_PX_API_BASE_URL")
-        .unwrap_or("http://127.0.0.1:3000")
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
     let mut game = use_signal(|| None::<GameStateDto>);
     let mut game_summaries = use_signal(Vec::<api::GameSummaryDto>::new);
     let mut session = use_signal(|| None::<api::PlayerSessionDto>);
@@ -103,15 +109,17 @@ pub fn RootApp() -> Element {
         let server_url = server_url.clone();
         spawn(async move {
             let stored = crate::local_storage::load();
+            let mut auth_token: Option<String> = None;
             if let Some(token) = stored.session_token.clone() {
                 match validate_session(&server_url, &token).await {
                     Ok(player) => {
                         session.set(Some(api::PlayerSessionDto {
                             player_id: player.id,
-                            session_token: token,
+                            session_token: token.clone(),
                             display_name: player.display_name,
                             email: player.email,
                         }));
+                        auth_token = Some(token);
                     }
                     Err(_) => {
                         // Stored token is no longer valid — drop it, but
@@ -128,6 +136,7 @@ pub fn RootApp() -> Element {
             error_message.set(None);
             load_summaries_and_game(
                 &server_url,
+                auth_token.as_deref(),
                 None,
                 game,
                 game_summaries,
@@ -163,6 +172,7 @@ pub fn RootApp() -> Element {
             is_reconnecting.set(true);
             let server_url = server_url.clone();
             let current_game_id = game().as_ref().map(|current| current.id.clone());
+            let auth_token = session().map(|current| current.session_token.clone());
             spawn(async move {
                 loop {
                     sleep_ms(RECONNECT_POLL_MS).await;
@@ -174,6 +184,7 @@ pub fn RootApp() -> Element {
                 info_message.set(Some("Reconnected — catching up...".to_string()));
                 load_summaries_and_game(
                     &server_url,
+                    auth_token.as_deref(),
                     current_game_id,
                     game,
                     game_summaries,
@@ -216,6 +227,7 @@ pub fn RootApp() -> Element {
     }
 
     let game_for_view = game().clone().unwrap_or_else(empty_live_game);
+    let viewer_player_id = session().map(|current| current.player_id.clone());
     let can_start = IS_ONLINE()
         && game()
             .as_ref()
@@ -226,9 +238,21 @@ pub fn RootApp() -> Element {
                 && current
                     .participants
                     .get(current.current_seat as usize)
-                    .is_some_and(|participant| participant.kind == SeatKind::Human)
+                    .is_some_and(|participant| {
+                        participant.kind == SeatKind::Human && seat_is_open_or_owned_by(participant, viewer_player_id.as_deref())
+                    })
         });
-    let rack_tiles = current_rack_tiles(&game_for_view, &staged_placements());
+    // Which seat's rack this viewer gets to see at all: their own claimed
+    // seat if they have one (even on another player's turn — you can
+    // always see your own tiles while you wait), else the current seat if
+    // it's unclaimed (anonymous/open play, unchanged from before), else
+    // nothing — a logged-in viewer who isn't a participant, or an
+    // anonymous one looking at a game with claimed seats, sees no rack at
+    // all rather than relying on the server to reject an attempted move
+    // after the fact.
+    let viewer_rack_seat = viewer_rack_seat(&game_for_view, viewer_player_id.as_deref());
+    let can_view_rack = viewer_rack_seat.is_some();
+    let rack_tiles = rack_tiles_for_seat(&game_for_view, viewer_rack_seat, &staged_placements());
     let can_submit_manual_action =
         can_submit_human_action && !exchange_mode() && !staged_placements().is_empty();
 
@@ -257,6 +281,9 @@ pub fn RootApp() -> Element {
     }
     let staged_preview = staged_preview();
     let server_url_for_create = server_url.clone();
+    let server_url_for_custom_create = server_url.clone();
+    let server_url_for_accept = server_url.clone();
+    let server_url_for_reject = server_url.clone();
     let server_url_for_refresh = server_url.clone();
     let server_url_for_select = server_url.clone();
     let server_url_for_start = server_url.clone();
@@ -308,6 +335,20 @@ pub fn RootApp() -> Element {
                         session.set(None);
                         info_message.set(Some("Logged out".to_string()));
                     },
+                    on_password_changed: move |_| {
+                        // The server invalidates every session for this
+                        // player on a password change, including the one
+                        // that made the request — so the client just needs
+                        // to drop its own local copy, same as a manual
+                        // logout, and prompt a fresh login.
+                        let stored = crate::local_storage::load();
+                        crate::local_storage::save(&crate::local_storage::StoredAuth {
+                            remembered_name: stored.remembered_name,
+                            session_token: None,
+                        });
+                        session.set(None);
+                        info_message.set(Some("Password changed — please log in again.".to_string()));
+                    },
                 }
             }
 
@@ -316,6 +357,7 @@ pub fn RootApp() -> Element {
                     summaries: game_summaries().clone(),
                     selected_id: game().as_ref().map(|current| current.id.clone()),
                     is_loading: is_loading(),
+                    my_display_name: session().map(|current| current.display_name.clone()),
                     on_select: move |game_id: String| {
                         let server_url = server_url_for_select.clone();
                         spawn(async move {
@@ -360,7 +402,72 @@ pub fn RootApp() -> Element {
                                     );
                                     websocket_game_id.set(None);
                                     game.set(Some(created));
-                                    if let Ok(summaries) = load_game_summaries(&server_url).await {
+                                    if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                        game_summaries.set(summaries);
+                                    }
+                                }
+                                Err(error) => error_message.set(Some(error)),
+                            }
+                            is_loading.set(false);
+                        });
+                    },
+                    on_custom_new_game: move |submission: crate::components::games_panel::CustomGameSubmission| {
+                        let server_url = server_url_for_custom_create.clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        spawn(async move {
+                            is_loading.set(true);
+                            error_message.set(None);
+                            match create_custom_game(&server_url, token.as_deref(), &submission).await {
+                                Ok(created) => {
+                                    info_message.set(None);
+                                    reset_composer_state(
+                                        dragging_tile_id,
+                                        selected_blank_letter,
+                                        staged_placements,
+                                        selected_cell,
+                                        exchange_mode,
+                                        exchange_selected,
+                                    );
+                                    websocket_game_id.set(None);
+                                    game.set(Some(created));
+                                    if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                        game_summaries.set(summaries);
+                                    }
+                                }
+                                Err(error) => error_message.set(Some(error)),
+                            }
+                            is_loading.set(false);
+                        });
+                    },
+                    on_accept_invitation: move |invitation_id: String| {
+                        let server_url = server_url_for_accept.clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        spawn(async move {
+                            is_loading.set(true);
+                            error_message.set(None);
+                            match accept_invitation(&server_url, &invitation_id, token.as_deref()).await {
+                                Ok(joined) => {
+                                    info_message.set(None);
+                                    websocket_game_id.set(None);
+                                    game.set(Some(joined));
+                                    if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                        game_summaries.set(summaries);
+                                    }
+                                }
+                                Err(error) => error_message.set(Some(error)),
+                            }
+                            is_loading.set(false);
+                        });
+                    },
+                    on_reject_invitation: move |invitation_id: String| {
+                        let server_url = server_url_for_reject.clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        spawn(async move {
+                            is_loading.set(true);
+                            error_message.set(None);
+                            match reject_invitation(&server_url, &invitation_id, token.as_deref()).await {
+                                Ok(_) => {
+                                    if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
                                         game_summaries.set(summaries);
                                     }
                                 }
@@ -371,10 +478,11 @@ pub fn RootApp() -> Element {
                     },
                     on_refresh: move |_| {
                         let server_url = server_url_for_refresh.clone();
+                        let token = session().map(|current| current.session_token.clone());
                         spawn(async move {
                             is_loading.set(true);
                             error_message.set(None);
-                            match load_game_summaries(&server_url).await {
+                            match load_game_summaries(&server_url, token.as_deref()).await {
                                 Ok(summaries) => game_summaries.set(summaries),
                                 Err(error) => error_message.set(Some(error)),
                             }
@@ -390,6 +498,7 @@ pub fn RootApp() -> Element {
                     info_message: info_message().clone(),
                     error_message: error_message().clone(),
                     rack_tiles,
+                    can_view_rack,
                     staged_placements: staged_placements().clone(),
                     can_stage_moves: can_submit_human_action && !exchange_mode(),
                     selected_cell: selected_cell(),
@@ -526,28 +635,41 @@ pub fn RootApp() -> Element {
                         let Some(cell_index) = selected_cell() else {
                             return;
                         };
-                        let had_staged_tile = staged_placements()
+                        // The cursor normally sits one past the last typed
+                        // tile (ready for the next letter), so backspace
+                        // targets the previous editable cell — the tile just
+                        // behind the cursor — and removes/lands on exactly
+                        // that one cell, rather than also skipping past it.
+                        // If the cursor is already sitting directly on a
+                        // staged tile (e.g. after clicking it), act on that
+                        // cell in place instead of stepping back further.
+                        let cursor_has_tile = staged_placements()
                             .iter()
                             .any(|p| p.board_index == cell_index);
-                        if had_staged_tile {
-                            staged_placements
-                                .with_mut(|placements| {
-                                    placements.retain(|p| p.board_index != cell_index);
-                                });
+                        let target = if cursor_has_tile {
+                            Some(cell_index)
+                        } else {
+                            let direction = infer_typing_direction(&game_for_backspace, &staged_placements());
+                            find_previous_editable_cell(&game_for_backspace, cell_index, direction)
+                        };
+                        let Some(target) = target else {
+                            return;
+                        };
+                        staged_placements
+                            .with_mut(|placements| placements.retain(|p| p.board_index != target));
+                        selected_cell.set(Some(target));
+                    },
+                    on_delete: move |_| {
+                        if !can_submit_human_action || exchange_mode() {
+                            return;
                         }
-                        let direction = infer_typing_direction(&game_for_backspace, &staged_placements());
-                        let previous = find_next_placeable_cell(
-                            &game_for_backspace,
-                            &staged_placements(),
-                            cell_index,
-                            direction,
-                            false,
-                        );
-                        if let Some(previous) = previous {
-                            selected_cell.set(Some(previous));
-                        } else if had_staged_tile {
-                            selected_cell.set(Some(cell_index));
-                        }
+                        let Some(cell_index) = selected_cell() else {
+                            return;
+                        };
+                        // Forward-delete: removes a staged tile at the
+                        // cursor without moving the cursor, unlike backspace.
+                        staged_placements
+                            .with_mut(|placements| placements.retain(|p| p.board_index != cell_index));
                     },
                     on_clear_staged: move |_| {
                         dragging_tile_id.set(None);
@@ -767,6 +889,8 @@ fn empty_live_game() -> GameStateDto {
         current_seat: 0,
         winner_seat: None,
         bag_count: 100,
+        move_time_limit_seconds: 0,
+        turn_started_at: "0".to_string(),
         participants: vec![ParticipantDto {
             seat_number: 0,
             kind: SeatKind::Human,
@@ -827,8 +951,11 @@ fn mirrored_positions(x: u8, y: u8) -> [(u8, u8); 4] {
     [(x, y), (max - x, y), (x, max - y), (max - x, max - y)]
 }
 
-async fn load_game_summaries(server_url: &str) -> Result<Vec<api::GameSummaryDto>, String> {
-    get_json::<Vec<api::GameSummaryDto>>(&format!("{server_url}/games")).await
+async fn load_game_summaries(
+    server_url: &str,
+    token: Option<&str>,
+) -> Result<Vec<api::GameSummaryDto>, String> {
+    get_json_auth::<Vec<api::GameSummaryDto>>(&format!("{server_url}/games"), token).await
 }
 
 pub(crate) async fn register_player(
@@ -855,6 +982,24 @@ pub(crate) async fn login_player(
         password: password.to_string(),
     };
     post_json(&format!("{server_url}/auth/login"), None, &request).await
+}
+
+pub(crate) async fn change_password(
+    server_url: &str,
+    token: &str,
+    current_password: &str,
+    new_password: &str,
+) -> Result<(), String> {
+    let request = api::ChangePasswordRequest {
+        current_password: current_password.to_string(),
+        new_password: new_password.to_string(),
+    };
+    post_no_content(
+        &format!("{server_url}/auth/change-password"),
+        Some(token),
+        &request,
+    )
+    .await
 }
 
 async fn validate_session(server_url: &str, session_token: &str) -> Result<api::PlayerDto, String> {
@@ -897,6 +1042,7 @@ async fn check_server_reachable(server_url: &str) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn load_summaries_and_game(
     server_url: &str,
+    token: Option<&str>,
     preferred_game_id: Option<String>,
     mut game: Signal<Option<GameStateDto>>,
     mut game_summaries: Signal<Vec<api::GameSummaryDto>>,
@@ -909,7 +1055,16 @@ async fn load_summaries_and_game(
     exchange_mode: Signal<bool>,
     exchange_selected: Signal<HashSet<usize>>,
 ) {
-    match load_game_summaries(server_url).await {
+    // The games list is per-account now (the server 401s without a
+    // session), so there's nothing meaningful to fetch until the caller is
+    // signed in — surface that as guidance rather than an "error".
+    let Some(token) = token else {
+        game_summaries.set(Vec::new());
+        info_message.set(Some("Sign in to see your games.".to_string()));
+        return;
+    };
+
+    match load_game_summaries(server_url, Some(token)).await {
         Ok(summaries) => {
             let target_id = preferred_game_id.or_else(|| summaries.first().map(|s| s.id.clone()));
             game_summaries.set(summaries);
@@ -938,10 +1093,12 @@ async fn load_summaries_and_game(
     }
 }
 
-/// Builds the two seats for a freshly created game. The first seat is
-/// always the human-facing "me" seat when `my_display_name` is known (i.e.
-/// the caller is logged in); it falls back to a generic name for anonymous
-/// play, matching the server's existing anonymous-creation support.
+/// Builds the seats for a freshly created game. Every human seat needs a
+/// claim now (creating a game requires being signed in — there's no more
+/// anonymous/open-to-anyone seat), so the first seat is always `Creator`
+/// when the caller has a display name. These three presets are shortcuts
+/// into the general seat-builder form (creator / named / open / engine per
+/// seat) rather than separate hardcoded flows.
 fn build_new_game_seats(kind: NewGameKind, my_display_name: Option<&str>) -> Vec<CreateSeatRequest> {
     let my_name = my_display_name.unwrap_or("Player 1").to_string();
     match kind {
@@ -950,11 +1107,13 @@ fn build_new_game_seats(kind: NewGameKind, my_display_name: Option<&str>) -> Vec
                 kind: SeatKind::Human,
                 display_name: my_name,
                 engine_id: None,
+                claim: Some(SeatClaim::Creator),
             },
             CreateSeatRequest {
                 kind: SeatKind::Engine,
                 display_name: "Greedy".to_string(),
                 engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
+                claim: None,
             },
         ],
         NewGameKind::VsHuman => vec![
@@ -962,11 +1121,13 @@ fn build_new_game_seats(kind: NewGameKind, my_display_name: Option<&str>) -> Vec
                 kind: SeatKind::Human,
                 display_name: my_name,
                 engine_id: None,
+                claim: Some(SeatClaim::Creator),
             },
             CreateSeatRequest {
                 kind: SeatKind::Human,
-                display_name: "Player 2".to_string(),
+                display_name: "Open seat".to_string(),
                 engine_id: None,
+                claim: Some(SeatClaim::Open),
             },
         ],
         NewGameKind::EngineVsEngine => vec![
@@ -974,11 +1135,13 @@ fn build_new_game_seats(kind: NewGameKind, my_display_name: Option<&str>) -> Vec
                 kind: SeatKind::Engine,
                 display_name: "Greedy One".to_string(),
                 engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
+                claim: None,
             },
             CreateSeatRequest {
                 kind: SeatKind::Engine,
                 display_name: "Greedy Two".to_string(),
                 engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
+                claim: None,
             },
         ],
     }
@@ -996,9 +1159,37 @@ async fn create_game(
         variant: None,
         language: None,
         board_layout: None,
+        move_time_limit_seconds: None,
     };
 
     post_json(&format!("{server_url}/games"), token, &request).await
+}
+
+async fn create_custom_game(
+    server_url: &str,
+    token: Option<&str>,
+    submission: &crate::components::games_panel::CustomGameSubmission,
+) -> Result<GameStateDto, String> {
+    let request = CreateGameRequest {
+        seats: submission.seats.clone(),
+        seed: None,
+        variant: None,
+        language: None,
+        board_layout: None,
+        move_time_limit_seconds: submission.move_time_limit_seconds,
+    };
+    post_json(&format!("{server_url}/games"), token, &request).await
+}
+
+/// Neither endpoint takes a request body (the invitation id in the path is
+/// all the server needs), but `post_json` always serializes a payload — `()`
+/// serializes to `null`, which the handlers simply never look at.
+async fn accept_invitation(server_url: &str, invitation_id: &str, token: Option<&str>) -> Result<GameStateDto, String> {
+    post_json(&format!("{server_url}/invitations/{invitation_id}/accept"), token, &()).await
+}
+
+async fn reject_invitation(server_url: &str, invitation_id: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
+    post_json(&format!("{server_url}/invitations/{invitation_id}/reject"), token, &()).await
 }
 
 async fn start_game(server_url: &str, game_id: &str, token: Option<&str>) -> Result<GameStateDto, String> {
@@ -1054,6 +1245,15 @@ where
     post_json_impl(url, token, payload).await
 }
 
+/// For endpoints that respond `204 No Content` (nothing to deserialize) —
+/// `post_json::<_, ()>` would fail trying to parse an empty body as JSON.
+async fn post_no_content<T>(url: &str, token: Option<&str>, payload: &T) -> Result<(), String>
+where
+    T: serde::Serialize + ?Sized,
+{
+    post_no_content_impl(url, token, payload).await
+}
+
 /// Text shown for a request that never got a response at all — as opposed
 /// to a response the server sent back rejecting it, which keeps its own
 /// specific message. This is the one signal that distinguishes "the server
@@ -1082,11 +1282,19 @@ async fn get_json<R>(url: &str) -> Result<R, String>
 where
     R: serde::de::DeserializeOwned,
 {
-    let response = reqwest::Client::new()
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| mark_offline())?;
+    get_json_auth(url, None).await
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn get_json_auth<R>(url: &str, token: Option<&str>) -> Result<R, String>
+where
+    R: serde::de::DeserializeOwned,
+{
+    let mut request = reqwest::Client::new().get(url);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = request.send().await.map_err(|_| mark_offline())?;
     mark_online();
     if !response.status().is_success() {
         let msg = response
@@ -1104,7 +1312,19 @@ async fn get_json<R>(url: &str) -> Result<R, String>
 where
     R: serde::de::DeserializeOwned,
 {
-    let response = Request::get(url).send().await.map_err(|_| mark_offline())?;
+    get_json_auth(url, None).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn get_json_auth<R>(url: &str, token: Option<&str>) -> Result<R, String>
+where
+    R: serde::de::DeserializeOwned,
+{
+    let mut builder = Request::get(url);
+    if let Some(token) = token {
+        builder = builder.header("Authorization", &format!("Bearer {token}"));
+    }
+    let response = builder.send().await.map_err(|_| mark_offline())?;
     mark_online();
     if !response.ok() {
         let msg = response
@@ -1172,6 +1392,55 @@ where
         .json::<R>()
         .await
         .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn post_no_content_impl<T>(url: &str, token: Option<&str>, payload: &T) -> Result<(), String>
+where
+    T: serde::Serialize + ?Sized,
+{
+    let mut request = reqwest::Client::new().post(url).json(payload);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = request.send().await.map_err(|_| mark_offline())?;
+    mark_online();
+    if !response.status().is_success() {
+        let msg = response
+            .json::<api::ApiError>()
+            .await
+            .map(|e| e.message)
+            .unwrap_or_else(|_| "Request failed".to_string());
+        return Err(msg);
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn post_no_content_impl<T>(url: &str, token: Option<&str>, payload: &T) -> Result<(), String>
+where
+    T: serde::Serialize + ?Sized,
+{
+    let mut builder = Request::post(url);
+    if let Some(token) = token {
+        builder = builder.header("Authorization", &format!("Bearer {token}"));
+    }
+    let response = builder
+        .json(payload)
+        .map_err(|error| error.to_string())?
+        .send()
+        .await
+        .map_err(|_| mark_offline())?;
+    mark_online();
+    if !response.ok() {
+        let msg = response
+            .json::<api::ApiError>()
+            .await
+            .map(|e| e.message)
+            .unwrap_or_else(|_| format!("HTTP {} {}", response.status(), response.status_text()));
+        return Err(msg);
+    }
+    Ok(())
 }
 
 async fn subscribe_to_game_events(
@@ -1252,7 +1521,38 @@ fn websocket_url(server_url: &str, game_id: &str) -> Result<String, String> {
     if let Some(url) = server_url.strip_prefix("https://") {
         return Ok(format!("wss://{url}/games/{game_id}/events"));
     }
+    // An empty `server_url` means "same origin as the page" (see
+    // `default_server_url` — used when a reverse proxy serves both the
+    // static assets and the API from one host, e.g. the container
+    // deployment). There's no explicit scheme/host to rewrite in that case,
+    // so it's derived from the browser's own location instead.
+    if server_url.is_empty() {
+        return same_origin_websocket_url(game_id);
+    }
     Err(format!("Unsupported server url: {server_url}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn same_origin_websocket_url(game_id: &str) -> Result<String, String> {
+    let location = web_sys::window()
+        .ok_or_else(|| "No browser window available".to_string())?
+        .location();
+    let protocol = location
+        .protocol()
+        .map_err(|_| "Could not read page protocol".to_string())?;
+    let host = location
+        .host()
+        .map_err(|_| "Could not read page host".to_string())?;
+    let ws_scheme = if protocol == "https:" { "wss" } else { "ws" };
+    Ok(format!("{ws_scheme}://{host}/games/{game_id}/events"))
+}
+
+/// The desktop build never runs with a same-origin (empty) `server_url` — it
+/// always talks to an explicit configured server — so this is unreachable
+/// in practice; it exists only so `websocket_url` compiles for both targets.
+#[cfg(not(target_arch = "wasm32"))]
+fn same_origin_websocket_url(_game_id: &str) -> Result<String, String> {
+    Err("Same-origin server URLs are only supported on the web build".to_string())
 }
 
 fn build_manual_move_request(
@@ -1455,9 +1755,9 @@ fn step_index(index: usize, direction: DirectionDto, forward: bool) -> Option<us
 /// Walks from `from_index` in `direction`, skipping over cells that are
 /// already occupied (a permanently-played letter, or a tile staged earlier
 /// this turn), and returns the first free one. Used to auto-advance to the
-/// next slot when typing a word, and to step backward on backspace —
-/// stepping through already-placed letters rather than stopping on them,
-/// since a staged word can legitimately run across existing board tiles.
+/// next slot when typing a word — skipping past a tile just staged is
+/// correct going forward, since typing shouldn't double back onto what it
+/// just placed.
 fn find_next_placeable_cell(
     game: &GameStateDto,
     staged: &[StagedPlacementView],
@@ -1474,6 +1774,31 @@ fn find_next_placeable_cell(
             .is_some_and(board_cell_has_letter);
         let is_staged = staged.iter().any(|p| p.board_index == current);
         if !is_permanent && !is_staged {
+            return Some(current);
+        }
+    }
+}
+
+/// Walks backward from `from_index`, skipping only permanently-played
+/// letters (not staged ones — unlike `find_next_placeable_cell`), and
+/// returns the first cell that isn't a permanent letter. That's the cell
+/// backspace should act on: either a staged tile to remove, or — if nothing
+/// has been typed there yet — the next empty slot to land the cursor on.
+/// Landing *on* the previous staged tile (rather than skipping past it) is
+/// what makes backspace delete exactly one tile per press.
+fn find_previous_editable_cell(
+    game: &GameStateDto,
+    from_index: usize,
+    direction: DirectionDto,
+) -> Option<usize> {
+    let mut current = from_index;
+    loop {
+        current = step_index(current, direction, false)?;
+        let is_permanent = game
+            .board
+            .get(current)
+            .is_some_and(board_cell_has_letter);
+        if !is_permanent {
             return Some(current);
         }
     }
@@ -1540,8 +1865,52 @@ fn reset_composer_state(
     exchange_selected.set(HashSet::new());
 }
 
+/// True if this seat is either unclaimed (anonymous/open play — anyone may
+/// view or act on it, unchanged from before) or claimed by exactly this
+/// viewer. Mirrors the server's own ownership rule (`submit_action` et al)
+/// client-side, so the UI doesn't show a seat as live only for the server
+/// to reject the attempt after the fact.
+fn seat_is_open_or_owned_by(participant: &ParticipantDto, viewer_player_id: Option<&str>) -> bool {
+    match participant.player_id.as_deref() {
+        None => true,
+        Some(owner) => Some(owner) == viewer_player_id,
+    }
+}
+
+/// The seat whose rack this viewer should see, if any: their own claimed
+/// seat (regardless of whose turn it is), else the current seat if it's
+/// unclaimed, else `None`.
+fn viewer_rack_seat(game: &GameStateDto, viewer_player_id: Option<&str>) -> Option<usize> {
+    if let Some(viewer_player_id) = viewer_player_id {
+        if let Some(owned) = game
+            .participants
+            .iter()
+            .find(|participant| participant.player_id.as_deref() == Some(viewer_player_id))
+        {
+            return Some(owned.seat_number as usize);
+        }
+    }
+    let current = game.participants.get(game.current_seat as usize)?;
+    if current.player_id.is_none() {
+        Some(game.current_seat as usize)
+    } else {
+        None
+    }
+}
+
 fn current_rack_tiles(game: &GameStateDto, staged: &[StagedPlacementView]) -> Vec<RackTileView> {
-    let Some(rack) = game.racks.get(game.current_seat as usize) else {
+    rack_tiles_for_seat(game, Some(game.current_seat as usize), staged)
+}
+
+fn rack_tiles_for_seat(
+    game: &GameStateDto,
+    seat_index: Option<usize>,
+    staged: &[StagedPlacementView],
+) -> Vec<RackTileView> {
+    let Some(seat_index) = seat_index else {
+        return Vec::new();
+    };
+    let Some(rack) = game.racks.get(seat_index) else {
         return Vec::new();
     };
 
@@ -1582,6 +1951,33 @@ fn current_rack_tiles(game: &GameStateDto, staged: &[StagedPlacementView]) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn websocket_url_rewrites_http_and_https_schemes() {
+        assert_eq!(
+            websocket_url("http://example.com:3000", "game-1"),
+            Ok("ws://example.com:3000/games/game-1/events".to_string())
+        );
+        assert_eq!(
+            websocket_url("https://example.com", "game-1"),
+            Ok("wss://example.com/games/game-1/events".to_string())
+        );
+    }
+
+    #[test]
+    fn websocket_url_rejects_an_unrecognized_scheme() {
+        assert!(websocket_url("ftp://example.com", "game-1").is_err());
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn websocket_url_same_origin_is_only_supported_on_web() {
+        // The desktop/native build never actually passes an empty
+        // server_url (it always talks to an explicit configured server),
+        // so this just confirms the fallback doesn't panic — same-origin
+        // resolution itself is only meaningful in a browser.
+        assert!(websocket_url("", "game-1").is_err());
+    }
 
     #[test]
     fn vs_engine_seats_are_one_human_one_engine() {
@@ -1670,6 +2066,43 @@ mod tests {
     }
 
     #[test]
+    fn find_previous_editable_cell_lands_on_the_immediately_preceding_staged_tile() {
+        // Regression test: backspace used to skip straight past the last
+        // staged tile (landing one cell further back than intended) because
+        // it reused the forward-advance helper, which treats staged cells
+        // as something to skip over rather than stop on.
+        let game = test_game(empty_board());
+        assert_eq!(
+            find_previous_editable_cell(&game, 12, DirectionDto::Horizontal),
+            Some(11)
+        );
+    }
+
+    #[test]
+    fn find_previous_editable_cell_skips_over_permanent_letters_only() {
+        let mut board = empty_board();
+        board[11].letter = Some('A');
+        board[10].letter = Some('B');
+        let game = test_game(board);
+
+        // From 12 going left: 11 and 10 are permanent, so backspace should
+        // land on 9 — the first cell that isn't a permanent letter.
+        assert_eq!(
+            find_previous_editable_cell(&game, 12, DirectionDto::Horizontal),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn find_previous_editable_cell_returns_none_past_the_edge() {
+        let game = test_game(empty_board());
+        assert_eq!(
+            find_previous_editable_cell(&game, 0, DirectionDto::Horizontal),
+            None
+        );
+    }
+
+    #[test]
     fn infer_typing_direction_defaults_to_horizontal_when_empty_or_isolated() {
         let game = test_game(empty_board());
         assert_eq!(infer_typing_direction(&game, &[]), DirectionDto::Horizontal);
@@ -1746,5 +2179,73 @@ mod tests {
         let placement = stage_tile_at_cell(7, &tile, None);
         assert_eq!(placement.display, '?');
         assert_eq!(placement.tile, TileDto::Blank { acting_as: None });
+    }
+
+    fn participant(seat_number: u8, player_id: Option<&str>) -> ParticipantDto {
+        ParticipantDto {
+            seat_number,
+            kind: SeatKind::Human,
+            display_name: format!("Seat {seat_number}"),
+            player_id: player_id.map(str::to_string),
+            engine_id: None,
+            score: 0,
+        }
+    }
+
+    fn game_with_participants(participants: Vec<ParticipantDto>, current_seat: u8) -> GameStateDto {
+        let racks = participants.iter().map(|_| RackDto { counts: [0; 26], blanks: 0 }).collect();
+        GameStateDto {
+            participants,
+            racks,
+            current_seat,
+            ..test_game(empty_board())
+        }
+    }
+
+    #[test]
+    fn seat_is_open_or_owned_by_lets_anyone_use_an_unclaimed_seat() {
+        let unclaimed = participant(0, None);
+        assert!(seat_is_open_or_owned_by(&unclaimed, None));
+        assert!(seat_is_open_or_owned_by(&unclaimed, Some("alice")));
+        assert!(seat_is_open_or_owned_by(&unclaimed, Some("mallory")));
+    }
+
+    #[test]
+    fn seat_is_open_or_owned_by_restricts_a_claimed_seat_to_its_owner() {
+        let claimed = participant(0, Some("alice"));
+        assert!(seat_is_open_or_owned_by(&claimed, Some("alice")));
+        assert!(!seat_is_open_or_owned_by(&claimed, Some("mallory")));
+        assert!(!seat_is_open_or_owned_by(&claimed, None));
+    }
+
+    #[test]
+    fn viewer_rack_seat_shows_your_own_seat_even_when_its_not_your_turn() {
+        // Alice owns seat 0, Bob owns seat 1, it's Bob's turn — Alice
+        // should still see her own rack while she waits.
+        let game = game_with_participants(
+            vec![participant(0, Some("alice")), participant(1, Some("bob"))],
+            1,
+        );
+        assert_eq!(viewer_rack_seat(&game, Some("alice")), Some(0));
+        assert_eq!(viewer_rack_seat(&game, Some("bob")), Some(1));
+    }
+
+    #[test]
+    fn viewer_rack_seat_hides_a_claimed_game_from_a_non_participant() {
+        let game = game_with_participants(
+            vec![participant(0, Some("alice")), participant(1, Some("bob"))],
+            0,
+        );
+        assert_eq!(viewer_rack_seat(&game, Some("mallory")), None);
+        assert_eq!(viewer_rack_seat(&game, None), None);
+    }
+
+    #[test]
+    fn viewer_rack_seat_stays_open_for_an_anonymous_game() {
+        // Neither seat is claimed — matches today's anonymous-play
+        // behavior, unaffected by ownership gating.
+        let game = game_with_participants(vec![participant(0, None), participant(1, None)], 0);
+        assert_eq!(viewer_rack_seat(&game, None), Some(0));
+        assert_eq!(viewer_rack_seat(&game, Some("anyone")), Some(0));
     }
 }

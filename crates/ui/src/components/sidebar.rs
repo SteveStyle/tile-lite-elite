@@ -111,6 +111,7 @@ fn action_note(record: &MoveRecordDto) -> String {
     match record.move_type.as_str() {
         "pass" => "passed".to_string(),
         "resign" => "resigned".to_string(),
+        "timeout" => "retired (exceeded time limit)".to_string(),
         "exchange" => {
             let count = record
                 .description

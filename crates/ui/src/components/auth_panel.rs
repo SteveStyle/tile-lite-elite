@@ -12,6 +12,7 @@ pub fn AuthPanel(
     session: Option<api::PlayerSessionDto>,
     on_authenticated: EventHandler<(api::PlayerSessionDto, bool, bool)>,
     on_logout: EventHandler<()>,
+    on_password_changed: EventHandler<()>,
 ) -> Element {
     let stored = crate::local_storage::load();
     let has_remembered_name = stored.remembered_name.is_some();
@@ -27,14 +28,110 @@ pub fn AuthPanel(
     let mut error_message = use_signal(|| None::<String>);
     let mut is_submitting = use_signal(|| false);
 
+    let mut show_change_password = use_signal(|| false);
+    let mut current_password_input = use_signal(String::new);
+    let mut new_password_input = use_signal(String::new);
+    let mut confirm_password_input = use_signal(String::new);
+    let mut change_password_error = use_signal(|| None::<String>);
+    let mut is_changing_password = use_signal(|| false);
+
     if let Some(session) = session {
         return rsx! {
             div { class: "auth-widget",
-                span { class: "auth-status", "Logged in as {session.display_name}" }
-                button {
-                    class: "toggle-button toggle-button-muted",
-                    onclick: move |_| on_logout.call(()),
-                    "Log out"
+                div { class: "auth-widget-row",
+                    span { class: "auth-status", "Logged in as {session.display_name}" }
+                    button {
+                        class: "toggle-button toggle-button-muted",
+                        onclick: move |_| {
+                            show_change_password.set(!show_change_password());
+                            change_password_error.set(None);
+                        },
+                        "Change password"
+                    }
+                    button {
+                        class: "toggle-button toggle-button-muted",
+                        onclick: move |_| on_logout.call(()),
+                        "Log out"
+                    }
+                }
+                if show_change_password() {
+                    div { class: "auth-panel",
+                        input {
+                            class: "auth-input",
+                            r#type: "password",
+                            placeholder: "Current password",
+                            value: "{current_password_input}",
+                            oninput: move |event| current_password_input.set(event.value()),
+                        }
+                        input {
+                            class: "auth-input",
+                            r#type: "password",
+                            placeholder: "New password",
+                            value: "{new_password_input}",
+                            oninput: move |event| new_password_input.set(event.value()),
+                        }
+                        input {
+                            class: "auth-input",
+                            r#type: "password",
+                            placeholder: "Confirm new password",
+                            value: "{confirm_password_input}",
+                            oninput: move |event| confirm_password_input.set(event.value()),
+                        }
+                        if let Some(error) = change_password_error() {
+                            p { class: "error-banner", "{error}" }
+                        }
+                        div { class: "auth-panel-actions",
+                            button {
+                                class: "toggle-button toggle-button-muted",
+                                disabled: is_changing_password(),
+                                onclick: move |_| {
+                                    show_change_password.set(false);
+                                    change_password_error.set(None);
+                                    current_password_input.set(String::new());
+                                    new_password_input.set(String::new());
+                                    confirm_password_input.set(String::new());
+                                },
+                                "Cancel"
+                            }
+                            button {
+                                class: "toggle-button",
+                                disabled: is_changing_password(),
+                                onclick: move |_| {
+                                    let server_url = server_url.clone();
+                                    let token = session.session_token.clone();
+                                    let current = current_password_input();
+                                    let new_password_value = new_password_input();
+                                    let confirm = confirm_password_input();
+
+                                    if current.is_empty() || new_password_value.is_empty() {
+                                        change_password_error.set(Some("Both current and new password are required".to_string()));
+                                        return;
+                                    }
+                                    if new_password_value != confirm {
+                                        change_password_error.set(Some("New password and confirmation don't match".to_string()));
+                                        return;
+                                    }
+
+                                    spawn(async move {
+                                        is_changing_password.set(true);
+                                        change_password_error.set(None);
+                                        match crate::app::change_password(&server_url, &token, &current, &new_password_value).await {
+                                            Ok(()) => {
+                                                show_change_password.set(false);
+                                                current_password_input.set(String::new());
+                                                new_password_input.set(String::new());
+                                                confirm_password_input.set(String::new());
+                                                on_password_changed.call(());
+                                            }
+                                            Err(error) => change_password_error.set(Some(error)),
+                                        }
+                                        is_changing_password.set(false);
+                                    });
+                                },
+                                "Update password"
+                            }
+                        }
+                    }
                 }
             }
         };
