@@ -27,6 +27,18 @@ is_web_running() {
     [[ -f "$PIDFILE_WEB" ]] && kill -0 "$(cat "$PIDFILE_WEB")" 2>/dev/null
 }
 
+# PID-file checks only know about processes *this script* started. Something
+# can be listening on the port regardless — started by hand, by an IDE, by a
+# previous script invocation whose PID file went stale — and this script
+# would otherwise report it as "not running" despite it working fine.
+backend_reachable() {
+    curl -sf --max-time 2 http://127.0.0.1:3000/health >/dev/null 2>&1
+}
+
+web_reachable() {
+    curl -sf --max-time 2 http://127.0.0.1:8080 >/dev/null 2>&1
+}
+
 start_server() {
     if [[ -f "$PIDFILE_SERVER" ]] && kill -0 "$(cat "$PIDFILE_SERVER")" 2>/dev/null; then
         echo "✓ Backend server already running (PID $(cat "$PIDFILE_SERVER"))"
@@ -61,6 +73,14 @@ start_web() {
         echo "✓ Web dev server already running (PID $(cat "$PIDFILE_WEB"))"
         return
     fi
+
+    # Same defensive cleanup start_server already does — without it, an
+    # untracked process already bound to :8080 (started by hand, or from a
+    # stale PID file) makes dx serve fail to bind rather than taking over.
+    echo "Cleaning up any stale web dev processes on port 8080..."
+    lsof -ti :8080 2>/dev/null | xargs -r kill -9 2>/dev/null || true
+    sleep 1
+
     echo "Starting web dev server..."
     cd "$REPO_DIR/crates/ui"
     nohup env RUSTC_WRAPPER="" CARGO_INCREMENTAL=0 ~/.cargo/bin/dx serve --platform web --port 8080 >"$LOGDIR/web.log" 2>&1 &
@@ -108,30 +128,53 @@ stop_web() {
 status() {
     echo "=== Scrabble PX Services Status ==="
     echo ""
-    if is_server_running; then
+
+    local server_tracked=false web_tracked=false
+    is_server_running && server_tracked=true
+    is_web_running && web_tracked=true
+    local server_up=false web_up=false
+    backend_reachable && server_up=true
+    web_reachable && web_up=true
+
+    if $server_tracked; then
         echo "✓ Backend server: running (PID $(cat "$PIDFILE_SERVER"))"
+    elif $server_up; then
+        echo "⚠ Backend server: responding on :3000, but not a process this script started"
+        echo "  (stale/missing PID file — 'stop'/'restart-server' won't manage it as-is)"
     else
         echo "✗ Backend server: not running"
     fi
     echo "  Endpoint: http://127.0.0.1:3000"
     echo "  Log: $LOGDIR/server.log"
     echo ""
-    if is_web_running; then
+
+    if $web_tracked; then
         echo "✓ Web dev server: running (PID $(cat "$PIDFILE_WEB"))"
+    elif $web_up; then
+        echo "⚠ Web dev server: responding on :8080, but not a process this script started"
+        echo "  (stale/missing PID file — 'stop'/'restart-web' won't manage it as-is)"
     else
         echo "✗ Web dev server: not running"
     fi
     echo "  URL: http://127.0.0.1:8080"
     echo "  Log: $LOGDIR/web.log"
     echo ""
-    
+
     # Suggest restart if one service is down but the other is up
-    if is_server_running && ! is_web_running; then
+    if $server_tracked && ! $web_tracked && ! $web_up; then
         echo "💡 Suggestion: Restart web dev server without stopping backend"
         echo "   Run: $0 restart-web"
-    elif is_web_running && ! is_server_running; then
+    elif $web_tracked && ! $server_tracked && ! $server_up; then
         echo "💡 Suggestion: Restart backend server without stopping web"
         echo "   Run: $0 restart-server"
+    fi
+    if $server_up && ! $server_tracked; then
+        echo "💡 Suggestion: bring the backend under this script's management"
+        echo "   Run: $0 restart-server   # kills whatever's on :3000, starts a tracked one"
+    fi
+    if $web_up && ! $web_tracked; then
+        echo "💡 Suggestion: bring the web dev server under this script's management"
+        echo "   Run: $0 restart-web"
     fi
 }
 
