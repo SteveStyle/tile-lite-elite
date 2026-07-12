@@ -82,6 +82,67 @@ Backend (port 3000)   ←→   Web UI (port 8080, WASM in browser)
 The backend owns all game state, rule enforcement, scoring, and persistence.
 Clients are thin presentation layers that call the server API.
 
+## Environments
+
+Two genuinely different places this project runs, easy to conflate since some of the same commands (`docker compose ...`) work in both:
+
+### Local dev machine
+
+Where you write code, run tests, and build the images that get deployed. Has the full source tree; nothing here is what's actually serving live traffic.
+
+**Components**: Rust toolchain + workspace crates, Docker Engine (used here only to *build* images and optionally run the stack for local testing — see [Container Deployment](#container-deployment) — not to serve real traffic), the git clone itself (pushed to/pulled from GitHub).
+
+**Directory structure** (repo root, `~/scrabble-px` in this WSL setup):
+
+```
+scrabble-px/
+├── crates/                  # the six workspace crates
+│   ├── api/                 # shared request/response DTOs
+│   ├── rules-shared/        # pure rules/scoring/move-generation
+│   ├── engine-core/         # ScrabbleEngine trait + GreedyEngine
+│   ├── server-game/         # Axum backend
+│   ├── ui/                  # Dioxus web/desktop client
+│   └── admin-cli/           # scrabble-admin operator CLI
+├── old-crates/              # early prototypes, kept for design precedent only
+├── docs/                    # this file and other design docs
+├── scripts/                 # admin.sh, deploy.sh, services.sh, setup-dev-environment.sh, desktop.sh
+├── data/                    # local dev SQLite file (SCRABBLE_PX_DATABASE_URL's default)
+├── target/                  # cargo build output (gitignored)
+├── .cargo/config.toml       # sccache + wasm rustflags (see Known Build Issues)
+├── Dockerfile, docker-compose.yml, Caddyfile, .dockerignore
+└── Cargo.toml                # workspace manifest
+```
+
+### Oracle Cloud VM (production)
+
+Where the live deployment actually runs. **Does not have the source tree at all** — no git clone, no `crates/`, nothing to build. Just the compose file and whatever Docker itself stores (images, volumes) — `scripts/deploy.sh` builds everything locally and ships only the finished images plus `docker-compose.yml` over.
+
+**Components**: Docker Engine only. Two running containers (`scrabble-px-server-1`, `scrabble-px-web-1`) and three named volumes (`scrabble-px_scrabble-data`, `scrabble-px_caddy-data`, `scrabble-px_caddy-config`) — see [Container Deployment](#container-deployment) for what each holds.
+
+**Directory structure** (`~/scrabble-px` on the VM — same path as local, different machine, don't let that imply it's the same *kind* of directory):
+
+```
+~/scrabble-px/
+└── docker-compose.yml       # the only file that lives here
+```
+
+That's genuinely everything on disk outside of Docker's own storage. What's *inside* the containers (via `docker compose exec <service> ls ...`):
+
+```
+server container:
+├── /usr/local/bin/
+│   ├── server-game          # the release binary actually running
+│   └── scrabble-admin       # copied in but not running — invoked on demand via `docker compose exec`
+└── /data/                   # the scrabble-data volume
+    └── scrabble-px.sqlite3
+
+web container:
+├── /srv/                    # the built web client (index.html, assets/, wasm/) — served as static files
+├── /etc/caddy/Caddyfile     # baked into the image at build time, not a volume
+├── /data/caddy/             # the caddy-data volume — obtained TLS certificates live here
+└── /config/caddy/           # the caddy-config volume — Caddy's own runtime state
+```
+
 ## Starting Services
 
 ### Using Scripts (Recommended)
