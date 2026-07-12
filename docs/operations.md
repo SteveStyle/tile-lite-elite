@@ -38,12 +38,37 @@ View logs while running:
 ./scripts/services.sh logs
 ```
 
-## Prerequisites
+## Development Environment Setup
 
-- Rust stable toolchain (`rustup install stable`)
-- `wasm32-unknown-unknown` target (`rustup target add wasm32-unknown-unknown`)
-- Dioxus CLI (`cargo install dioxus-cli`)
-- wasm-bindgen CLI matching `Cargo.lock` (`cargo install wasm-bindgen-cli --version 0.2.103`)
+The dev machine (currently WSL2 Ubuntu, treated as disposable/recreatable — see below) needs: a Rust toolchain, the `wasm32-unknown-unknown` target, `dioxus-cli` and `wasm-bindgen-cli` at versions that match this project exactly (a mismatch fails confusingly rather than cleanly — see "Known Build Issues" below), `sccache`, and Docker Engine (for [Container Deployment](#container-deployment)).
+
+```bash
+git clone https://github.com/SteveStyle/scrabble-px.git
+cd scrabble-px
+./scripts/setup-dev-environment.sh
+```
+
+The script is idempotent (safe to re-run; every step checks whether it's already done first) and reads the required `wasm-bindgen-cli` version out of `Cargo.lock` itself rather than hardcoding it, so it won't silently go stale as dependencies update.
+
+**Two things it deliberately doesn't do**, both manual:
+
+1. **Restore the Oracle deploy SSH key.** It's a secret, not something a setup script should generate or fetch on its own. Copy `~/.ssh/oracle_scrabble` (private) and `.pub` back in from wherever you backed them up (this project's key is also kept on the Windows side, outside WSL, for exactly this recreate-the-VM-is-fine-the-key-survives scenario).
+2. **Enable systemd in WSL**, if this is a fresh WSL instance and it's not already on. Docker needs it to manage its service. This is a Windows-side edit, not something a script running inside the distro can safely do to itself:
+   ```
+   # /etc/wsl.conf
+   [boot]
+   systemd=true
+   ```
+   then from Windows PowerShell: `wsl --shutdown`, and restart the shell. The setup script checks for this and warns if it's missing rather than failing silently later.
+
+**Verify the result**:
+
+```bash
+cargo test --workspace
+dx --version                 # should include 0.6.3
+docker compose version
+ssh -i ~/.ssh/oracle_scrabble ubuntu@129.151.69.246 echo ok
+```
 
 ## Architecture
 
