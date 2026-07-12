@@ -2,7 +2,7 @@
 
 ## Summary
 
-The project has successfully implemented the core MVP architecture: a server-authoritative Scrabble game system with a shared rules library, an engine plugin interface, multiple client types (web, desktop), a full invitation/matchmaking model, per-game move-time limits, and a real production deployment (Docker + Caddy + automatic HTTPS, running on Oracle Cloud). All fundamental boundaries from the architecture doc are in place and working; most of what's left is optional/v1 scope (forgot-password, structured logging, multiple engines) rather than gaps in the core loop.
+The project has successfully implemented the core MVP architecture: a server-authoritative Scrabble game system with a shared rules library, an engine plugin interface, multiple client types (web, desktop), a full invitation/matchmaking model, per-game move-time limits, structured logging, and a real production deployment (Docker + Caddy + automatic HTTPS, running on Oracle Cloud). All fundamental boundaries from the architecture doc are in place and working; most of what's left is optional/v1 scope (forgot-password, multiple engines) rather than gaps in the core loop.
 
 ## Architecture Alignment
 
@@ -230,7 +230,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 | Admin tooling | Implemented | `scrabble-admin` CLI + `/admin/*` endpoints |
 | Client resilience to outages | Implemented | Connection-status tracking, background reconnect/reload, self-healing WebSocket |
 | Container deployment | Implemented and live | See the "Deployment" entry in Architecture Alignment above |
-| Structured logging | Not implemented | Still `eprintln!`-based; no request tracing, no engine-decision diagnostics |
+| Structured logging | Implemented | `tracing` + `tracing-subscriber`, configurable via `RUST_LOG` (see `docs/operations.md`'s "Logging" section). App-level events (auth, game lifecycle, invitations, admin actions, move-time-limit retirement) at `info`/`warn`; per-HTTP-request spans via `tower-http`'s `TraceLayer` at `debug`. Engine-decision diagnostics (why an engine chose a move) still don't exist — only that it timed out |
 
 ### ⚠️ Partially Implemented
 
@@ -300,8 +300,8 @@ The project has successfully implemented the core MVP architecture: a server-aut
    - Still missing: a test that forces the engine timeout branch, direct testing of the WebSocket events path itself (covered indirectly via live verification, not an automated test)
 
 3. **Observability**
-   - No structured logging
-   - Engine decisions not logged (would help debugging)
+   - Structured logging via `tracing` now covers auth, game lifecycle, invitations, admin actions, and move-time-limit retirement (see `docs/operations.md`)
+   - Still missing: engine decisions aren't logged (only that an engine timed out, not what it considered or why it picked a move)
    - Performance metrics not tracked (though the move-generation performance fix was measured directly via `examples/repro_lexicon.rs`, not guessed at)
 
 4. **Client-side validation**
@@ -348,10 +348,11 @@ Status: **Core loop solid, player identity and matchmaking real (not just schema
 - Client survives server/network outages
 - Admin CLI for operating the server (users, games), including inside the container deployment
 - Container deployment: Docker + Caddy reverse proxy + automatic HTTPS, live on Oracle Cloud, with a scripted redeploy path
+- Structured logging via `tracing`, configurable verbosity (`RUST_LOG`), covering auth/game-lifecycle/invitations/admin actions plus per-request HTTP tracing
 
 ❌ Not Yet:
-- Forgot-password / email verification flows (change-password for a logged-in user now exists; this is the "locked out entirely" case)
-- Structured logging / engine decision diagnostics
+- Forgot-password / email verification flows (change-password for a logged-in user now exists; this is the "locked out entirely" case) — blocked on choosing and setting up an email-sending path (a transactional email API needs a verified domain to send to arbitrary recipients, which the current sslip.io-based deployment doesn't have)
+- Engine decision diagnostics (why an engine chose a move, not just that it timed out)
 - Multiple engine implementations, engine benchmarking CLI
 - Client-side move pre-validation
 - A repeatable (CI or registry-based) deploy pipeline — currently a manual script
@@ -361,8 +362,7 @@ Status: **Core loop solid, player identity and matchmaking real (not just schema
 Expected next focus:
 - Multiple engine implementations, using `examples/repro_lexicon.rs` as a shared benchmark harness
 - Engine benchmarking CLI
-- Forgot-password flow
-- Structured logging
+- Forgot-password flow (once a domain is registered — needed for transactional email delivery)
 - Full move validation test suite
 - Client-side preview validation
 
@@ -370,4 +370,4 @@ Expected next focus:
 
 ## Conclusion
 
-The architecture plan is **well-executed and now genuinely deployed**, not just running locally. The codebase correctly separates concerns, uses the right technologies (Rust, Axum, Dioxus, SQLite, Caddy), and has the foundation to support all documented features. Both clients work end-to-end today, including a real login/register/change-password flow, seat-ownership protection on every action, and a full invitation-based matchmaking model. The live deployment on Oracle Cloud, behind automatic HTTPS, closes out what was previously a purely local/dev-only project. The main remaining gaps are the parts of auth not yet covered (forgot-password), observability (structured logging), and optional/v1 features (multiple engines, engine benchmarking, a less manual deploy pipeline).
+The architecture plan is **well-executed and now genuinely deployed**, not just running locally. The codebase correctly separates concerns, uses the right technologies (Rust, Axum, Dioxus, SQLite, Caddy), and has the foundation to support all documented features. Both clients work end-to-end today, including a real login/register/change-password flow, seat-ownership protection on every action, and a full invitation-based matchmaking model. The live deployment on Oracle Cloud, behind automatic HTTPS, closes out what was previously a purely local/dev-only project, and structured logging closes out what was previously the last major observability gap. The main remaining items are the part of auth not yet covered (forgot-password, blocked on registering a domain for transactional email), and optional/v1 features (multiple engines, engine benchmarking, a less manual deploy pipeline).

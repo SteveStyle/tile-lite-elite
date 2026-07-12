@@ -20,6 +20,7 @@ use axum::{Json, Router};
 use sqlx::{Pool, Sqlite};
 use tokio::sync::{RwLock, broadcast};
 use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::game_state::{
@@ -110,6 +111,12 @@ pub fn build_router(state: AppState) -> Router {
         )
         .merge(admin_routes)
         .layer(CorsLayer::permissive())
+        // One INFO-level span per request (method, path, status, latency)
+        // with no per-handler code — this alone covers "what happened and
+        // when" for the whole HTTP surface; the tracing calls sprinkled
+        // through individual handlers below are for the *why* on top of it
+        // (which player, which game, why a request was rejected).
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -321,6 +328,14 @@ async fn create_game(
         .map_err(ApiProblem::from_sqlx)?;
     }
 
+    tracing::info!(
+        game_id = %game.id,
+        creator_player_id = %creator_player_id,
+        seats = game.participants.len(),
+        move_time_limit_seconds,
+        "game created"
+    );
+
     state.games.write().await.insert(game.id.clone(), game);
     Ok(Json(dto))
 }
@@ -391,6 +406,8 @@ async fn start_game(
         dto
     };
 
+    tracing::info!(game_id = %dto.id, status = ?dto.status, "game started");
+
     let _ = state
         .events
         .send(GameEventDto::GameStarted { game: dto.clone() });
@@ -458,6 +475,7 @@ async fn submit_action(
     };
 
     let event = if dto.status == api::GameStatus::Finished {
+        tracing::info!(game_id = %dto.id, winner_seat = ?dto.winner_seat, "game finished");
         GameEventDto::GameFinished { game: dto.clone() }
     } else {
         GameEventDto::StateUpdated { game: dto.clone() }
@@ -618,6 +636,7 @@ async fn suggest_move(
     };
 
     let event = if dto.status == api::GameStatus::Finished {
+        tracing::info!(game_id = %dto.id, winner_seat = ?dto.winner_seat, "game finished");
         GameEventDto::GameFinished { game: dto.clone() }
     } else {
         GameEventDto::StateUpdated { game: dto.clone() }
@@ -712,6 +731,8 @@ async fn register_player(
     .await
     .map_err(ApiProblem::from_sqlx)?;
 
+    tracing::info!(player_id, display_name, "player registered");
+
     Ok(Json(PlayerSessionDto {
         player_id,
         session_token,
@@ -726,17 +747,26 @@ async fn login_player(
 ) -> Result<Json<PlayerSessionDto>, ApiProblem> {
     // The same error is returned whether the name doesn't exist or the
     // password is wrong, so a caller can't use this endpoint to discover
-    // which display names are registered.
-    let mismatch = || ApiProblem::bad_request("Incorrect name or password");
+    // which display names are registered. Logging the attempted name
+    // server-side (never the password) doesn't weaken that — it's only
+    // visible to whoever can already read the server's own logs, and gives
+    // an audit trail for spotting repeated failed attempts.
+    let display_name = request.display_name.trim().to_string();
+    let mismatch = |reason: &'static str| {
+        tracing::warn!(display_name = %display_name, reason, "login rejected");
+        ApiProblem::bad_request("Incorrect name or password")
+    };
 
-    let player = persistence::get_player_by_name(&state.db, request.display_name.trim())
+    let player = persistence::get_player_by_name(&state.db, &display_name)
         .await
         .map_err(ApiProblem::from_sqlx)?
-        .ok_or_else(mismatch)?;
+        .ok_or_else(|| mismatch("unknown display name"))?;
 
     if !verify_password(&request.password, &player.password_hash) {
-        return Err(mismatch());
+        return Err(mismatch("wrong password"));
     }
+
+    tracing::info!(player_id = %player.id, display_name = %display_name, "player logged in");
 
     let session_token = Uuid::new_v4().to_string();
     persistence::create_session(
@@ -804,6 +834,7 @@ async fn change_password(
     // the password is what makes this a deliberate account action rather
     // than something a stolen token alone can do.
     if !verify_password(&request.current_password, &player.password_hash) {
+        tracing::warn!(player_id, "password change rejected: wrong current password");
         return Err(ApiProblem::bad_request("Current password is incorrect"));
     }
 
@@ -820,6 +851,8 @@ async fn change_password(
     persistence::invalidate_sessions_for_player(&state.db, &player_id)
         .await
         .map_err(ApiProblem::from_sqlx)?;
+
+    tracing::info!(player_id, "password changed; all sessions invalidated");
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -905,6 +938,14 @@ async fn invite_player_to_game(
     )
     .await
     .map_err(ApiProblem::from_sqlx)?;
+
+    tracing::info!(
+        game_id,
+        invitation_id,
+        seat_number = request.seat_number,
+        invited_player_id = record.invited_player_id.as_deref(),
+        "invitation created"
+    );
 
     Ok(Json(GameInvitationDto {
         id: record.id,
@@ -1003,6 +1044,14 @@ async fn accept_invitation(
         dto
     };
 
+    tracing::info!(
+        invitation_id,
+        game_id = %record.game_id,
+        seat_number = record.seat_number,
+        player_id = %caller_player_id,
+        "invitation accepted; seat claimed"
+    );
+
     let _ = state.events.send(GameEventDto::StateUpdated { game: dto.clone() });
     Ok(Json(dto))
 }
@@ -1037,6 +1086,8 @@ async fn reject_invitation(
     persistence::update_invitation_status(&state.db, &invitation_id, "rejected")
         .await
         .map_err(ApiProblem::from_sqlx)?;
+
+    tracing::info!(invitation_id, player_id = %caller_player_id, "invitation rejected");
 
     Ok(Json(serde_json::json!({
         "status": "rejected"
@@ -1156,8 +1207,9 @@ async fn expire_overdue_turns(state: &AppState) {
         let mut games = state.games.write().await;
         for game in games.values_mut() {
             if game.apply_move_timeout() {
+                tracing::info!(game_id = %game.id, seat = game.current_seat, "seat auto-retired for exceeding the move time limit");
                 if let Err(error) = persistence::save_game(&state.db, game).await {
-                    eprintln!("failed to persist timeout retirement for game {}: {error}", game.id);
+                    tracing::error!(game_id = %game.id, %error, "failed to persist timeout retirement");
                 }
                 finished.push(game.to_dto());
             }
@@ -1179,8 +1231,9 @@ async fn expire_overdue_turn(state: &AppState, game_id: &str) {
         if !game.apply_move_timeout() {
             return;
         }
+        tracing::info!(game_id, seat = game.current_seat, "seat auto-retired for exceeding the move time limit");
         if let Err(error) = persistence::save_game(&state.db, game).await {
-            eprintln!("failed to persist timeout retirement for game {game_id}: {error}");
+            tracing::error!(game_id, %error, "failed to persist timeout retirement");
         }
         game.to_dto()
     };
@@ -1232,6 +1285,7 @@ async fn admin_delete_user(
             }
         }
     }
+    tracing::warn!(player_id, "admin: user deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1251,6 +1305,7 @@ async fn admin_reset_password(
     if !updated {
         return Err(ApiProblem::not_found("Player not found"));
     }
+    tracing::warn!(player_id, "admin: password reset");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1344,6 +1399,7 @@ async fn admin_delete_game(
         return Err(ApiProblem::not_found("Game not found"));
     }
     state.games.write().await.remove(&game_id);
+    tracing::warn!(game_id, "admin: game deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1367,6 +1423,7 @@ async fn admin_force_end_game(
             .map_err(ApiProblem::from_sqlx)?;
         dto
     };
+    tracing::warn!(game_id, "admin: game force-ended");
     let _ = state.events.send(GameEventDto::GameFinished { game: dto.clone() });
     Ok(Json(dto))
 }

@@ -189,6 +189,26 @@ No test coverage for `admin-cli` (it's a thin HTTP client with no logic of its o
 | `SCRABBLE_PX_DATABASE_URL` | `sqlite://data/scrabble-px.sqlite3` | SQLite database path |
 | `SCRABBLE_PX_API_BASE_URL` | `http://127.0.0.1:3000` | Backend URL used by clients. Set at *build* time (`option_env!`), not runtime. An explicit empty string means "same origin as the page" — see [Container Deployment](#container-deployment) |
 | `SCRABBLE_UI_PORT` | `8080` | Web dev server port |
+| `RUST_LOG` | `server_game=info,tower_http=info,warn` | Log verbosity for `server-game`. See [Logging](#logging) |
+
+## Logging
+
+`server-game` uses `tracing`, not `eprintln!`. Application-level events (registration, login success/failure, game created/started/finished, invitations, admin actions, move-time-limit retirement) log at `info` by default; per-HTTP-request spans (method, path, status, latency) from `tower-http`'s `TraceLayer` log at `debug` and are off by default to keep normal output readable.
+
+```bash
+# Default verbosity — app events, no per-request noise
+cargo run -p server-game
+
+# See per-request HTTP tracing too
+RUST_LOG=server_game=info,tower_http=debug cargo run -p server-game
+
+# Everything, very verbose
+RUST_LOG=debug cargo run -p server-game
+```
+
+Failed logins log the attempted display name (never the password) at `warn`, along with the reason (unknown name vs. wrong password) — visible only to whoever can read the server's own logs, so it doesn't weaken the login endpoint's existing anti-enumeration behavior (the client always gets the same generic error either way). Admin actions (`admin_delete_user`, `admin_reset_password`, `admin_delete_game`, `admin_force_end_game`) log at `warn` specifically so they stand out as an audit trail even at default verbosity.
+
+In the container deployment, this all goes to `docker compose logs server` (or `-f` to follow); `RUST_LOG` can be set as an extra `environment:` entry in `docker-compose.yml`'s `server` service if you need more/less than the default.
 
 ## Resetting the Database
 

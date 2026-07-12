@@ -470,9 +470,12 @@ impl GameSession {
                 ));
             }
             Err(_elapsed) => {
-                eprintln!(
-                    "engine '{engine_id}' exceeded {}ms budget on seat {seat_number}; auto-passing",
-                    engine_timeout.as_millis()
+                tracing::warn!(
+                    game_id = %self.id,
+                    engine_id,
+                    seat_number,
+                    budget_ms = engine_timeout.as_millis() as u64,
+                    "engine exceeded its move budget; auto-passing"
                 );
                 self.apply_pass(seat_number)?;
                 return Ok(true);
