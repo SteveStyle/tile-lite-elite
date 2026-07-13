@@ -12,6 +12,8 @@ pub fn BoardView(
     selected_cell: Option<usize>,
     on_drop_tile: EventHandler<usize>,
     on_remove_staged: EventHandler<usize>,
+    on_drag_staged_tile: EventHandler<usize>,
+    on_drag_end_staged_tile: EventHandler<usize>,
     on_select_cell: EventHandler<usize>,
 ) -> Element {
     let cells = board.iter().enumerate().map(|(index, cell)| {
@@ -24,6 +26,11 @@ pub fn BoardView(
         let is_selectable = can_stage_moves && !has_letter;
         let is_selected = selected_cell == Some(index);
         let is_last_move = has_letter && last_move_cells.contains(&index);
+        // A staged tile can be picked back up and moved to another cell,
+        // or dragged off the board entirely to return it to the rack (see
+        // on_drag_end_staged_tile) — same turn-taking gate as a fresh drag
+        // from the rack.
+        let staged_draggable = is_staged && can_stage_moves;
 
         let mut class_name = if has_letter {
             format!(
@@ -57,6 +64,7 @@ pub fn BoardView(
             div {
                 key: "{index}",
                 class: "{class_name}",
+                draggable: "{staged_draggable}",
                 ondragover: move |event| {
                     if can_drop {
                         event.prevent_default();
@@ -66,6 +74,16 @@ pub fn BoardView(
                     event.prevent_default();
                     if can_drop {
                         on_drop_tile.call(index);
+                    }
+                },
+                ondragstart: move |_| {
+                    if staged_draggable {
+                        on_drag_staged_tile.call(index);
+                    }
+                },
+                ondragend: move |_| {
+                    if staged_draggable {
+                        on_drag_end_staged_tile.call(index);
                     }
                 },
                 onclick: move |_| {

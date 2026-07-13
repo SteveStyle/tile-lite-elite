@@ -107,6 +107,12 @@ pub fn RootApp() -> Element {
     let mut bootstrapped = use_signal(|| false);
     let mut websocket_game_id = use_signal(|| None::<String>);
     let mut dragging_tile_id = use_signal(|| None::<usize>);
+    // `Some(index)` while dragging a tile that was already staged on the
+    // board (picked up from that index), rather than a fresh one off the
+    // rack — lets the drop handler tell "move" from "place" apart, and
+    // lets on_drag_end return the tile to the rack when it isn't dropped
+    // on another valid board cell (including off the board entirely).
+    let mut dragging_from_board_index = use_signal(|| None::<usize>);
     let mut staged_placements = use_signal(Vec::<StagedPlacementView>::new);
     let mut selected_blank_letter = use_signal(|| None::<char>);
     let mut selected_cell = use_signal(|| None::<usize>);
@@ -570,9 +576,33 @@ pub fn RootApp() -> Element {
                     selected_cell: selected_cell(),
                     on_drag_rack_tile: move |tile_id| {
                         dragging_tile_id.set(Some(tile_id));
+                        dragging_from_board_index.set(None);
                     },
                     on_drag_end_rack_tile: move |_| {
                         dragging_tile_id.set(None);
+                    },
+                    on_drag_staged_tile: move |board_index: usize| {
+                        let tile_id = staged_placements()
+                            .iter()
+                            .find(|p| p.board_index == board_index)
+                            .map(|p| p.rack_tile_id);
+                        let Some(tile_id) = tile_id else { return };
+                        dragging_tile_id.set(Some(tile_id));
+                        dragging_from_board_index.set(Some(board_index));
+                    },
+                    on_drag_end_staged_tile: move |board_index: usize| {
+                        // Fires whether or not the drop landed anywhere —
+                        // if this same origin is still recorded, nothing
+                        // claimed it (dropped off the board, or on an
+                        // invalid cell), so it goes back to the rack. A
+                        // successful move to another cell already clears
+                        // this before drag-end fires.
+                        if dragging_from_board_index() == Some(board_index) {
+                            staged_placements
+                                .with_mut(|placements| placements.retain(|p| p.board_index != board_index));
+                            dragging_tile_id.set(None);
+                            dragging_from_board_index.set(None);
+                        }
                     },
                     on_drop_board_cell: move |board_index| {
                         if !can_submit_human_action || exchange_mode() {
@@ -594,6 +624,28 @@ pub fn RootApp() -> Element {
                         let Some(tile_id) = dragging_tile_id() else {
                             return;
                         };
+                        if let Some(old_index) = dragging_from_board_index() {
+                            // Moving an already-staged tile: carry over its
+                            // existing display/tile (a resolved blank keeps
+                            // its chosen letter) rather than re-deriving a
+                            // fresh, unresolved one from the rack.
+                            let existing = staged_placements()
+                                .iter()
+                                .find(|p| p.board_index == old_index && p.rack_tile_id == tile_id)
+                                .cloned();
+                            if let Some(existing) = existing {
+                                staged_placements.with_mut(|placements| {
+                                    placements.retain(|p| p.board_index != old_index);
+                                    placements.push(StagedPlacementView {
+                                        board_index,
+                                        ..existing
+                                    });
+                                });
+                            }
+                            dragging_tile_id.set(None);
+                            dragging_from_board_index.set(None);
+                            return;
+                        }
                         let Some(tile) = current_rack_tiles(&game_for_drop, &staged_placements())
                             .into_iter()
                             .find(|t| t.id == tile_id)

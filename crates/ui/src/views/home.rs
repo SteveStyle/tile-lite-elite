@@ -22,6 +22,8 @@ pub fn Home(
     selected_cell: Option<usize>,
     on_drag_rack_tile: EventHandler<usize>,
     on_drag_end_rack_tile: EventHandler<()>,
+    on_drag_staged_tile: EventHandler<usize>,
+    on_drag_end_staged_tile: EventHandler<usize>,
     on_drop_board_cell: EventHandler<usize>,
     on_select_cell: EventHandler<usize>,
     on_click_rack_tile: EventHandler<usize>,
@@ -145,6 +147,8 @@ pub fn Home(
                     selected_cell,
                     on_drop_tile: on_drop_board_cell,
                     on_remove_staged,
+                    on_drag_staged_tile,
+                    on_drag_end_staged_tile,
                     on_select_cell: move |index| {
                         if let Some(handle) = keyboard_focus() {
                             spawn(async move {
