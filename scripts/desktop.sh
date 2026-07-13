@@ -3,19 +3,25 @@ set -euo pipefail
 
 # desktop.sh — Launch a desktop client instance
 # Usage:
-#   ./scripts/desktop.sh [server_url]
-# 
-# Default server_url: http://127.0.0.1:3000
-# 
+#   ./scripts/desktop.sh                       # compiled-in default (see crates/ui/src/config.rs)
+#   ./scripts/desktop.sh <server_url>           # shorthand for --server-url <url>
+#   ./scripts/desktop.sh --server-url <url>     # connect to an exact URL
+#   ./scripts/desktop.sh --env <name>           # connect to a named environment (e.g. local, prod)
+#
 # The desktop client is a native window app that connects to the backend.
 # It can be launched multiple times for multiple players.
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-SERVER_URL="${1:-http://127.0.0.1:3000}"
-
-echo "Launching desktop client..."
-echo "Server: $SERVER_URL"
-echo ""
-
 cd "$REPO_DIR"
-SCRABBLE_PX_API_BASE_URL="$SERVER_URL" cargo run -p scrabble-ui --features desktop
+
+if [[ $# -eq 0 ]]; then
+    echo "Launching desktop client (compiled-in default server)..."
+    cargo run -p scrabble-ui --features desktop
+elif [[ "$1" == --* ]]; then
+    echo "Launching desktop client..."
+    cargo run -p scrabble-ui --features desktop -- "$@"
+else
+    echo "Launching desktop client..."
+    echo "Server: $1"
+    cargo run -p scrabble-ui --features desktop -- --server-url "$1"
+fi

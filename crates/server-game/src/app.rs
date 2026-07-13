@@ -128,8 +128,11 @@ async fn require_loopback(ConnectInfo(addr): ConnectInfo<SocketAddr>, request: R
     next.run(request).await
 }
 
-async fn health() -> &'static str {
-    "ok"
+async fn health() -> Json<api::HealthDto> {
+    Json(api::HealthDto {
+        status: "ok".to_string(),
+        api_version: api::API_VERSION,
+    })
 }
 
 async fn list_engines(State(state): State<AppState>) -> Json<Vec<api::EngineProfileDto>> {

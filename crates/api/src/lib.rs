@@ -1,5 +1,39 @@
 use serde::{Deserialize, Serialize};
 
+/// The API contract version this build implements. Both server and client
+/// binaries embed whatever this constant was at *their own* build time, so
+/// comparing a client's compiled-in value against what a server reports at
+/// `/health` detects real drift (e.g. a desktop client that predates a
+/// breaking server change) rather than just tautologically matching itself.
+///
+/// Bump `major` for a breaking change to routes/DTOs (old clients can't be
+/// trusted to work — should be treated as incompatible), `minor` for an
+/// additive/non-breaking one (old clients still work, just without whatever
+/// the change added). There's deliberately no patch/build component here:
+/// those never change the wire contract, so including them would make the
+/// compatibility check fire on every routine bugfix deploy. Release/build
+/// numbering for display purposes is a separate concern — see each
+/// binary's own `app_version()`.
+pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 0 };
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiVersion {
+    pub major: u32,
+    pub minor: u32,
+}
+
+impl std::fmt::Display for ApiVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.major, self.minor)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthDto {
+    pub status: String,
+    pub api_version: ApiVersion,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SeatKind {

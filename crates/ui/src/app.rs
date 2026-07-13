@@ -80,15 +80,22 @@ pub struct MovePreviewView {
 
 #[component]
 pub fn RootApp() -> Element {
-    // Set (even to an empty string) at build time — empty means "same
+    // Web: set (even to an empty string) at build time — empty means "same
     // origin as whatever page this was served from" (see `websocket_url`),
     // used by the container deployment where a reverse proxy serves both
     // the static build and the API from one host. Unset (the default for
     // local dev, where `dx serve`'s web client and the backend run as two
     // separate origins) falls back to the explicit dev address.
+    #[cfg(target_arch = "wasm32")]
     let server_url = option_env!("SCRABBLE_PX_API_BASE_URL")
         .map(str::to_string)
         .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
+
+    // Desktop has no browser origin to derive from, so it resolves from
+    // `crate::config` instead: a compiled-in default environment, with a
+    // `--server-url`/`--env` CLI override (see `main.rs` and `config.rs`).
+    #[cfg(not(target_arch = "wasm32"))]
+    let server_url = crate::config::server_url();
     let mut game = use_signal(|| None::<GameStateDto>);
     let mut game_summaries = use_signal(Vec::<api::GameSummaryDto>::new);
     let mut session = use_signal(|| None::<api::PlayerSessionDto>);
@@ -108,6 +115,21 @@ pub fn RootApp() -> Element {
         bootstrapped.set(true);
         let server_url = server_url.clone();
         spawn(async move {
+            match check_api_version(&server_url).await {
+                VersionCheck::Compatible | VersionCheck::Unreachable => {}
+                VersionCheck::MinorMismatch { server, client } => {
+                    info_message.set(Some(format!(
+                        "Server API v{server} differs from this client's v{client} (non-breaking) — some features may be unavailable until you update."
+                    )));
+                }
+                VersionCheck::MajorMismatch { server, client } => {
+                    error_message.set(Some(format!(
+                        "This client (API v{client}) is incompatible with the server (API v{server}). Please update the app before continuing."
+                    )));
+                    return;
+                }
+            }
+
             let stored = crate::local_storage::load();
             let mut auth_token: Option<String> = None;
             if let Some(token) = stored.session_token.clone() {
@@ -1033,6 +1055,47 @@ async fn check_server_reachable(server_url: &str) -> bool {
         .send()
         .await
         .is_ok()
+}
+
+/// Result of comparing this client's compiled-in `api::API_VERSION`
+/// against what the server reported at `/health` on first connect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionCheck {
+    Compatible,
+    /// Non-breaking drift — old client still works, just without whatever
+    /// the newer/older side added. Worth a soft, non-blocking notice.
+    MinorMismatch {
+        server: api::ApiVersion,
+        client: api::ApiVersion,
+    },
+    /// Breaking drift — this client build can't be trusted to talk to this
+    /// server correctly. Should block further use, not just warn.
+    MajorMismatch {
+        server: api::ApiVersion,
+        client: api::ApiVersion,
+    },
+    /// `/health` didn't answer at all — not a version problem, the normal
+    /// offline/reachability handling elsewhere in bootstrap covers it.
+    Unreachable,
+}
+
+fn compare_api_version(server: api::ApiVersion, client: api::ApiVersion) -> VersionCheck {
+    if server.major != client.major {
+        VersionCheck::MajorMismatch { server, client }
+    } else if server.minor != client.minor {
+        VersionCheck::MinorMismatch { server, client }
+    } else {
+        VersionCheck::Compatible
+    }
+}
+
+/// Checked once, at the start of bootstrap, before anything else talks to
+/// the server — see the call site in `RootApp`.
+async fn check_api_version(server_url: &str) -> VersionCheck {
+    match get_json::<api::HealthDto>(&format!("{server_url}/health")).await {
+        Ok(health) => compare_api_version(health.api_version, api::API_VERSION),
+        Err(_) => VersionCheck::Unreachable,
+    }
 }
 
 /// Loads the games list and a target game (a specific id if given, else the
@@ -1977,6 +2040,32 @@ mod tests {
         // so this just confirms the fallback doesn't panic — same-origin
         // resolution itself is only meaningful in a browser.
         assert!(websocket_url("", "game-1").is_err());
+    }
+
+    #[test]
+    fn matching_version_is_compatible() {
+        let v = api::ApiVersion { major: 1, minor: 2 };
+        assert_eq!(compare_api_version(v, v), VersionCheck::Compatible);
+    }
+
+    #[test]
+    fn differing_major_is_a_hard_mismatch() {
+        let server = api::ApiVersion { major: 2, minor: 0 };
+        let client = api::ApiVersion { major: 1, minor: 0 };
+        assert_eq!(
+            compare_api_version(server, client),
+            VersionCheck::MajorMismatch { server, client }
+        );
+    }
+
+    #[test]
+    fn differing_minor_with_matching_major_is_a_soft_mismatch() {
+        let server = api::ApiVersion { major: 1, minor: 3 };
+        let client = api::ApiVersion { major: 1, minor: 1 };
+        assert_eq!(
+            compare_api_version(server, client),
+            VersionCheck::MinorMismatch { server, client }
+        );
     }
 
     #[test]

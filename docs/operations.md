@@ -263,6 +263,43 @@ No test coverage for `admin-cli` (it's a thin HTTP client with no logic of its o
 | `SCRABBLE_PX_API_BASE_URL` | `http://127.0.0.1:3000` | Backend URL used by clients. Set at *build* time (`option_env!`), not runtime. An explicit empty string means "same origin as the page" — see [Container Deployment](#container-deployment) |
 | `SCRABBLE_UI_PORT` | `8080` | Web dev server port |
 | `RUST_LOG` | `server_game=info,tower_http=info,warn` | Log verbosity for `server-game`. See [Logging](#logging) |
+| `SCRABBLE_PX_BUILD_ID` | unset | Optional build identifier baked in at *build* time (`option_env!`), appended as SemVer build metadata to the app version (e.g. `0.1.0+a1c9f02`). Unset (the default, used for production releases) shows only `Major.Minor.Patch`. See [Versioning](#versioning) |
+
+## Versioning
+
+Two independent version numbers, on purpose — see the doc comments on
+`api::API_VERSION` and each binary's `app_version()` (in `server-game`'s
+and `scrabble-ui`'s `main.rs`) for the full rationale.
+
+**API contract version** (`Major.Minor`, e.g. `1.0`) — lives once in the
+shared `api` crate as `api::API_VERSION`, so both the server and any given
+client binary embed whatever it was at *their own* build time. Bump
+`major` for a breaking DTO/route change, `minor` for an additive,
+non-breaking one. The desktop client checks this against the server's
+`/health` response the moment it first connects
+(`check_api_version`/`compare_api_version` in `crates/ui/src/app.rs`): a
+major mismatch blocks further use with an "update the app" message, a
+minor mismatch shows a soft, non-blocking notice. There's deliberately no
+patch/build component here — those never change the wire contract, so
+including them would make the check fire on every routine bugfix deploy.
+
+**App/build version** (`Major.Minor.Patch[+build]`) — `Major.Minor.Patch`
+comes straight from each crate's `Cargo.toml` `version` (currently `0.1.0`
+everywhere). An optional `+<build>` suffix (standard SemVer build
+metadata) is appended when `SCRABBLE_PX_BUILD_ID` is set at compile time —
+e.g. a git short SHA or CI run number, for telling internal/test builds
+apart:
+
+```bash
+# Internal/test build with a build id
+SCRABBLE_PX_BUILD_ID=$(git rev-parse --short HEAD) cargo build -p server-game --release
+
+# Production release — no build id set, shows "0.1.0" not "0.1.0+..."
+cargo build -p server-game --release
+```
+
+`server-game` logs its app version alongside the API version at startup;
+the desktop client puts its app version in the window title.
 
 ## Logging
 
@@ -358,7 +395,7 @@ Plain `http://` requests get redirected to `https://` automatically — no separ
 ## Known Build Issues
 
 ### sccache hangs the WASM build
-sccache (configured in `.cargo/config.toml`) is incompatible with the `wasm32-unknown-unknown` target. Always set `RUSTC_WRAPPER=""` when building web targets. The `run-desktop-linux.sh` script handles this automatically.
+sccache (configured in `.cargo/config.toml`) is incompatible with the `wasm32-unknown-unknown` target. Always set `RUSTC_WRAPPER=""` when building web targets. `scripts/services.sh` handles this automatically.
 
 ### wasm-bindgen version mismatch
 The `wasm-bindgen-cli` version must exactly match the `wasm-bindgen` crate version in `Cargo.lock`. Check with:

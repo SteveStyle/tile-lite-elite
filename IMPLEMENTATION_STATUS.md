@@ -231,6 +231,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 | Client resilience to outages | Implemented | Connection-status tracking, background reconnect/reload, self-healing WebSocket |
 | Container deployment | Implemented and live | See the "Deployment" entry in Architecture Alignment above |
 | Structured logging | Implemented | `tracing` + `tracing-subscriber`, configurable via `RUST_LOG` (see `docs/operations.md`'s "Logging" section). App-level events (auth, game lifecycle, invitations, admin actions, move-time-limit retirement) at `info`/`warn`; per-HTTP-request spans via `tower-http`'s `TraceLayer` at `debug`. Engine-decision diagnostics (why an engine chose a move) still don't exist — only that it timed out |
+| Client API versioning | Implemented | `api::API_VERSION` (`Major.Minor`) checked against `/health` on first connect, in the shared bootstrap path (both web and desktop) — major mismatch blocks with an update message, minor mismatch is a soft notice (see `docs/operations.md`'s "Versioning" section). Separate `Major.Minor.Patch[+build]` app version (from `Cargo.toml` + optional `SCRABBLE_PX_BUILD_ID`) is for display/logging only, not compatibility — server logs it at startup, desktop client shows it in the window title |
 
 ### ⚠️ Partially Implemented
 

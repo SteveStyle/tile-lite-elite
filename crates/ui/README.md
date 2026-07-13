@@ -47,8 +47,11 @@ RUSTC_WRAPPER="" CARGO_INCREMENTAL=0 ~/.cargo/bin/dx serve --platform web --port
 ### 2b. Desktop client (manual)
 
 ```bash
-SCRABBLE_PX_API_BASE_URL=http://127.0.0.1:3000 cargo run -p scrabble-ui --features desktop
+cargo run -p scrabble-ui --features desktop -- --server-url http://127.0.0.1:3000
 ```
+
+See `src/config.rs` for the compiled-in default environments and the
+`--server-url`/`--env` CLI overrides (also usable via `scripts/desktop.sh`).
 
 ## How to Play
 
@@ -67,6 +70,7 @@ crates/ui/
 ├── src/
 │   ├── app.rs                # Root component, all state signals, event handlers
 │   ├── main.rs               # Dioxus entry point
+│   ├── config.rs             # Desktop-only: compiled-in server environments + CLI override
 │   ├── components/
 │   │   ├── board_view.rs     # 15×15 board with drag-and-drop
 │   │   ├── rack_view.rs      # Draggable tile rack
@@ -74,10 +78,11 @@ crates/ui/
 │   └── views/
 │       └── home.rs           # Main game layout
 ├── Cargo.toml
-├── Dioxus.toml
-├── run-desktop-linux.sh      # Launch helper (web or desktop)
-└── build-windows.sh          # Cross-compile for Windows
+└── Dioxus.toml
 ```
+
+Launch scripts live in the repo root's `scripts/` folder, not here — see
+`scripts/desktop.sh` and `scripts/services.sh`.
 
 ## Dependencies
 
