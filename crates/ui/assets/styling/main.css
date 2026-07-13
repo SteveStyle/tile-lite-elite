@@ -114,6 +114,9 @@ button:disabled {
 .resign-button {
     color: #8a2d1e;
     box-shadow: inset 0 0 0 1px rgba(199, 104, 72, 0.35);
+    /* Sits apart from the routine turn actions in the same flex row,
+       rather than flush against Play. */
+    margin-left: auto;
 }
 
 .workspace-shell {
@@ -206,7 +209,11 @@ button:disabled {
 
 .board-panel,
 .rack-panel {
-    padding: 22px;
+    padding: 16px;
+}
+
+.rack-panel .panel-header {
+    margin-bottom: 10px;
 }
 
 .status-strip {
@@ -220,7 +227,8 @@ button:disabled {
     display: flex;
     gap: 10px;
     flex-wrap: wrap;
-    margin-top: 16px;
+    align-items: center;
+    margin-top: 10px;
 }
 
 .panel-header {
@@ -284,6 +292,16 @@ button:disabled {
     box-shadow:
         inset 0 0 0 2px var(--clay, rgba(199, 104, 72, 0.9)),
         0 6px 14px rgba(77, 50, 26, 0.14);
+}
+
+/* `.board-cell-clickable:hover` alone (two selectors) outranks
+   `.board-cell-selected` (one selector) on specificity, so hovering a
+   selected-and-still-selectable cell was silently swapping the selection
+   ring out for the plain hover shadow. This needs to win over both. */
+.board-cell-clickable.board-cell-selected:hover {
+    box-shadow:
+        inset 0 0 0 2px var(--clay, rgba(199, 104, 72, 0.9)),
+        0 10px 18px rgba(77, 50, 26, 0.08);
 }
 
 /* Marks the squares the most recent move placed a tile on — cleared the
@@ -883,10 +901,11 @@ button:disabled {
     gap: 6px;
 }
 
-/* Blocking modal shown whenever there's no session — nothing in the app
-   works signed out, so this covers the whole viewport rather than being
-   a dismissable widget (see `AuthPanel` in auth_panel.rs). */
-.auth-modal-backdrop {
+/* Generic blocking-modal shell — used both for the auth gate (nothing in
+   the app works signed out, so that one covers the whole viewport rather
+   than being a dismissable widget; see `AuthPanel`) and for smaller
+   confirmations like resigning (see `Home`). */
+.modal-backdrop {
     position: fixed;
     inset: 0;
     background: rgba(35, 25, 15, 0.6);
@@ -898,7 +917,7 @@ button:disabled {
     z-index: 1000;
 }
 
-.auth-modal-card {
+.modal-card {
     display: flex;
     flex-direction: column;
     align-items: stretch;
@@ -908,35 +927,39 @@ button:disabled {
     max-width: 380px;
     border-radius: 24px;
     padding: 32px;
+    background: var(--panel);
+    box-shadow: var(--shadow);
 }
 
-.auth-modal-title {
+.modal-title {
     font-family: "Palatino Linotype", "Book Antiqua", Georgia, serif;
     font-size: 1.6rem;
 }
 
-.auth-modal-copy {
+.modal-copy {
     color: rgba(35, 25, 15, 0.72);
     margin-bottom: 4px;
 }
 
-.auth-modal-card .auth-panel-tabs {
+.modal-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 6px;
+}
+
+.modal-actions button {
+    flex: 1;
+}
+
+.modal-card .auth-panel-tabs {
     justify-content: center;
 }
 
-.auth-modal-card .auth-input {
+.modal-card .auth-input {
     width: 100%;
     border-radius: 12px;
     padding: 10px 14px;
     font-size: 0.95rem;
-}
-
-.auth-modal-card .auth-panel-actions {
-    margin-top: 6px;
-}
-
-.auth-modal-card .auth-panel-actions button {
-    flex: 1;
 }
 
 @media (max-width: 1080px) {

@@ -84,6 +84,9 @@ pub fn Home(
     // element losing focus to e.g. a turn-action button is otherwise a dead
     // end — nothing else would naturally hand focus back.
     let mut keyboard_focus: Signal<Option<Rc<MountedData>>> = use_signal(|| None);
+    // Resigning ends the game outright, so it's gated behind an explicit
+    // confirmation rather than firing straight off the button click.
+    let mut confirming_resign = use_signal(|| false);
 
     rsx! {
         section {
@@ -179,12 +182,6 @@ pub fn Home(
                             }
                         }
                     }
-                    if let Some(info_message) = info_message.clone() {
-                        p { class: "status-banner", "{info_message}" }
-                    }
-                    if let Some(error_message) = error_message.clone() {
-                        p { class: "error-banner", "{error_message}" }
-                    }
                     if has_unresolved_blank {
                         div { class: "blank-picker",
                             p { class: "composer-copy",
@@ -217,6 +214,17 @@ pub fn Home(
                         on_drag_end: on_drag_end_rack_tile,
                         on_click_tile: on_click_rack_tile,
                         on_toggle_exchange_tile,
+                    }
+
+                    // Below the tiles rather than above them — these come
+                    // and go with every action, and a message appearing or
+                    // disappearing above the rack used to shift the tiles
+                    // up and down while you were trying to use them.
+                    if let Some(info_message) = info_message.clone() {
+                        p { class: "status-banner", "{info_message}" }
+                    }
+                    if let Some(error_message) = error_message.clone() {
+                        p { class: "error-banner", "{error_message}" }
                     }
 
                     div { class: "turn-actions",
@@ -256,8 +264,32 @@ pub fn Home(
                             button {
                                 class: "toggle-button toggle-button-muted resign-button",
                                 disabled: is_loading || !can_resign,
-                                onclick: move |_| on_resign.call(()),
+                                onclick: move |_| confirming_resign.set(true),
                                 "Resign"
+                            }
+                        }
+                    }
+                }
+            }
+
+            if confirming_resign() {
+                div { class: "modal-backdrop",
+                    div { class: "modal-card",
+                        h2 { class: "modal-title", "Resign this game?" }
+                        p { class: "modal-copy", "This ends the game immediately — there's no undoing it." }
+                        div { class: "modal-actions",
+                            button {
+                                class: "toggle-button toggle-button-muted",
+                                onclick: move |_| confirming_resign.set(false),
+                                "Cancel"
+                            }
+                            button {
+                                class: "toggle-button",
+                                onclick: move |_| {
+                                    confirming_resign.set(false);
+                                    on_resign.call(());
+                                },
+                                "Yes, resign"
                             }
                         }
                     }

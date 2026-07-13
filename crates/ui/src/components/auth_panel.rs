@@ -226,10 +226,10 @@ pub fn AuthPanel(
     let server_url_for_button = server_url.clone();
 
     rsx! {
-        div { class: "auth-modal-backdrop",
-        div { class: "auth-panel auth-modal-card",
-            h2 { class: "auth-modal-title", "Welcome to Scrabble PX" }
-            p { class: "auth-modal-copy", "Log in or register to create and play games." }
+        div { class: "modal-backdrop",
+        div { class: "auth-panel modal-card",
+            h2 { class: "modal-title", "Welcome to Scrabble PX" }
+            p { class: "modal-copy", "Log in or register to create and play games." }
             div { class: "auth-panel-tabs",
                 button {
                     class: if mode() == AuthMode::Login { "auth-tab auth-tab-active" } else { "auth-tab" },
@@ -344,7 +344,7 @@ pub fn AuthPanel(
                 p { class: "error-banner", "{error}" }
             }
 
-            div { class: "auth-panel-actions",
+            div { class: "modal-actions",
                 button {
                     class: "toggle-button",
                     disabled: is_submitting(),
