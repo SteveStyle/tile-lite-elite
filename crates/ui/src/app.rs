@@ -116,6 +116,11 @@ pub fn RootApp() -> Element {
     let mut staged_placements = use_signal(Vec::<StagedPlacementView>::new);
     let mut selected_blank_letter = use_signal(|| None::<char>);
     let mut selected_cell = use_signal(|| None::<usize>);
+    // Only meaningful while exactly one tile is staged (direction is
+    // otherwise ambiguous) — set by the space-bar/button toggle, cleared
+    // whenever the staged tiles are cleared out so it doesn't linger and
+    // silently steer a later, unrelated word.
+    let mut direction_override = use_signal(|| None::<DirectionDto>);
     let mut exchange_mode = use_signal(|| false);
     let mut exchange_selected = use_signal(HashSet::<usize>::new);
     // Purely a display order for the rack — reset to identity whenever the
@@ -184,6 +189,7 @@ pub fn RootApp() -> Element {
                 selected_cell,
                 exchange_mode,
                 exchange_selected,
+                direction_override,
             )
             .await;
             is_loading.set(false);
@@ -232,6 +238,7 @@ pub fn RootApp() -> Element {
                     selected_cell,
                     exchange_mode,
                     exchange_selected,
+                    direction_override,
                 )
                 .await;
                 is_reconnecting.set(false);
@@ -304,7 +311,12 @@ pub fn RootApp() -> Element {
         use_effect(move || {
             let staged = staged_placements();
             let game_val = game();
-            let direction = infer_typing_direction(&game_for_direction, &staged);
+            let direction = infer_typing_direction(
+                &game_for_direction,
+                &staged,
+                selected_cell(),
+                direction_override(),
+            );
             let is_human_turn = can_submit_human_action;
             let server_url = server_url_for_preview.clone();
             let token = session().map(|current| current.session_token.clone());
@@ -339,6 +351,14 @@ pub fn RootApp() -> Element {
     let game_for_click = game_for_view.clone();
     let game_for_type = game_for_view.clone();
     let game_for_backspace = game_for_view.clone();
+    let game_for_toggle = game_for_view.clone();
+    let can_toggle_direction = staged_placements().len() == 1;
+    let current_typing_direction = infer_typing_direction(
+        &game_for_view,
+        &staged_placements(),
+        selected_cell(),
+        direction_override(),
+    );
 
     rsx! {
         document::Link { rel: "stylesheet", href: MAIN_CSS }
@@ -386,6 +406,7 @@ pub fn RootApp() -> Element {
                                 selected_cell,
                                 exchange_mode,
                                 exchange_selected,
+                                direction_override,
                             )
                             .await;
                             is_loading.set(false);
@@ -444,6 +465,7 @@ pub fn RootApp() -> Element {
                                             selected_cell,
                                             exchange_mode,
                                             exchange_selected,
+                                            direction_override,
                                         );
                                         game.set(Some(updated));
                                         if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
@@ -471,6 +493,7 @@ pub fn RootApp() -> Element {
                                         selected_cell,
                                         exchange_mode,
                                         exchange_selected,
+                                        direction_override,
                                     );
                                     websocket_game_id.set(None);
                                     game.set(Some(loaded));
@@ -496,6 +519,7 @@ pub fn RootApp() -> Element {
                                         selected_cell,
                                         exchange_mode,
                                         exchange_selected,
+                                        direction_override,
                                     );
                                     websocket_game_id.set(None);
                                     game.set(Some(created));
@@ -574,6 +598,16 @@ pub fn RootApp() -> Element {
                     staged_placements: staged_placements().clone(),
                     can_stage_moves: can_submit_human_action && !exchange_mode(),
                     selected_cell: selected_cell(),
+                    can_toggle_direction,
+                    current_typing_direction,
+                    on_toggle_direction: move |_| {
+                        toggle_direction_override(
+                            &game_for_toggle,
+                            staged_placements,
+                            direction_override,
+                            selected_cell,
+                        );
+                    },
                     on_drag_rack_tile: move |tile_id| {
                         dragging_tile_id.set(Some(tile_id));
                         dragging_from_board_index.set(None);
@@ -632,6 +666,12 @@ pub fn RootApp() -> Element {
                         let Some(tile_id) = dragging_tile_id() else {
                             return;
                         };
+                        // Any change to the staged placements invalidates a
+                        // previous submit/typing message — the live preview
+                        // banner is the one source of truth for the current
+                        // arrangement going forward.
+                        error_message.set(None);
+                        info_message.set(None);
                         if let Some(old_index) = dragging_from_board_index() {
                             // Moving an already-staged tile: carry over its
                             // existing display/tile (a resolved blank keeps
@@ -665,6 +705,13 @@ pub fn RootApp() -> Element {
                         staged_placements
                             .with_mut(|placements| placements.push(placement));
                         dragging_tile_id.set(None);
+                        advance_selection(
+                            &game_for_drop,
+                            staged_placements,
+                            selected_cell,
+                            direction_override(),
+                            board_index,
+                        );
                     },
                     on_select_cell: move |board_index: usize| {
                         if !can_submit_human_action || exchange_mode() {
@@ -705,10 +752,18 @@ pub fn RootApp() -> Element {
                         else {
                             return;
                         };
+                        error_message.set(None);
+                        info_message.set(None);
                         let placement = stage_tile_at_cell(cell_index, &tile, None);
                         staged_placements
                             .with_mut(|placements| placements.push(placement));
-                        advance_selection(&game_for_click, staged_placements, selected_cell, cell_index);
+                        advance_selection(
+                            &game_for_click,
+                            staged_placements,
+                            selected_cell,
+                            direction_override(),
+                            cell_index,
+                        );
                     },
                     on_type_letter: move |letter: char| {
                         if !can_submit_human_action || exchange_mode() {
@@ -750,9 +805,17 @@ pub fn RootApp() -> Element {
                         };
                         let resolved = matches!(tile.tile, TileDto::Blank { .. }).then_some(letter);
                         let placement = stage_tile_at_cell(cell_index, tile, resolved);
+                        error_message.set(None);
+                        info_message.set(None);
                         staged_placements
                             .with_mut(|placements| placements.push(placement));
-                        advance_selection(&game_for_type, staged_placements, selected_cell, cell_index);
+                        advance_selection(
+                            &game_for_type,
+                            staged_placements,
+                            selected_cell,
+                            direction_override(),
+                            cell_index,
+                        );
                     },
                     on_backspace: move |_| {
                         if !can_submit_human_action || exchange_mode() {
@@ -775,12 +838,19 @@ pub fn RootApp() -> Element {
                         let target = if cursor_has_tile {
                             Some(cell_index)
                         } else {
-                            let direction = infer_typing_direction(&game_for_backspace, &staged_placements());
+                            let direction = infer_typing_direction(
+                                &game_for_backspace,
+                                &staged_placements(),
+                                Some(cell_index),
+                                direction_override(),
+                            );
                             find_previous_editable_cell(&game_for_backspace, cell_index, direction)
                         };
                         let Some(target) = target else {
                             return;
                         };
+                        error_message.set(None);
+                        info_message.set(None);
                         staged_placements
                             .with_mut(|placements| placements.retain(|p| p.board_index != target));
                         selected_cell.set(Some(target));
@@ -792,6 +862,8 @@ pub fn RootApp() -> Element {
                         let Some(cell_index) = selected_cell() else {
                             return;
                         };
+                        error_message.set(None);
+                        info_message.set(None);
                         // Forward-delete: removes a staged tile at the
                         // cursor without moving the cursor, unlike backspace.
                         staged_placements
@@ -802,15 +874,21 @@ pub fn RootApp() -> Element {
                         selected_blank_letter.set(None);
                         staged_placements.set(Vec::new());
                         selected_cell.set(None);
+                        direction_override.set(None);
+                        error_message.set(None);
                         info_message.set(Some("Cleared staged placements.".to_string()));
                     },
                     on_remove_staged: move |board_index| {
+                        error_message.set(None);
+                        info_message.set(None);
                         staged_placements
                             .with_mut(|placements| {
                                 placements.retain(|p| p.board_index != board_index);
                             });
                     },
                     on_set_blank_letter: move |letter| {
+                        error_message.set(None);
+                        info_message.set(None);
                         selected_blank_letter.set(Some(letter));
                         staged_placements
                             .with_mut(|placements| {
@@ -846,6 +924,7 @@ pub fn RootApp() -> Element {
                                             selected_cell,
                                             exchange_mode,
                                             exchange_selected,
+                                            direction_override,
                                         );
                                         game.set(Some(updated));
                                         if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
@@ -877,6 +956,7 @@ pub fn RootApp() -> Element {
                                             selected_cell,
                                             exchange_mode,
                                             exchange_selected,
+                                            direction_override,
                                         );
                                         game.set(Some(updated));
                                         if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
@@ -896,7 +976,12 @@ pub fn RootApp() -> Element {
                         let staged = staged_placements().clone();
                         let token = session().map(|current| current.session_token.clone());
                         if let Some(current_game) = current_game {
-                            let direction = infer_typing_direction(&current_game, &staged);
+                            let direction = infer_typing_direction(
+                                &current_game,
+                                &staged,
+                                selected_cell(),
+                                direction_override(),
+                            );
                             spawn(async move {
                                 is_loading.set(true);
                                 error_message.set(None);
@@ -918,6 +1003,7 @@ pub fn RootApp() -> Element {
                                             selected_cell,
                                             exchange_mode,
                                             exchange_selected,
+                                            direction_override,
                                         );
                                         game.set(Some(updated));
                                         if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
@@ -949,6 +1035,7 @@ pub fn RootApp() -> Element {
                                 selected_cell,
                                 exchange_mode,
                                 exchange_selected,
+                                direction_override,
                             );
                             exchange_mode.set(true);
                         } else {
@@ -989,6 +1076,7 @@ pub fn RootApp() -> Element {
                                             selected_cell,
                                             exchange_mode,
                                             exchange_selected,
+                                            direction_override,
                                         );
                                         game.set(Some(updated));
                                         if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
@@ -1229,6 +1317,7 @@ async fn load_summaries_and_game(
     selected_cell: Signal<Option<usize>>,
     exchange_mode: Signal<bool>,
     exchange_selected: Signal<HashSet<usize>>,
+    direction_override: Signal<Option<DirectionDto>>,
 ) {
     // The games list is per-account now (the server 401s without a
     // session), so there's nothing meaningful to fetch until the caller is
@@ -1254,6 +1343,7 @@ async fn load_summaries_and_game(
                             selected_cell,
                             exchange_mode,
                             exchange_selected,
+                            direction_override,
                         );
                         game.set(Some(loaded));
                     }
@@ -1839,10 +1929,35 @@ fn board_cell_has_letter(cell: &BoardCellDto) -> bool {
 /// logic `build_manual_move_request` uses, exposed standalone so the
 /// click/keyboard composer can auto-advance in the direction the move will
 /// actually be read in, not always horizontally.
-fn infer_typing_direction(game: &GameStateDto, staged: &[StagedPlacementView]) -> DirectionDto {
+///
+/// With exactly one staged tile the direction is inherently ambiguous, so
+/// two extra (purely-current-state) signals get a say, in priority order:
+/// `selected_cell`, when it's aligned with the staged tile on one axis, is
+/// the strongest signal — it's the player explicitly clicking elsewhere to
+/// point out which way the word should run. Failing that, `direction_override`
+/// (set by the space-bar/button toggle) wins. Only once both are silent does
+/// this fall back to the permanent-neighbor-based guess.
+fn infer_typing_direction(
+    game: &GameStateDto,
+    staged: &[StagedPlacementView],
+    selected_cell: Option<usize>,
+    direction_override: Option<DirectionDto>,
+) -> DirectionDto {
     match staged.len() {
         0 => DirectionDto::Horizontal,
-        1 => infer_single_tile_direction(game, staged[0].board_index, DirectionDto::Horizontal),
+        1 => {
+            let anchor = staged[0].board_index;
+            if let Some(selected) = selected_cell {
+                if let Some(direction) = aligned_direction(anchor, selected) {
+                    return direction;
+                }
+            }
+            infer_single_tile_direction(
+                game,
+                anchor,
+                direction_override.unwrap_or(DirectionDto::Horizontal),
+            )
+        }
         _ => {
             let positions: Vec<(usize, usize)> = staged
                 .iter()
@@ -1855,6 +1970,23 @@ fn infer_typing_direction(game: &GameStateDto, staged: &[StagedPlacementView]) -
                 DirectionDto::Vertical
             }
         }
+    }
+}
+
+/// If `other` shares exactly one axis with `anchor` (same row, different
+/// column, or same column, different row), returns the direction that
+/// alignment implies. `None` if they're the same cell or share neither axis
+/// (diagonal) — genuinely ambiguous, not this function's call to make.
+fn aligned_direction(anchor: usize, other: usize) -> Option<DirectionDto> {
+    if anchor == other {
+        return None;
+    }
+    let (ax, ay) = (anchor % BOARD_WIDTH, anchor / BOARD_WIDTH);
+    let (ox, oy) = (other % BOARD_WIDTH, other / BOARD_WIDTH);
+    match (ax == ox, ay == oy) {
+        (false, true) => Some(DirectionDto::Horizontal),
+        (true, false) => Some(DirectionDto::Vertical),
+        _ => None,
     }
 }
 
@@ -1930,11 +2062,38 @@ fn advance_selection(
     game: &GameStateDto,
     staged_placements: Signal<Vec<StagedPlacementView>>,
     mut selected_cell: Signal<Option<usize>>,
+    direction_override: Option<DirectionDto>,
     from_index: usize,
 ) {
     let staged = staged_placements();
-    let direction = infer_typing_direction(game, &staged);
+    let direction = infer_typing_direction(game, &staged, Some(from_index), direction_override);
     selected_cell.set(find_next_placeable_cell(game, &staged, from_index, direction, true));
+}
+
+/// Flips the effective typing direction (space bar / direction button).
+/// Only meaningful with exactly one staged tile — with zero or two-plus,
+/// direction isn't ambiguous, so this is a no-op. Moves `selected_cell` to
+/// follow the new direction immediately, so the cursor lands where the next
+/// letter would actually go rather than leaving it in the old direction's
+/// slot.
+fn toggle_direction_override(
+    game: &GameStateDto,
+    staged_placements: Signal<Vec<StagedPlacementView>>,
+    mut direction_override: Signal<Option<DirectionDto>>,
+    mut selected_cell: Signal<Option<usize>>,
+) {
+    let staged = staged_placements();
+    if staged.len() != 1 {
+        return;
+    }
+    let anchor = staged[0].board_index;
+    let current = infer_typing_direction(game, &staged, selected_cell(), direction_override());
+    let next = match current {
+        DirectionDto::Horizontal => DirectionDto::Vertical,
+        DirectionDto::Vertical => DirectionDto::Horizontal,
+    };
+    direction_override.set(Some(next));
+    selected_cell.set(find_next_placeable_cell(game, &staged, anchor, next, true));
 }
 
 /// Builds the staged placement for dropping/clicking/typing `tile` onto
@@ -1975,6 +2134,7 @@ fn reset_composer_state(
     mut selected_cell: Signal<Option<usize>>,
     mut exchange_mode: Signal<bool>,
     mut exchange_selected: Signal<HashSet<usize>>,
+    mut direction_override: Signal<Option<DirectionDto>>,
 ) {
     dragging_tile_id.set(None);
     selected_blank_letter.set(None);
@@ -1982,6 +2142,7 @@ fn reset_composer_state(
     selected_cell.set(None);
     exchange_mode.set(false);
     exchange_selected.set(HashSet::new());
+    direction_override.set(None);
 }
 
 /// True if this seat is either unclaimed (anonymous/open play — anyone may
@@ -2286,10 +2447,16 @@ mod tests {
     #[test]
     fn infer_typing_direction_defaults_to_horizontal_when_empty_or_isolated() {
         let game = test_game(empty_board());
-        assert_eq!(infer_typing_direction(&game, &[]), DirectionDto::Horizontal);
+        assert_eq!(
+            infer_typing_direction(&game, &[], None, None),
+            DirectionDto::Horizontal
+        );
 
         let staged = vec![letter_placement(112, 0, 'A')];
-        assert_eq!(infer_typing_direction(&game, &staged), DirectionDto::Horizontal);
+        assert_eq!(
+            infer_typing_direction(&game, &staged, None, None),
+            DirectionDto::Horizontal
+        );
     }
 
     #[test]
@@ -2299,12 +2466,18 @@ mod tests {
         let mut board_with_left_neighbor = empty_board();
         board_with_left_neighbor[111].letter = Some('C');
         let game = test_game(board_with_left_neighbor);
-        assert_eq!(infer_typing_direction(&game, &staged), DirectionDto::Horizontal);
+        assert_eq!(
+            infer_typing_direction(&game, &staged, None, None),
+            DirectionDto::Horizontal
+        );
 
         let mut board_with_top_neighbor = empty_board();
         board_with_top_neighbor[112 - BOARD_WIDTH].letter = Some('C');
         let game = test_game(board_with_top_neighbor);
-        assert_eq!(infer_typing_direction(&game, &staged), DirectionDto::Vertical);
+        assert_eq!(
+            infer_typing_direction(&game, &staged, None, None),
+            DirectionDto::Vertical
+        );
     }
 
     #[test]
@@ -2312,13 +2485,91 @@ mod tests {
         let game = test_game(empty_board());
 
         let same_row = vec![letter_placement(100, 0, 'A'), letter_placement(102, 1, 'B')];
-        assert_eq!(infer_typing_direction(&game, &same_row), DirectionDto::Horizontal);
+        assert_eq!(
+            infer_typing_direction(&game, &same_row, None, None),
+            DirectionDto::Horizontal
+        );
 
         let same_column = vec![
             letter_placement(100, 0, 'A'),
             letter_placement(100 + BOARD_WIDTH * 2, 1, 'B'),
         ];
-        assert_eq!(infer_typing_direction(&game, &same_column), DirectionDto::Vertical);
+        assert_eq!(
+            infer_typing_direction(&game, &same_column, None, None),
+            DirectionDto::Vertical
+        );
+    }
+
+    #[test]
+    fn infer_typing_direction_follows_the_selected_cell_for_a_single_ambiguous_tile() {
+        // No permanent neighbor on either axis, so this is genuinely
+        // ambiguous — the currently selected cell (the player having clicked
+        // elsewhere to imply a direction) should win over the plain default.
+        let game = test_game(empty_board());
+        let staged = vec![letter_placement(112, 0, 'A')];
+
+        // Selecting the cell to the right implies horizontal.
+        assert_eq!(
+            infer_typing_direction(&game, &staged, Some(113), None),
+            DirectionDto::Horizontal
+        );
+        // Selecting the cell below implies vertical.
+        assert_eq!(
+            infer_typing_direction(&game, &staged, Some(112 + BOARD_WIDTH), None),
+            DirectionDto::Vertical
+        );
+        // Selecting the tile's own cell isn't a signal either way.
+        assert_eq!(
+            infer_typing_direction(&game, &staged, Some(112), None),
+            DirectionDto::Horizontal
+        );
+    }
+
+    #[test]
+    fn infer_typing_direction_selected_cell_beats_a_stale_direction_override() {
+        let game = test_game(empty_board());
+        let staged = vec![letter_placement(112, 0, 'A')];
+
+        // An override says Vertical, but the player has since clicked a cell
+        // that unambiguously implies Horizontal — the explicit click wins.
+        assert_eq!(
+            infer_typing_direction(&game, &staged, Some(113), Some(DirectionDto::Vertical)),
+            DirectionDto::Horizontal
+        );
+    }
+
+    #[test]
+    fn infer_typing_direction_falls_back_to_the_override_when_selection_is_ambiguous() {
+        let game = test_game(empty_board());
+        let staged = vec![letter_placement(112, 0, 'A')];
+
+        // No selected cell at all falls back to the override.
+        assert_eq!(
+            infer_typing_direction(&game, &staged, None, Some(DirectionDto::Vertical)),
+            DirectionDto::Vertical
+        );
+        // A diagonally-selected cell shares neither axis, so it's not a
+        // signal either — falls back to the override too.
+        assert_eq!(
+            infer_typing_direction(
+                &game,
+                &staged,
+                Some(112 + BOARD_WIDTH + 1),
+                Some(DirectionDto::Vertical)
+            ),
+            DirectionDto::Vertical
+        );
+    }
+
+    #[test]
+    fn aligned_direction_reads_the_axis_two_cells_share() {
+        assert_eq!(aligned_direction(112, 113), Some(DirectionDto::Horizontal));
+        assert_eq!(
+            aligned_direction(112, 112 + BOARD_WIDTH),
+            Some(DirectionDto::Vertical)
+        );
+        assert_eq!(aligned_direction(112, 112), None);
+        assert_eq!(aligned_direction(112, 112 + BOARD_WIDTH + 1), None);
     }
 
     #[test]

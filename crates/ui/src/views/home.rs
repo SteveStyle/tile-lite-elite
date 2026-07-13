@@ -2,7 +2,7 @@ use crate::{
     app::{MovePreviewView, RackTileView, StagedPlacementView},
     components::{board_view::BoardView, rack_view::RackView},
 };
-use api::{GameStateDto, GameStatus, TileDto};
+use api::{DirectionDto, GameStateDto, GameStatus, TileDto};
 use dioxus::prelude::*;
 use std::collections::HashSet;
 use std::rc::Rc;
@@ -20,6 +20,9 @@ pub fn Home(
     staged_placements: Vec<StagedPlacementView>,
     can_stage_moves: bool,
     selected_cell: Option<usize>,
+    can_toggle_direction: bool,
+    current_typing_direction: DirectionDto,
+    on_toggle_direction: EventHandler<()>,
     on_drag_rack_tile: EventHandler<usize>,
     on_drag_end_rack_tile: EventHandler<()>,
     on_drag_staged_tile: EventHandler<usize>,
@@ -100,6 +103,12 @@ pub fn Home(
                     return;
                 }
                 match event.key() {
+                    Key::Character(text) if text == " " => {
+                        if can_toggle_direction {
+                            event.prevent_default();
+                            on_toggle_direction.call(());
+                        }
+                    }
                     Key::Character(text) if text.chars().count() == 1 => {
                         if let Some(letter) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
                             event.prevent_default();
@@ -133,11 +142,10 @@ pub fn Home(
                 p { class: "game-over-banner", "{summary}" }
             }
             if !has_rack {
-                if let Some(info_message) = info_message.clone() {
-                    p { class: "status-banner", "{info_message}" }
-                }
                 if let Some(error_message) = error_message.clone() {
                     p { class: "error-banner", "{error_message}" }
+                } else if let Some(info_message) = info_message.clone() {
+                    p { class: "status-banner", "{info_message}" }
                 }
             }
 
@@ -181,6 +189,19 @@ pub fn Home(
                                 "Clear"
                             }
                         }
+                        if can_toggle_direction {
+                            button {
+                                class: "direction-button direction-button-muted",
+                                title: "Change which way this word reads — same as pressing space bar",
+                                onclick: move |_| on_toggle_direction.call(()),
+                                {
+                                    match current_typing_direction {
+                                        DirectionDto::Horizontal => "⇄ Switch to Down",
+                                        DirectionDto::Vertical => "⇄ Switch to Across",
+                                    }
+                                }
+                            }
+                        }
                     }
                     if has_unresolved_blank {
                         div { class: "blank-picker",
@@ -219,12 +240,14 @@ pub fn Home(
                     // Below the tiles rather than above them — these come
                     // and go with every action, and a message appearing or
                     // disappearing above the rack used to shift the tiles
-                    // up and down while you were trying to use them.
-                    if let Some(info_message) = info_message.clone() {
-                        p { class: "status-banner", "{info_message}" }
-                    }
+                    // up and down while you were trying to use them. Only
+                    // one of info/error shows at a time (error wins) so
+                    // there's a single message here, not two that can
+                    // contradict each other.
                     if let Some(error_message) = error_message.clone() {
                         p { class: "error-banner", "{error_message}" }
+                    } else if let Some(info_message) = info_message.clone() {
+                        p { class: "status-banner", "{info_message}" }
                     }
 
                     div { class: "turn-actions",
