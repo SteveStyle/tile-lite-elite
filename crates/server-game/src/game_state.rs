@@ -91,6 +91,13 @@ pub struct GameSession {
     pub turn_number: i64,
     pub current_seat: u8,
     pub winner_seat: Option<u8>,
+    /// Set only when someone went out (emptied their rack) — the standard
+    /// end-of-game rack bonus, where every other seat's remaining rack
+    /// value is deducted from them and handed to whoever went out. A
+    /// scoreless-turn-limit ending or a resignation/timeout has no such
+    /// transfer, so these stay `None` for those.
+    pub final_bonus_seat: Option<u8>,
+    pub final_bonus_points: Option<i32>,
     pub random_seed: u64,
     pub rules: VariantRules,
     pub state: GameState,
@@ -126,6 +133,8 @@ impl GameSession {
             turn_number: 0,
             current_seat: 0,
             winner_seat: None,
+            final_bonus_seat: None,
+            final_bonus_points: None,
             random_seed,
             rules,
             state,
@@ -238,6 +247,8 @@ impl GameSession {
             turn_number: self.turn_number,
             current_seat: self.current_seat,
             winner_seat: self.winner_seat,
+            final_bonus_seat: self.final_bonus_seat,
+            final_bonus_points: self.final_bonus_points,
             bag_count: self.bag.len(),
             move_time_limit_seconds: self.move_time_limit_seconds,
             turn_started_at: self.turn_started_at.clone(),
@@ -552,6 +563,8 @@ impl GameSession {
             {
                 participant.score += opponents_total;
             }
+            self.final_bonus_seat = Some(seat);
+            self.final_bonus_points = Some(opponents_total);
         }
 
         self.status = GameStatus::Finished;

@@ -176,6 +176,16 @@ button:disabled {
     color: #8a2d1e;
 }
 
+.game-over-banner {
+    margin-top: 14px;
+    padding: 14px 16px;
+    border-radius: 16px;
+    background: linear-gradient(135deg, rgba(212, 162, 58, 0.3), rgba(138, 160, 123, 0.22));
+    box-shadow: inset 0 0 0 1px rgba(212, 162, 58, 0.4);
+    font-weight: 700;
+    color: rgba(35, 25, 15, 0.88);
+}
+
 .meta-chip,
 .panel-tag,
 .history-badge,

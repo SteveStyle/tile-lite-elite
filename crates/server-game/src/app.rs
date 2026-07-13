@@ -2057,6 +2057,8 @@ mod tests {
         // distribution): he loses it, Alice (who went out) gains it.
         assert_eq!(bob.score, -10);
         assert_eq!(alice.score, move_score + 10);
+        assert_eq!(updated.final_bonus_seat, Some(0));
+        assert_eq!(updated.final_bonus_points, Some(10));
     }
 
     #[tokio::test]
@@ -2312,6 +2314,9 @@ mod tests {
         assert_eq!(updated.status, api::GameStatus::Finished);
         assert_eq!(updated.winner_seat, Some(1));
         assert_eq!(updated.moves[0].move_type, "resign");
+        // A resignation has no rack transfer — only going out does.
+        assert_eq!(updated.final_bonus_seat, None);
+        assert_eq!(updated.final_bonus_points, None);
     }
 
     #[tokio::test]
@@ -2784,6 +2789,8 @@ mod tests {
             turn_number: 0,
             current_seat: 0,
             winner_seat: None,
+            final_bonus_seat: None,
+            final_bonus_points: None,
             bag_count: 100,
             move_time_limit_seconds: 0,
             turn_started_at: "0".to_string(),

@@ -243,6 +243,13 @@ pub struct GameStateDto {
     pub turn_number: i64,
     pub current_seat: u8,
     pub winner_seat: Option<u8>,
+    /// Set only when the game ended because someone went out (emptied
+    /// their rack) — the seat that received the standard end-of-game rack
+    /// bonus (everyone else's remaining rack value), and how many points
+    /// that was. `None` for a scoreless-turn-limit ending, a resignation,
+    /// or a timeout, none of which involve that transfer.
+    pub final_bonus_seat: Option<u8>,
+    pub final_bonus_points: Option<i32>,
     pub bag_count: usize,
     pub move_time_limit_seconds: u64,
     /// Seconds since the Unix epoch when `current_seat`'s turn began.

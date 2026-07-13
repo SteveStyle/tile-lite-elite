@@ -121,6 +121,9 @@ pub fn Home(
                     span { class: "meta-chip", "Working..." }
                 }
             }
+            if let Some(summary) = finished_game_summary(&game) {
+                p { class: "game-over-banner", "{summary}" }
+            }
             if !has_rack {
                 if let Some(info_message) = info_message.clone() {
                     p { class: "status-banner", "{info_message}" }
@@ -260,6 +263,37 @@ fn last_move_board_indices(moves: &[api::MoveRecordDto]) -> HashSet<usize> {
         .unwrap_or_default()
 }
 
+/// The persistent "who won, and why" banner shown once a game finishes —
+/// previously the only way to tell was to notice the status badge in the
+/// games list and work the scores out by hand. `None` while the game is
+/// still in progress.
+fn finished_game_summary(game: &GameStateDto) -> Option<String> {
+    if game.status != GameStatus::Finished {
+        return None;
+    }
+
+    let seat_name = |seat: u8| -> &str {
+        game.participants
+            .iter()
+            .find(|p| p.seat_number == seat)
+            .map(|p| p.display_name.as_str())
+            .unwrap_or("Someone")
+    };
+
+    let outcome = match game.winner_seat {
+        Some(seat) => format!("Game over — {} won!", seat_name(seat)),
+        None => "Game over — it's a tie!".to_string(),
+    };
+
+    match (game.final_bonus_seat, game.final_bonus_points) {
+        (Some(seat), Some(points)) if points > 0 => Some(format!(
+            "{outcome} {} went out and picked up a {points}-point bonus from the other players' racks.",
+            seat_name(seat)
+        )),
+        _ => Some(outcome),
+    }
+}
+
 fn current_turn_name(game: &GameStateDto) -> &str {
     game.participants
         .iter()
@@ -326,5 +360,109 @@ mod tests {
     #[test]
     fn no_moves_yet_highlights_nothing() {
         assert!(last_move_board_indices(&[]).is_empty());
+    }
+
+    fn participant(seat_number: u8, display_name: &str, score: i32) -> api::ParticipantDto {
+        api::ParticipantDto {
+            seat_number,
+            kind: api::SeatKind::Human,
+            display_name: display_name.to_string(),
+            player_id: None,
+            engine_id: None,
+            score,
+        }
+    }
+
+    fn finished_game(
+        winner_seat: Option<u8>,
+        final_bonus_seat: Option<u8>,
+        final_bonus_points: Option<i32>,
+        participants: Vec<api::ParticipantDto>,
+    ) -> GameStateDto {
+        GameStateDto {
+            id: "game-1".to_string(),
+            status: GameStatus::Finished,
+            variant: "official".to_string(),
+            language: "sowpods".to_string(),
+            board_layout: "official".to_string(),
+            turn_number: 5,
+            current_seat: 0,
+            winner_seat,
+            final_bonus_seat,
+            final_bonus_points,
+            bag_count: 0,
+            move_time_limit_seconds: 0,
+            turn_started_at: "0".to_string(),
+            participants,
+            board: Vec::new(),
+            racks: Vec::new(),
+            moves: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn in_progress_game_has_no_summary() {
+        let mut game = finished_game(Some(0), None, None, vec![participant(0, "Alice", 10)]);
+        game.status = GameStatus::Active;
+        assert_eq!(finished_game_summary(&game), None);
+    }
+
+    #[test]
+    fn names_the_winner_with_no_rack_bonus() {
+        let game = finished_game(
+            Some(1),
+            None,
+            None,
+            vec![participant(0, "Alice", 5), participant(1, "Bob", 20)],
+        );
+        assert_eq!(
+            finished_game_summary(&game),
+            Some("Game over — Bob won!".to_string())
+        );
+    }
+
+    #[test]
+    fn a_tie_names_no_one() {
+        let game = finished_game(
+            None,
+            None,
+            None,
+            vec![participant(0, "Alice", 10), participant(1, "Bob", 10)],
+        );
+        assert_eq!(
+            finished_game_summary(&game),
+            Some("Game over — it's a tie!".to_string())
+        );
+    }
+
+    #[test]
+    fn going_out_names_the_winner_and_the_rack_bonus() {
+        let game = finished_game(
+            Some(0),
+            Some(0),
+            Some(10),
+            vec![participant(0, "Alice", 30), participant(1, "Bob", -10)],
+        );
+        assert_eq!(
+            finished_game_summary(&game),
+            Some(
+                "Game over — Alice won! Alice went out and picked up a 10-point bonus from the other players' racks."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_zero_point_bonus_is_not_worth_mentioning() {
+        let game = finished_game(
+            Some(0),
+            Some(0),
+            Some(0),
+            vec![participant(0, "Alice", 30), participant(1, "Bob", 0)],
+        );
+        assert_eq!(
+            finished_game_summary(&game),
+            Some("Game over — Alice won!".to_string())
+        );
     }
 }

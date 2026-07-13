@@ -914,6 +914,8 @@ fn empty_live_game() -> GameStateDto {
         turn_number: 0,
         current_seat: 0,
         winner_seat: None,
+        final_bonus_seat: None,
+        final_bonus_points: None,
         bag_count: 100,
         move_time_limit_seconds: 0,
         turn_started_at: "0".to_string(),
