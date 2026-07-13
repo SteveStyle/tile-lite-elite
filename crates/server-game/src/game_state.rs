@@ -52,6 +52,11 @@ pub struct MoveRecord {
     pub main_word: Option<String>,
     pub score_delta: i32,
     pub description: String,
+    /// Board squares this move placed a tile on — empty for anything but
+    /// `"place"` (pass/exchange/resign/timeout touch no squares). `#[serde(default)]`
+    /// so game snapshots persisted before this field existed still deserialize.
+    #[serde(default)]
+    pub positions: Vec<PositionDto>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +185,7 @@ impl GameSession {
             move_type: "timeout".to_string(),
             main_word: None,
             score_delta: 0,
+            positions: Vec::new(),
             description: format!("{display_name} was retired for exceeding the move time limit"),
         });
         self.winner_seat = self
@@ -265,6 +271,7 @@ impl GameSession {
                     move_type: record.move_type.clone(),
                     main_word: record.main_word.clone(),
                     score_delta: record.score_delta,
+                    positions: record.positions.clone(),
                     description: record.description.clone(),
                 })
                 .collect(),
@@ -302,12 +309,27 @@ impl GameSession {
         participant.score += validated.score.total as i32;
         refill_rack(&mut participant.rack, &mut self.bag, self.rules.rack_size);
         let went_out = participant.rack.is_empty();
+        let positions = candidate
+            .tiles
+            .iter()
+            .map(|placement| match candidate.direction {
+                Direction::Horizontal => PositionDto {
+                    x: candidate.start.x + placement.offset,
+                    y: candidate.start.y,
+                },
+                Direction::Vertical => PositionDto {
+                    x: candidate.start.x,
+                    y: candidate.start.y + placement.offset,
+                },
+            })
+            .collect();
         self.moves.push(MoveRecord {
             move_number: self.turn_number,
             seat_number,
             move_type: "place".to_string(),
             main_word: Some(validated.preview.main_word.clone()),
             score_delta: validated.score.total as i32,
+            positions,
             description: format!(
                 "{} played {} for {}",
                 participant.display_name, validated.preview.main_word, validated.score.total
@@ -334,6 +356,7 @@ impl GameSession {
             move_type: "pass".to_string(),
             main_word: None,
             score_delta: 0,
+            positions: Vec::new(),
             description: format!("{} passed", participant.display_name),
         });
         self.consecutive_scoreless_turns += 1;
@@ -371,6 +394,7 @@ impl GameSession {
             move_type: "exchange".to_string(),
             main_word: None,
             score_delta: 0,
+            positions: Vec::new(),
             description: format!(
                 "{} exchanged {} tiles",
                 participant.display_name,
@@ -399,6 +423,7 @@ impl GameSession {
             move_type: "resign".to_string(),
             main_word: None,
             score_delta: 0,
+            positions: Vec::new(),
             description: format!("{} resigned", participant.display_name),
         });
         self.winner_seat = self

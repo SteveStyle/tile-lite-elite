@@ -134,6 +134,7 @@ pub fn Home(
                 BoardView {
                     board: game.board.clone(),
                     staged_placements: staged_placements.clone(),
+                    last_move_cells: last_move_board_indices(&game.moves),
                     can_stage_moves,
                     selected_cell,
                     on_drop_tile: on_drop_board_cell,
@@ -243,6 +244,22 @@ pub fn Home(
     }
 }
 
+/// Board squares to highlight as "the last move" — whatever `moves.last()`
+/// placed, which is empty for a pass/exchange/resign/timeout (nothing on
+/// the board changed) rather than falling back to an earlier placement.
+fn last_move_board_indices(moves: &[api::MoveRecordDto]) -> HashSet<usize> {
+    moves
+        .last()
+        .map(|record| {
+            record
+                .positions
+                .iter()
+                .map(|p| p.y as usize * crate::app::BOARD_WIDTH + p.x as usize)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn current_turn_name(game: &GameStateDto) -> &str {
     game.participants
         .iter()
@@ -256,5 +273,58 @@ fn format_status(game: &GameStateDto) -> &'static str {
         api::GameStatus::Waiting => "Waiting",
         api::GameStatus::Active => "Playing",
         api::GameStatus::Finished => "Finished",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn place_record(positions: Vec<api::PositionDto>) -> api::MoveRecordDto {
+        api::MoveRecordDto {
+            move_number: 1,
+            seat_number: 0,
+            move_type: "place".to_string(),
+            main_word: Some("CAT".to_string()),
+            score_delta: 10,
+            positions,
+            description: String::new(),
+        }
+    }
+
+    fn pass_record() -> api::MoveRecordDto {
+        api::MoveRecordDto {
+            move_number: 2,
+            seat_number: 1,
+            move_type: "pass".to_string(),
+            main_word: None,
+            score_delta: 0,
+            positions: Vec::new(),
+            description: String::new(),
+        }
+    }
+
+    #[test]
+    fn highlights_the_last_placed_move_s_squares() {
+        let moves = vec![place_record(vec![
+            api::PositionDto { x: 7, y: 7 },
+            api::PositionDto { x: 8, y: 7 },
+        ])];
+        let indices = last_move_board_indices(&moves);
+        assert_eq!(indices, HashSet::from([7 * 15 + 7, 7 * 15 + 8]));
+    }
+
+    #[test]
+    fn a_trailing_pass_has_nothing_to_highlight_even_after_an_earlier_placement() {
+        let moves = vec![
+            place_record(vec![api::PositionDto { x: 7, y: 7 }]),
+            pass_record(),
+        ];
+        assert!(last_move_board_indices(&moves).is_empty());
+    }
+
+    #[test]
+    fn no_moves_yet_highlights_nothing() {
+        assert!(last_move_board_indices(&[]).is_empty());
     }
 }

@@ -1,11 +1,13 @@
 use crate::app::StagedPlacementView;
 use api::{BoardCellDto, PremiumDto};
 use dioxus::prelude::*;
+use std::collections::HashSet;
 
 #[component]
 pub fn BoardView(
     board: Vec<BoardCellDto>,
     staged_placements: Vec<StagedPlacementView>,
+    last_move_cells: HashSet<usize>,
     can_stage_moves: bool,
     selected_cell: Option<usize>,
     on_drop_tile: EventHandler<usize>,
@@ -21,6 +23,7 @@ pub fn BoardView(
         let can_drop = can_stage_moves && !has_letter && !is_staged;
         let is_selectable = can_stage_moves && !has_letter;
         let is_selected = selected_cell == Some(index);
+        let is_last_move = has_letter && last_move_cells.contains(&index);
 
         let mut class_name = if has_letter {
             format!(
@@ -45,6 +48,9 @@ pub fn BoardView(
         }
         if is_selected {
             class_name.push_str(" board-cell-selected");
+        }
+        if is_last_move {
+            class_name.push_str(" board-cell-last-move");
         }
 
         rsx! {

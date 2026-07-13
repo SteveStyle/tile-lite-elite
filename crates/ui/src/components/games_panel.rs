@@ -753,6 +753,7 @@ mod tests {
                 move_type: "place".to_string(),
                 main_word: Some("CAT".to_string()),
                 score_delta: 10,
+                positions: Vec::new(),
                 description: String::new(),
             },
             MoveRecordDto {
@@ -761,6 +762,7 @@ mod tests {
                 move_type: "pass".to_string(),
                 main_word: None,
                 score_delta: 0,
+                positions: Vec::new(),
                 description: String::new(),
             },
             MoveRecordDto {
@@ -769,6 +771,7 @@ mod tests {
                 move_type: "place".to_string(),
                 main_word: Some("DOG".to_string()),
                 score_delta: 8,
+                positions: Vec::new(),
                 description: String::new(),
             },
         ];

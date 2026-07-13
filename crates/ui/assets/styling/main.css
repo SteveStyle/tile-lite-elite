@@ -263,6 +263,15 @@ button:disabled {
         0 6px 14px rgba(77, 50, 26, 0.14);
 }
 
+/* Marks the squares the most recent move placed a tile on — cleared the
+   moment a pass/exchange happens (see `last_move_board_indices` in
+   home.rs), since nothing changed on the board that turn. */
+.board-cell-last-move {
+    box-shadow:
+        inset 0 0 0 2px var(--gold, rgba(212, 162, 58, 0.95)),
+        0 6px 14px rgba(77, 50, 26, 0.1);
+}
+
 .board-cell-filled {
     background: linear-gradient(160deg, #f6dca4, #ddb771);
     box-shadow:

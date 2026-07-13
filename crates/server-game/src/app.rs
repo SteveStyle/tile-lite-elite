@@ -1905,6 +1905,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn placed_move_records_the_board_positions_it_used() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        let created_id = started.game.id.clone();
+
+        {
+            let mut games = state.games.write().await;
+            let game = games
+                .get_mut(&created_id)
+                .expect("created game should exist in memory");
+            game.bag = vec![rules_shared::Tile::Letter(Letter::from('X')); 20];
+            game.participants[0].rack = rack_with_letters(&['A', 'T']);
+        }
+
+        let rules = VariantRules::official();
+        let board = board_from_dto(&started.game.board).expect("board dto should reconstruct");
+        let position = GameState::from_board(board, &rules, &*SOWPODS);
+        let player_rack = rack_with_letters(&['A', 'T']);
+        let engine = RulesEngine {
+            rules: &rules,
+            dictionary: &*SOWPODS,
+        };
+        let candidate = engine
+            .enumerate_legal_moves(&position, &player_rack)
+            .next()
+            .expect("opening rack should have a legal move");
+
+        // Derived independently from the same candidate, mirroring the
+        // production offset math (`apply_place_move` in game_state.rs) —
+        // this is what the response's positions should equal regardless
+        // of which legal opening move the engine happened to pick.
+        let expected_positions: Vec<api::PositionDto> = candidate
+            .tiles
+            .iter()
+            .map(|placement| match candidate.direction {
+                rules_shared::Direction::Horizontal => api::PositionDto {
+                    x: candidate.start.x + placement.offset,
+                    y: candidate.start.y,
+                },
+                rules_shared::Direction::Vertical => api::PositionDto {
+                    x: candidate.start.x,
+                    y: candidate.start.y + placement.offset,
+                },
+            })
+            .collect();
+
+        let move_response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", created_id),
+            Some(&started.alice.session_token),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Place {
+                    candidate: move_candidate_to_dto(&candidate),
+                },
+            },
+        )
+        .await;
+        assert_eq!(move_response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(move_response).await;
+
+        assert_eq!(updated.moves[0].move_type, "place");
+        assert_eq!(updated.moves[0].positions.len(), expected_positions.len());
+        for expected in &expected_positions {
+            assert!(
+                updated.moves[0].positions.contains(expected),
+                "expected placed-tile position {expected:?} to be recorded on the move, got {:?}",
+                updated.moves[0].positions
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn human_going_out_with_empty_bag_finishes_game_with_rack_penalty() {
         let database_url = test_database_url();
         let state = create_test_state(&database_url).await;

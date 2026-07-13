@@ -21,7 +21,7 @@ use crate::components::games_panel::GamesPanel;
 use crate::views::Home;
 
 const MAIN_CSS: Asset = asset!("/assets/styling/main.css");
-const BOARD_WIDTH: usize = 15;
+pub(crate) const BOARD_WIDTH: usize = 15;
 const BOARD_HEIGHT: usize = 15;
 /// How often the background reconnect loop pings `/health` while the
 /// server is unreachable.

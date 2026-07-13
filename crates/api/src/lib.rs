@@ -227,6 +227,9 @@ pub struct MoveRecordDto {
     pub move_type: String,
     pub main_word: Option<String>,
     pub score_delta: i32,
+    /// Board squares this move placed a tile on — empty for anything but
+    /// `"place"`.
+    pub positions: Vec<PositionDto>,
     pub description: String,
 }
 
