@@ -1,25 +1,27 @@
 use crate::time_format::format_relative_time;
-use api::{CreateSeatRequest, GameRelationship, GameStatus, GameSummaryDto, SeatClaim, SeatKind};
+use api::{
+    CreateSeatRequest, GameRelationship, GameStateDto, GameStatus, GameSummaryDto, MoveRecordDto,
+    ParticipantDto, SeatClaim, SeatKind,
+};
 use dioxus::prelude::*;
 
 const DEFAULT_ENGINE_ID: &str = "greedy-v1";
 const DEFAULT_TIME_LIMIT_HOURS: u32 = 72;
 
-/// The seat shape for a newly created game. Every variant is exactly two
-/// seats today; see `crate::app::build_new_game_seats` for how each maps to
-/// `CreateSeatRequest`s. These stay as one-click shortcuts alongside the
-/// general seat-builder form below.
+/// One-click starting shapes for the draft table below — each seeds
+/// `include_creator`/`additional_seats` with a starting roster that's still
+/// fully editable before you click Invite (see `preset_draft`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NewGameKind {
+enum NewGameKind {
     VsEngine,
     VsHuman,
     EngineVsEngine,
 }
 
-/// What the seat-builder form emits on submit — already fully resolved into
-/// `CreateSeatRequest`s (the "Me" seat's display name is filled in here,
-/// since only this component knows the draft rows), so the caller just
-/// POSTs it as-is.
+/// What the seat-builder table emits on submit — already fully resolved
+/// into `CreateSeatRequest`s (the "you" seat's display name is filled in
+/// here, since only this component knows the draft rows), so the caller
+/// just POSTs it as-is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CustomGameSubmission {
     pub seats: Vec<CreateSeatRequest>,
@@ -40,20 +42,135 @@ struct AdditionalSeatDraft {
     name: String,
 }
 
+/// The starting roster for each quick-preset button: whether "you" are
+/// seated, plus the other seats. Pure and separate from `build_seats` so
+/// both halves (seeding the draft, resolving it to a request) are testable
+/// without a running component.
+fn preset_draft(kind: NewGameKind) -> (bool, Vec<AdditionalSeatDraft>) {
+    match kind {
+        NewGameKind::VsEngine => (
+            true,
+            vec![AdditionalSeatDraft {
+                kind: AdditionalSeatKind::Engine,
+                name: String::new(),
+            }],
+        ),
+        NewGameKind::VsHuman => (
+            true,
+            vec![AdditionalSeatDraft {
+                kind: AdditionalSeatKind::Open,
+                name: String::new(),
+            }],
+        ),
+        NewGameKind::EngineVsEngine => (
+            false,
+            vec![
+                AdditionalSeatDraft {
+                    kind: AdditionalSeatKind::Engine,
+                    name: String::new(),
+                },
+                AdditionalSeatDraft {
+                    kind: AdditionalSeatKind::Engine,
+                    name: String::new(),
+                },
+            ],
+        ),
+    }
+}
+
+/// Seeds the draft signals from a preset and opens the draft view. A plain
+/// function (rather than a closure captured by multiple buttons) sidesteps
+/// the `FnMut`-borrow ambiguity of sharing one closure across several
+/// `onclick` handlers — each button just calls this directly with its own
+/// `NewGameKind` and the (`Copy`) signals.
+fn start_draft(
+    kind: NewGameKind,
+    mut include_creator: Signal<bool>,
+    mut additional_seats: Signal<Vec<AdditionalSeatDraft>>,
+    mut time_limit_hours: Signal<u32>,
+    mut drafting: Signal<bool>,
+) {
+    let (creator, seats) = preset_draft(kind);
+    include_creator.set(creator);
+    additional_seats.set(seats);
+    time_limit_hours.set(DEFAULT_TIME_LIMIT_HOURS);
+    drafting.set(true);
+}
+
+/// Resolves a draft roster into `CreateSeatRequest`s ready to POST.
+fn build_seats(
+    include_creator: bool,
+    additional: &[AdditionalSeatDraft],
+    my_display_name: Option<&str>,
+) -> Vec<CreateSeatRequest> {
+    let mut seats = Vec::new();
+    if include_creator {
+        seats.push(CreateSeatRequest {
+            kind: SeatKind::Human,
+            display_name: my_display_name.unwrap_or("Player 1").to_string(),
+            engine_id: None,
+            claim: Some(SeatClaim::Creator),
+        });
+    }
+    let engine_count = additional
+        .iter()
+        .filter(|seat| seat.kind == AdditionalSeatKind::Engine)
+        .count();
+    let mut engine_index = 0;
+    for draft in additional {
+        seats.push(match draft.kind {
+            AdditionalSeatKind::Named => CreateSeatRequest {
+                kind: SeatKind::Human,
+                display_name: draft.name.trim().to_string(),
+                engine_id: None,
+                claim: Some(SeatClaim::Named {
+                    display_name: draft.name.trim().to_string(),
+                }),
+            },
+            AdditionalSeatKind::Open => CreateSeatRequest {
+                kind: SeatKind::Human,
+                display_name: "Open seat".to_string(),
+                engine_id: None,
+                claim: Some(SeatClaim::Open),
+            },
+            AdditionalSeatKind::Engine => {
+                engine_index += 1;
+                let label = if engine_count > 1 {
+                    format!("Greedy {engine_index}")
+                } else {
+                    "Greedy".to_string()
+                };
+                CreateSeatRequest {
+                    kind: SeatKind::Engine,
+                    display_name: label,
+                    engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
+                    claim: None,
+                }
+            }
+        });
+    }
+    seats
+}
+
 #[component]
+#[allow(clippy::too_many_arguments)]
 pub fn GamesPanel(
     summaries: Vec<GameSummaryDto>,
     selected_id: Option<String>,
+    current_game: Option<GameStateDto>,
+    viewer_player_id: Option<String>,
     is_loading: bool,
     my_display_name: Option<String>,
+    can_start: bool,
     on_select: EventHandler<String>,
-    on_new_game: EventHandler<NewGameKind>,
+    on_start: EventHandler<()>,
     on_custom_new_game: EventHandler<CustomGameSubmission>,
     on_accept_invitation: EventHandler<String>,
     on_reject_invitation: EventHandler<String>,
     on_refresh: EventHandler<()>,
 ) -> Element {
-    let mut show_builder = use_signal(|| false);
+    let mut drafting = use_signal(|| false);
+    let mut include_creator = use_signal(|| true);
     let mut additional_seats = use_signal(Vec::<AdditionalSeatDraft>::new);
     let mut time_limit_hours = use_signal(|| DEFAULT_TIME_LIMIT_HOURS);
 
@@ -70,17 +187,34 @@ pub fn GamesPanel(
         .into_iter()
         .partition(|s| s.relationship == GameRelationship::InvitedByName);
 
-    let section = |title: &'static str, rows: Vec<GameSummaryDto>, show_invite_actions: bool| {
-        if rows.is_empty() {
-            return rsx! {};
-        }
-        let row_elements = rows.into_iter().map(|summary| {
-            game_row(&summary, selected_id.as_deref(), show_invite_actions, on_select, on_accept_invitation, on_reject_invitation)
-        });
-        rsx! {
-            div { class: "games-list-section",
-                h3 { class: "games-list-section-title", "{title}" }
-                div { class: "games-list", {row_elements} }
+    let section = {
+        let current_game = current_game.clone();
+        let viewer_player_id = viewer_player_id.clone();
+        move |title: &'static str, rows: Vec<GameSummaryDto>, show_invite_actions: bool| {
+            if rows.is_empty() {
+                return rsx! {};
+            }
+            let row_elements = rows.into_iter().map(|summary| {
+                game_row(
+                    &summary,
+                    selected_id.as_deref(),
+                    show_invite_actions,
+                    current_game.as_ref(),
+                    viewer_player_id.as_deref(),
+                    can_start,
+                    is_loading,
+                    drafting,
+                    on_select,
+                    on_start,
+                    on_accept_invitation,
+                    on_reject_invitation,
+                )
+            });
+            rsx! {
+                div { class: "games-list-section",
+                    h3 { class: "games-list-section-title", "{title}" }
+                    div { class: "games-list", {row_elements} }
+                }
             }
         }
     };
@@ -88,45 +222,47 @@ pub fn GamesPanel(
     let seat_rows = additional_seats().into_iter().enumerate().map(|(index, draft)| {
         let removable_index = index;
         rsx! {
-            div { key: "{index}", class: "seat-draft-row",
-                span { class: "seat-draft-kind", "{seat_kind_label(draft.kind)}" }
-                if draft.kind == AdditionalSeatKind::Named {
-                    input {
-                        class: "seat-draft-name-input",
-                        placeholder: "Display name to invite",
-                        value: "{draft.name}",
-                        oninput: move |event| {
+            tr { key: "{index}",
+                td {
+                    if draft.kind == AdditionalSeatKind::Named {
+                        input {
+                            class: "seat-draft-name-input",
+                            placeholder: "Display name to invite",
+                            value: "{draft.name}",
+                            oninput: move |event| {
+                                additional_seats.with_mut(|seats| {
+                                    if let Some(seat) = seats.get_mut(index) {
+                                        seat.name = event.value();
+                                    }
+                                });
+                            },
+                        }
+                    } else {
+                        "{seat_draft_label(draft.kind)}"
+                    }
+                }
+                td { "{seat_draft_kind_label(draft.kind)}" }
+                td {
+                    button {
+                        class: "toggle-button toggle-button-muted seat-draft-remove",
+                        onclick: move |_| {
                             additional_seats.with_mut(|seats| {
-                                if let Some(seat) = seats.get_mut(index) {
-                                    seat.name = event.value();
+                                if removable_index < seats.len() {
+                                    seats.remove(removable_index);
                                 }
                             });
                         },
+                        "Remove"
                     }
-                }
-                button {
-                    class: "toggle-button toggle-button-muted seat-draft-remove",
-                    onclick: move |_| {
-                        additional_seats.with_mut(|seats| {
-                            if removable_index < seats.len() {
-                                seats.remove(removable_index);
-                            }
-                        });
-                    },
-                    "Remove"
                 }
             }
         }
     });
 
-    let engine_count = additional_seats()
+    let can_submit_builder = additional_seats()
         .iter()
-        .filter(|seat| seat.kind == AdditionalSeatKind::Engine)
-        .count();
-    let can_submit_builder = my_display_name.is_some()
-        && additional_seats()
-            .iter()
-            .all(|seat| seat.kind != AdditionalSeatKind::Named || !seat.name.trim().is_empty());
+        .all(|seat| seat.kind != AdditionalSeatKind::Named || !seat.name.trim().is_empty())
+        && (include_creator() || !additional_seats().is_empty());
 
     rsx! {
         aside { class: "games-panel",
@@ -145,40 +281,66 @@ pub fn GamesPanel(
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| on_new_game.call(NewGameKind::VsEngine),
+                        onclick: move |_| start_draft(NewGameKind::VsEngine, include_creator, additional_seats, time_limit_hours, drafting),
                         "vs Engine"
                     }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| on_new_game.call(NewGameKind::VsHuman),
+                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting),
                         "vs Human"
                     }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| on_new_game.call(NewGameKind::EngineVsEngine),
+                        onclick: move |_| start_draft(NewGameKind::EngineVsEngine, include_creator, additional_seats, time_limit_hours, drafting),
                         "Engine vs Engine"
                     }
                     button {
                         class: "toggle-button toggle-button-muted",
                         disabled: is_loading,
-                        onclick: move |_| {
-                            let opening = !show_builder();
-                            show_builder.set(opening);
-                            if opening {
-                                additional_seats.set(vec![AdditionalSeatDraft { kind: AdditionalSeatKind::Open, name: String::new() }]);
-                                time_limit_hours.set(DEFAULT_TIME_LIMIT_HOURS);
-                            }
-                        },
-                        if show_builder() { "Cancel" } else { "Custom game..." }
+                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting),
+                        "Custom game..."
                     }
                 }
 
-                if show_builder() {
-                    div { class: "game-builder",
-                        p { class: "composer-copy", "You (seat 1, creator)" }
-                        div { class: "seat-draft-list", {seat_rows} }
+                if drafting() {
+                    div { class: "games-panel-detail game-builder",
+                        div { class: "game-row-top",
+                            span { class: "game-status-badge game-status-new", "New" }
+                        }
+                        table { class: "player-table",
+                            thead {
+                                tr {
+                                    th { "Player" }
+                                    th { "Kind" }
+                                    th {}
+                                }
+                            }
+                            tbody {
+                                if include_creator() {
+                                    tr { key: "you",
+                                        td { "{my_display_name.clone().unwrap_or_default()} (you)" }
+                                        td { "Human" }
+                                        td {
+                                            button {
+                                                class: "toggle-button toggle-button-muted seat-draft-remove",
+                                                onclick: move |_| include_creator.set(false),
+                                                "Remove"
+                                            }
+                                        }
+                                    }
+                                }
+                                {seat_rows}
+                            }
+                        }
+                        if !include_creator() {
+                            button {
+                                class: "toggle-button toggle-button-muted",
+                                onclick: move |_| include_creator.set(true),
+                                "+ Add yourself as a player"
+                            }
+                        }
                         div { class: "game-builder-add-row",
                             button {
                                 class: "toggle-button toggle-button-muted",
@@ -218,51 +380,25 @@ pub fn GamesPanel(
                                 },
                             }
                         }
-                        button {
-                            class: "toggle-button",
-                            disabled: is_loading || !can_submit_builder,
-                            onclick: move |_| {
-                                let Some(my_name) = my_display_name.clone() else { return };
-                                let mut seats = vec![CreateSeatRequest {
-                                    kind: SeatKind::Human,
-                                    display_name: my_name,
-                                    engine_id: None,
-                                    claim: Some(SeatClaim::Creator),
-                                }];
-                                let mut engine_index = 0;
-                                for draft in additional_seats() {
-                                    seats.push(match draft.kind {
-                                        AdditionalSeatKind::Named => CreateSeatRequest {
-                                            kind: SeatKind::Human,
-                                            display_name: draft.name.trim().to_string(),
-                                            engine_id: None,
-                                            claim: Some(SeatClaim::Named { display_name: draft.name.trim().to_string() }),
-                                        },
-                                        AdditionalSeatKind::Open => CreateSeatRequest {
-                                            kind: SeatKind::Human,
-                                            display_name: "Open seat".to_string(),
-                                            engine_id: None,
-                                            claim: Some(SeatClaim::Open),
-                                        },
-                                        AdditionalSeatKind::Engine => {
-                                            engine_index += 1;
-                                            let label = if engine_count > 1 { format!("Greedy {engine_index}") } else { "Greedy".to_string() };
-                                            CreateSeatRequest {
-                                                kind: SeatKind::Engine,
-                                                display_name: label,
-                                                engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
-                                                claim: None,
-                                            }
-                                        }
+                        div { class: "game-builder-add-row",
+                            button {
+                                class: "toggle-button",
+                                disabled: is_loading || !can_submit_builder,
+                                onclick: move |_| {
+                                    let seats = build_seats(include_creator(), &additional_seats(), my_display_name.as_deref());
+                                    on_custom_new_game.call(CustomGameSubmission {
+                                        seats,
+                                        move_time_limit_seconds: Some(time_limit_hours() as u64 * 3600),
                                     });
-                                }
-                                on_custom_new_game.call(CustomGameSubmission {
-                                    seats,
-                                    move_time_limit_seconds: Some(time_limit_hours() as u64 * 3600),
-                                });
-                                show_builder.set(false);
-                            },
-                            "Create game"
+                                    drafting.set(false);
+                                },
+                                "Invite"
+                            }
+                            button {
+                                class: "toggle-button toggle-button-muted",
+                                onclick: move |_| drafting.set(false),
+                                "Cancel"
+                            }
                         }
                     }
                 }
@@ -282,11 +418,18 @@ pub fn GamesPanel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn game_row(
     summary: &GameSummaryDto,
     selected_id: Option<&str>,
     show_invite_actions: bool,
+    current_game: Option<&GameStateDto>,
+    viewer_player_id: Option<&str>,
+    can_start: bool,
+    is_loading: bool,
+    mut drafting: Signal<bool>,
     on_select: EventHandler<String>,
+    on_start: EventHandler<()>,
     on_accept_invitation: EventHandler<String>,
     on_reject_invitation: EventHandler<String>,
 ) -> Element {
@@ -308,20 +451,47 @@ fn game_row(
             .join(" vs ")
     };
     let relative_time = format_relative_time(&summary.last_activity_at);
-    let game_id = summary.id.clone();
-    let select_id = game_id.clone();
+    let select_id = summary.id.clone();
     let invitation_id = summary.invitation_id.clone();
+
+    // Prefer the fully-loaded game (has scores + move history) when it
+    // matches this row; fall back to the summary's participants (scores,
+    // no history) while the full load is still in flight.
+    let (participants, moves): (Vec<ParticipantDto>, Vec<MoveRecordDto>) =
+        match current_game.filter(|g| g.id == summary.id) {
+            Some(g) => (g.participants.clone(), g.moves.clone()),
+            None => (summary.participants.clone(), Vec::new()),
+        };
+    let loaded_matches = current_game.is_some_and(|g| g.id == summary.id);
 
     rsx! {
         div { key: "{summary.id}", class: "game-row-wrapper",
             button {
                 class: "{row_class}",
-                onclick: move |_| on_select.call(select_id.clone()),
+                onclick: move |_| {
+                    drafting.set(false);
+                    on_select.call(select_id.clone());
+                },
                 div { class: "game-row-top",
                     span { class: "{badge_class}", "{status_label(&summary.status)}" }
                     span { class: "game-row-time", "{relative_time}" }
                 }
                 p { class: "game-row-participants", "{participants_label}" }
+            }
+            if is_selected {
+                div { class: "games-panel-detail",
+                    {player_table(&participants, &moves, viewer_player_id)}
+                    if summary.status == GameStatus::Waiting {
+                        div { class: "game-builder-add-row",
+                            button {
+                                class: "toggle-button",
+                                disabled: is_loading || !(can_start && loaded_matches),
+                                onclick: move |_| on_start.call(()),
+                                "Start"
+                            }
+                        }
+                    }
+                }
             }
             if show_invite_actions {
                 if let Some(invitation_id) = invitation_id {
@@ -351,18 +521,133 @@ fn game_row(
     }
 }
 
-fn seat_kind_label(kind: AdditionalSeatKind) -> &'static str {
+fn player_table(participants: &[ParticipantDto], moves: &[MoveRecordDto], viewer_player_id: Option<&str>) -> Element {
+    let rows = participants.iter().map(|participant| {
+        let is_you = viewer_player_id.is_some() && participant.player_id.as_deref() == viewer_player_id;
+        let row_class = if is_you { "player-table-you" } else { "" };
+        let cell = last_move_cell(moves, participant.seat_number);
+        rsx! {
+            tr { key: "{participant.seat_number}", class: "{row_class}",
+                td {
+                    "{participant.display_name}"
+                    if is_you {
+                        span { class: "player-table-you-tag", " (you)" }
+                    }
+                }
+                td { "{seat_kind_label(&participant.kind)}" }
+                td { class: "player-table-score", "{participant.score}" }
+                td { {render_last_move(&cell)} }
+            }
+        }
+    });
+    rsx! {
+        table { class: "player-table",
+            thead {
+                tr {
+                    th { "Player" }
+                    th { "Kind" }
+                    th { "Score" }
+                    th { "Last move" }
+                }
+            }
+            tbody { {rows} }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum LastMoveCell {
+    None,
+    Note(String),
+    Word { word: String, score_delta: i32 },
+}
+
+fn last_move_cell(moves: &[MoveRecordDto], seat_number: u8) -> LastMoveCell {
+    match moves.iter().rev().find(|record| record.seat_number == seat_number) {
+        None => LastMoveCell::None,
+        Some(record) if record.move_type == "place" => LastMoveCell::Word {
+            word: record.main_word.clone().unwrap_or_default(),
+            score_delta: record.score_delta,
+        },
+        Some(record) => LastMoveCell::Note(action_note(record)),
+    }
+}
+
+fn render_last_move(cell: &LastMoveCell) -> Element {
+    match cell {
+        LastMoveCell::None => rsx! {
+            span { class: "player-table-last-move-empty", "—" }
+        },
+        LastMoveCell::Note(note) => rsx! {
+            span { class: "player-table-last-move-note", "{note}" }
+        },
+        LastMoveCell::Word { word, score_delta } => {
+            let url = format!(
+                "https://www.collinsdictionary.com/dictionary/english/{}",
+                word.to_lowercase()
+            );
+            let delta = *score_delta;
+            rsx! {
+                a {
+                    class: "player-table-last-move-word",
+                    href: "{url}",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    "{word}"
+                }
+                span { class: "player-table-last-move-score", " +{delta}" }
+            }
+        }
+    }
+}
+
+/// Pass/exchange/resign rows have no word or score, so this builds the
+/// short note shown in that slot instead. Exchange's tile count is parsed
+/// out of the existing `description` text (e.g. "Alice exchanged 3 tiles")
+/// rather than adding a new field, since the server already formats it.
+fn action_note(record: &MoveRecordDto) -> String {
+    match record.move_type.as_str() {
+        "pass" => "passed".to_string(),
+        "resign" => "resigned".to_string(),
+        "timeout" => "retired (exceeded time limit)".to_string(),
+        "exchange" => {
+            let count = record
+                .description
+                .split_whitespace()
+                .find_map(|token| token.parse::<u32>().ok())
+                .unwrap_or(0);
+            format!("exchanged {count} letter{}", if count == 1 { "" } else { "s" })
+        }
+        other => other.to_string(),
+    }
+}
+
+fn seat_kind_label(kind: &SeatKind) -> &'static str {
     match kind {
-        AdditionalSeatKind::Named => "Invite by name:",
+        SeatKind::Human => "Human",
+        SeatKind::Engine => "Engine",
+    }
+}
+
+fn seat_draft_label(kind: AdditionalSeatKind) -> &'static str {
+    match kind {
+        AdditionalSeatKind::Named => "Invite by name",
         AdditionalSeatKind::Open => "Open seat (any player may claim)",
+        AdditionalSeatKind::Engine => "Engine (Greedy)",
+    }
+}
+
+fn seat_draft_kind_label(kind: AdditionalSeatKind) -> &'static str {
+    match kind {
         AdditionalSeatKind::Engine => "Engine",
+        AdditionalSeatKind::Named | AdditionalSeatKind::Open => "Human",
     }
 }
 
 fn status_label(status: &GameStatus) -> &'static str {
     match status {
         GameStatus::Waiting => "Waiting",
-        GameStatus::Active => "Active",
+        GameStatus::Active => "Playing",
         GameStatus::Finished => "Finished",
     }
 }
@@ -372,5 +657,102 @@ fn status_slug(status: &GameStatus) -> &'static str {
         GameStatus::Waiting => "waiting",
         GameStatus::Active => "active",
         GameStatus::Finished => "finished",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vs_engine_seats_are_one_human_one_engine() {
+        let (include_creator, additional) = preset_draft(NewGameKind::VsEngine);
+        let seats = build_seats(include_creator, &additional, Some("Alice"));
+        assert_eq!(seats.len(), 2);
+        assert_eq!(seats[0].kind, SeatKind::Human);
+        assert_eq!(seats[0].display_name, "Alice");
+        assert_eq!(seats[1].kind, SeatKind::Engine);
+        assert!(seats[1].engine_id.is_some());
+    }
+
+    #[test]
+    fn vs_human_seats_are_both_human() {
+        let (include_creator, additional) = preset_draft(NewGameKind::VsHuman);
+        let seats = build_seats(include_creator, &additional, Some("Alice"));
+        assert_eq!(seats.len(), 2);
+        assert!(seats.iter().all(|seat| seat.kind == SeatKind::Human));
+        assert_eq!(seats[0].display_name, "Alice");
+    }
+
+    #[test]
+    fn engine_vs_engine_has_no_creator_seat_and_ignores_display_name() {
+        let (include_creator, additional) = preset_draft(NewGameKind::EngineVsEngine);
+        assert!(!include_creator);
+        let seats = build_seats(include_creator, &additional, Some("Alice"));
+        assert_eq!(seats.len(), 2);
+        assert!(seats.iter().all(|seat| seat.kind == SeatKind::Engine));
+        assert!(seats.iter().all(|seat| seat.engine_id.is_some()));
+        assert!(seats.iter().all(|seat| seat.display_name != "Alice"));
+    }
+
+    #[test]
+    fn anonymous_creator_gets_a_generic_name_instead_of_a_hardcoded_one() {
+        let (include_creator, additional) = preset_draft(NewGameKind::VsEngine);
+        let seats = build_seats(include_creator, &additional, None);
+        assert_ne!(seats[0].display_name, "Alice");
+        assert!(!seats[0].display_name.is_empty());
+    }
+
+    #[test]
+    fn removing_the_creator_row_seats_only_the_others() {
+        let seats = build_seats(
+            false,
+            &[AdditionalSeatDraft { kind: AdditionalSeatKind::Engine, name: String::new() }],
+            Some("Alice"),
+        );
+        assert_eq!(seats.len(), 1);
+        assert_eq!(seats[0].kind, SeatKind::Engine);
+    }
+
+    #[test]
+    fn last_move_cell_picks_the_most_recent_record_for_that_seat() {
+        let moves = vec![
+            MoveRecordDto {
+                move_number: 1,
+                seat_number: 0,
+                move_type: "place".to_string(),
+                main_word: Some("CAT".to_string()),
+                score_delta: 10,
+                description: String::new(),
+            },
+            MoveRecordDto {
+                move_number: 2,
+                seat_number: 1,
+                move_type: "pass".to_string(),
+                main_word: None,
+                score_delta: 0,
+                description: String::new(),
+            },
+            MoveRecordDto {
+                move_number: 3,
+                seat_number: 0,
+                move_type: "place".to_string(),
+                main_word: Some("DOG".to_string()),
+                score_delta: 8,
+                description: String::new(),
+            },
+        ];
+        match last_move_cell(&moves, 0) {
+            LastMoveCell::Word { word, score_delta } => {
+                assert_eq!(word, "DOG");
+                assert_eq!(score_delta, 8);
+            }
+            other => panic!("expected a word cell, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn last_move_cell_is_none_when_seat_has_no_moves() {
+        assert_eq!(last_move_cell(&[], 0), LastMoveCell::None);
     }
 }

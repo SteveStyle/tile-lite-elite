@@ -1,7 +1,7 @@
 use api::{
-    BoardCellDto, CreateGameRequest, CreateSeatRequest, DirectionDto, GameActionRequest,
-    GameEventDto, GameStateDto, GameStatus, MoveCandidateDto, ParticipantDto, PositionDto,
-    PremiumDto, RackDto, SeatClaim, SeatKind, StartGameRequest, TileDto, TilePlacementDto,
+    BoardCellDto, CreateGameRequest, DirectionDto, GameActionRequest, GameEventDto, GameStateDto,
+    GameStatus, MoveCandidateDto, ParticipantDto, PositionDto, PremiumDto, RackDto, SeatKind,
+    StartGameRequest, TileDto, TilePlacementDto,
 };
 use dioxus::prelude::*;
 use futures_util::StreamExt;
@@ -17,12 +17,10 @@ use gloo_net::{
 use tokio_tungstenite::connect_async;
 
 use crate::components::auth_panel::AuthPanel;
-use crate::components::games_panel::{GamesPanel, NewGameKind};
-use crate::components::sidebar::Sidebar;
+use crate::components::games_panel::GamesPanel;
 use crate::views::Home;
 
 const MAIN_CSS: Asset = asset!("/assets/styling/main.css");
-const DEFAULT_ENGINE_ID: &str = "greedy-v1";
 const BOARD_WIDTH: usize = 15;
 const BOARD_HEIGHT: usize = 15;
 /// How often the background reconnect loop pings `/health` while the
@@ -302,7 +300,6 @@ pub fn RootApp() -> Element {
         });
     }
     let staged_preview = staged_preview();
-    let server_url_for_create = server_url.clone();
     let server_url_for_custom_create = server_url.clone();
     let server_url_for_accept = server_url.clone();
     let server_url_for_reject = server_url.clone();
@@ -378,8 +375,41 @@ pub fn RootApp() -> Element {
                 GamesPanel {
                     summaries: game_summaries().clone(),
                     selected_id: game().as_ref().map(|current| current.id.clone()),
+                    current_game: game().clone(),
+                    viewer_player_id: viewer_player_id.clone(),
                     is_loading: is_loading(),
                     my_display_name: session().map(|current| current.display_name.clone()),
+                    can_start,
+                    on_start: move |_| {
+                        let server_url = server_url_for_start.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match start_game(&server_url, &current_game.id, token.as_deref()).await {
+                                    Ok(updated) => {
+                                        info_message.set(None);
+                                        reset_composer_state(
+                                            dragging_tile_id,
+                                            selected_blank_letter,
+                                            staged_placements,
+                                            selected_cell,
+                                            exchange_mode,
+                                            exchange_selected,
+                                        );
+                                        game.set(Some(updated));
+                                        if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                            game_summaries.set(summaries);
+                                        }
+                                    }
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
                     on_select: move |game_id: String| {
                         let server_url = server_url_for_select.clone();
                         spawn(async move {
@@ -398,35 +428,6 @@ pub fn RootApp() -> Element {
                                     );
                                     websocket_game_id.set(None);
                                     game.set(Some(loaded));
-                                }
-                                Err(error) => error_message.set(Some(error)),
-                            }
-                            is_loading.set(false);
-                        });
-                    },
-                    on_new_game: move |kind: NewGameKind| {
-                        let server_url = server_url_for_create.clone();
-                        let token = session().map(|current| current.session_token.clone());
-                        let my_display_name = session().map(|current| current.display_name.clone());
-                        spawn(async move {
-                            is_loading.set(true);
-                            error_message.set(None);
-                            match create_game(&server_url, token.as_deref(), kind, my_display_name.as_deref()).await {
-                                Ok(created) => {
-                                    info_message.set(None);
-                                    reset_composer_state(
-                                        dragging_tile_id,
-                                        selected_blank_letter,
-                                        staged_placements,
-                                        selected_cell,
-                                        exchange_mode,
-                                        exchange_selected,
-                                    );
-                                    websocket_game_id.set(None);
-                                    game.set(Some(created));
-                                    if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
-                                        game_summaries.set(summaries);
-                                    }
                                 }
                                 Err(error) => error_message.set(Some(error)),
                             }
@@ -723,34 +724,6 @@ pub fn RootApp() -> Element {
                     },
                     selected_blank_letter: selected_blank_letter(),
                     staged_preview,
-                    can_start,
-                    on_start: move |_| {
-                        let server_url = server_url_for_start.clone();
-                        let current_game = game().clone();
-                        let token = session().map(|current| current.session_token.clone());
-                        if let Some(current_game) = current_game {
-                            spawn(async move {
-                                is_loading.set(true);
-                                error_message.set(None);
-                                match start_game(&server_url, &current_game.id, token.as_deref()).await {
-                                    Ok(updated) => {
-                                        info_message.set(None);
-                                        reset_composer_state(
-                                            dragging_tile_id,
-                                            selected_blank_letter,
-                                            staged_placements,
-                                            selected_cell,
-                                            exchange_mode,
-                                            exchange_selected,
-                                        );
-                                        game.set(Some(updated));
-                                    }
-                                    Err(error) => error_message.set(Some(error)),
-                                }
-                                is_loading.set(false);
-                            });
-                        }
-                    },
                     can_pass: can_submit_human_action && !exchange_mode(),
                     on_pass: move |_| {
                         let server_url = server_url_for_pass.clone();
@@ -772,6 +745,9 @@ pub fn RootApp() -> Element {
                                             exchange_selected,
                                         );
                                         game.set(Some(updated));
+                                        if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                            game_summaries.set(summaries);
+                                        }
                                     }
                                     Err(error) => error_message.set(Some(error)),
                                 }
@@ -810,6 +786,9 @@ pub fn RootApp() -> Element {
                                             exchange_selected,
                                         );
                                         game.set(Some(updated));
+                                        if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                            game_summaries.set(summaries);
+                                        }
                                     }
                                     Err(error) => error_message.set(Some(error)),
                                 }
@@ -878,6 +857,9 @@ pub fn RootApp() -> Element {
                                             exchange_selected,
                                         );
                                         game.set(Some(updated));
+                                        if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                            game_summaries.set(summaries);
+                                        }
                                     }
                                     Err(error) => error_message.set(Some(error)),
                                 }
@@ -889,12 +871,6 @@ pub fn RootApp() -> Element {
                         exchange_mode.set(false);
                         exchange_selected.set(HashSet::new());
                     },
-                }
-
-                Sidebar {
-                    participants: game_for_view.participants.clone(),
-                    moves: game_for_view.moves.clone(),
-                    current_seat: game_for_view.current_seat,
                 }
             }
         }
@@ -1156,77 +1132,6 @@ async fn load_summaries_and_game(
     }
 }
 
-/// Builds the seats for a freshly created game. Every human seat needs a
-/// claim now (creating a game requires being signed in — there's no more
-/// anonymous/open-to-anyone seat), so the first seat is always `Creator`
-/// when the caller has a display name. These three presets are shortcuts
-/// into the general seat-builder form (creator / named / open / engine per
-/// seat) rather than separate hardcoded flows.
-fn build_new_game_seats(kind: NewGameKind, my_display_name: Option<&str>) -> Vec<CreateSeatRequest> {
-    let my_name = my_display_name.unwrap_or("Player 1").to_string();
-    match kind {
-        NewGameKind::VsEngine => vec![
-            CreateSeatRequest {
-                kind: SeatKind::Human,
-                display_name: my_name,
-                engine_id: None,
-                claim: Some(SeatClaim::Creator),
-            },
-            CreateSeatRequest {
-                kind: SeatKind::Engine,
-                display_name: "Greedy".to_string(),
-                engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
-                claim: None,
-            },
-        ],
-        NewGameKind::VsHuman => vec![
-            CreateSeatRequest {
-                kind: SeatKind::Human,
-                display_name: my_name,
-                engine_id: None,
-                claim: Some(SeatClaim::Creator),
-            },
-            CreateSeatRequest {
-                kind: SeatKind::Human,
-                display_name: "Open seat".to_string(),
-                engine_id: None,
-                claim: Some(SeatClaim::Open),
-            },
-        ],
-        NewGameKind::EngineVsEngine => vec![
-            CreateSeatRequest {
-                kind: SeatKind::Engine,
-                display_name: "Greedy One".to_string(),
-                engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
-                claim: None,
-            },
-            CreateSeatRequest {
-                kind: SeatKind::Engine,
-                display_name: "Greedy Two".to_string(),
-                engine_id: Some(DEFAULT_ENGINE_ID.to_string()),
-                claim: None,
-            },
-        ],
-    }
-}
-
-async fn create_game(
-    server_url: &str,
-    token: Option<&str>,
-    kind: NewGameKind,
-    my_display_name: Option<&str>,
-) -> Result<GameStateDto, String> {
-    let request = CreateGameRequest {
-        seats: build_new_game_seats(kind, my_display_name),
-        seed: None,
-        variant: None,
-        language: None,
-        board_layout: None,
-        move_time_limit_seconds: None,
-    };
-
-    post_json(&format!("{server_url}/games"), token, &request).await
-}
 
 async fn create_custom_game(
     server_url: &str,
@@ -2066,40 +1971,6 @@ mod tests {
             compare_api_version(server, client),
             VersionCheck::MinorMismatch { server, client }
         );
-    }
-
-    #[test]
-    fn vs_engine_seats_are_one_human_one_engine() {
-        let seats = build_new_game_seats(NewGameKind::VsEngine, Some("Alice"));
-        assert_eq!(seats.len(), 2);
-        assert_eq!(seats[0].kind, SeatKind::Human);
-        assert_eq!(seats[0].display_name, "Alice");
-        assert_eq!(seats[1].kind, SeatKind::Engine);
-        assert!(seats[1].engine_id.is_some());
-    }
-
-    #[test]
-    fn vs_human_seats_are_both_human() {
-        let seats = build_new_game_seats(NewGameKind::VsHuman, Some("Alice"));
-        assert_eq!(seats.len(), 2);
-        assert!(seats.iter().all(|seat| seat.kind == SeatKind::Human));
-        assert_eq!(seats[0].display_name, "Alice");
-    }
-
-    #[test]
-    fn engine_vs_engine_seats_are_both_engine_and_ignore_display_name() {
-        let seats = build_new_game_seats(NewGameKind::EngineVsEngine, Some("Alice"));
-        assert_eq!(seats.len(), 2);
-        assert!(seats.iter().all(|seat| seat.kind == SeatKind::Engine));
-        assert!(seats.iter().all(|seat| seat.engine_id.is_some()));
-        assert!(seats.iter().all(|seat| seat.display_name != "Alice"));
-    }
-
-    #[test]
-    fn anonymous_creator_gets_a_generic_name_instead_of_a_hardcoded_one() {
-        let seats = build_new_game_seats(NewGameKind::VsEngine, None);
-        assert_ne!(seats[0].display_name, "Alice");
-        assert!(!seats[0].display_name.is_empty());
     }
 
     fn test_game(board: Vec<BoardCellDto>) -> GameStateDto {

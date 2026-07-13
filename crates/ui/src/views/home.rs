@@ -32,8 +32,6 @@ pub fn Home(
     on_set_blank_letter: EventHandler<char>,
     selected_blank_letter: Option<char>,
     staged_preview: Option<MovePreviewView>,
-    can_start: bool,
-    on_start: EventHandler<()>,
     can_pass: bool,
     on_pass: EventHandler<()>,
     can_submit_manual: bool,
@@ -48,7 +46,6 @@ pub fn Home(
     on_cancel_exchange: EventHandler<()>,
 ) -> Element {
     let has_rack = can_view_rack;
-    let is_waiting = game.status == GameStatus::Waiting;
     let is_active = game.status == GameStatus::Active;
 
     // Show blank picker when there is a staged blank tile still needing a letter.
@@ -194,14 +191,6 @@ pub fn Home(
                     }
 
                     div { class: "turn-actions",
-                        if is_waiting {
-                            button {
-                                class: "toggle-button",
-                                disabled: is_loading || !can_start,
-                                onclick: move |_| on_start.call(()),
-                                "Start"
-                            }
-                        }
                         if is_active && exchange_mode {
                             button {
                                 class: "toggle-button toggle-button-muted",
