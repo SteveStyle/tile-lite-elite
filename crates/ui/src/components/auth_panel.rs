@@ -49,7 +49,22 @@ pub fn AuthPanel(
                     }
                     button {
                         class: "toggle-button toggle-button-muted",
-                        onclick: move |_| on_logout.call(()),
+                        onclick: move |_| {
+                            // Logging out should hand back a clean modal,
+                            // not whatever was left over from before — the
+                            // password (and, in Register mode, email) must
+                            // never carry over. Display name is the one
+                            // exception: it survives if "Remember me" is
+                            // what's asking it to (see local_storage.rs).
+                            mode.set(AuthMode::Login);
+                            email.set(String::new());
+                            password.set(String::new());
+                            stay_logged_in.set(false);
+                            if !remember_me() {
+                                display_name.set(String::new());
+                            }
+                            on_logout.call(());
+                        },
                         "Log out"
                     }
                 }
@@ -120,6 +135,13 @@ pub fn AuthPanel(
                                                 current_password_input.set(String::new());
                                                 new_password_input.set(String::new());
                                                 confirm_password_input.set(String::new());
+                                                mode.set(AuthMode::Login);
+                                                email.set(String::new());
+                                                password.set(String::new());
+                                                stay_logged_in.set(false);
+                                                if !remember_me() {
+                                                    display_name.set(String::new());
+                                                }
                                                 on_password_changed.call(());
                                             }
                                             Err(error) => change_password_error.set(Some(error)),
@@ -192,7 +214,9 @@ pub fn AuthPanel(
                 oninput: move |event| password.set(event.value()),
             }
 
-            label { class: "auth-checkbox-label",
+            label {
+                class: "auth-checkbox-label",
+                title: "Pre-fills your display name next time you log in. Doesn't keep you signed in or store your password.",
                 input {
                     r#type: "checkbox",
                     checked: remember_me(),
@@ -200,7 +224,9 @@ pub fn AuthPanel(
                 }
                 "Remember me"
             }
-            label { class: "auth-checkbox-label",
+            label {
+                class: "auth-checkbox-label",
+                title: "Keeps you signed in on this device — no need to log in again next time. Leave unchecked on a shared or public computer.",
                 input {
                     r#type: "checkbox",
                     checked: stay_logged_in(),

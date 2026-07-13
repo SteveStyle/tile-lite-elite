@@ -305,6 +305,7 @@ pub fn RootApp() -> Element {
         });
     }
     let staged_preview = staged_preview();
+    let server_url_for_login = server_url.clone();
     let server_url_for_custom_create = server_url.clone();
     let server_url_for_accept = server_url.clone();
     let server_url_for_reject = server_url.clone();
@@ -347,8 +348,30 @@ pub fn RootApp() -> Element {
                             },
                         };
                         crate::local_storage::save(&stored);
-                        info_message.set(Some(format!("Logged in as {}", new_session.display_name)));
+                        let token = new_session.session_token.clone();
                         session.set(Some(new_session));
+
+                        let server_url = server_url_for_login.clone();
+                        spawn(async move {
+                            is_loading.set(true);
+                            load_summaries_and_game(
+                                &server_url,
+                                Some(&token),
+                                None,
+                                game,
+                                game_summaries,
+                                info_message,
+                                error_message,
+                                dragging_tile_id,
+                                selected_blank_letter,
+                                staged_placements,
+                                selected_cell,
+                                exchange_mode,
+                                exchange_selected,
+                            )
+                            .await;
+                            is_loading.set(false);
+                        });
                     },
                     on_logout: move |_| {
                         let stored = crate::local_storage::load();
