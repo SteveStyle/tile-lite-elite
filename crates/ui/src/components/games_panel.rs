@@ -26,6 +26,12 @@ enum NewGameKind {
 pub struct CustomGameSubmission {
     pub seats: Vec<CreateSeatRequest>,
     pub move_time_limit_seconds: Option<u64>,
+    /// True when every seat is already resolved (no invitation left to wait
+    /// on) — the roster the "Start" label (as opposed to "Invite") promised.
+    /// The caller should immediately call the start endpoint too, rather
+    /// than leaving the game sitting in `Waiting` behind a second,
+    /// redundant "Start" click.
+    pub start_immediately: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -397,6 +403,7 @@ pub fn GamesPanel(
                                     on_custom_new_game.call(CustomGameSubmission {
                                         seats,
                                         move_time_limit_seconds: Some(time_limit_hours() as u64 * 3600),
+                                        start_immediately: !needs_invitations,
                                     });
                                     drafting.set(false);
                                 },

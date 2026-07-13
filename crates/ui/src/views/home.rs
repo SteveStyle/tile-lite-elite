@@ -25,6 +25,7 @@ pub fn Home(
     on_toggle_direction: EventHandler<()>,
     on_drag_rack_tile: EventHandler<usize>,
     on_drag_end_rack_tile: EventHandler<()>,
+    on_drop_rack_tile: EventHandler<usize>,
     on_drag_staged_tile: EventHandler<usize>,
     on_drag_end_staged_tile: EventHandler<usize>,
     on_drop_board_cell: EventHandler<usize>,
@@ -99,6 +100,15 @@ pub fn Home(
                 keyboard_focus.set(Some(event.data()));
             },
             onkeydown: move |event| {
+                if event.key() == Key::Enter {
+                    // Works regardless of cursor position — once tiles are
+                    // staged, Enter submits them the same as clicking Play.
+                    if can_submit_manual {
+                        event.prevent_default();
+                        on_submit_manual.call(());
+                    }
+                    return;
+                }
                 if selected_cell.is_none() {
                     return;
                 }
@@ -233,6 +243,7 @@ pub fn Home(
                         exchange_selected: exchange_selected.clone(),
                         on_drag_start: on_drag_rack_tile,
                         on_drag_end: on_drag_end_rack_tile,
+                        on_drop_tile: on_drop_rack_tile,
                         on_click_tile: on_click_rack_tile,
                         on_toggle_exchange_tile,
                     }

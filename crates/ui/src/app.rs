@@ -509,22 +509,38 @@ pub fn RootApp() -> Element {
                         spawn(async move {
                             is_loading.set(true);
                             error_message.set(None);
+                            let start_immediately = submission.start_immediately;
                             match create_custom_game(&server_url, token.as_deref(), &submission).await {
                                 Ok(created) => {
-                                    info_message.set(None);
-                                    reset_composer_state(
-                                        dragging_tile_id,
-                                        selected_blank_letter,
-                                        staged_placements,
-                                        selected_cell,
-                                        exchange_mode,
-                                        exchange_selected,
-                                        direction_override,
-                                    );
-                                    websocket_game_id.set(None);
-                                    game.set(Some(created));
-                                    if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
-                                        game_summaries.set(summaries);
+                                    // A roster with no invitation left to wait on (every
+                                    // seat already resolved) starts right away — the
+                                    // "Start" label on the draft button promised that,
+                                    // rather than leaving the game in `Waiting` behind a
+                                    // second, redundant per-game Start click.
+                                    let started = if start_immediately {
+                                        start_game(&server_url, &created.id, token.as_deref()).await
+                                    } else {
+                                        Ok(created)
+                                    };
+                                    match started {
+                                        Ok(game_state) => {
+                                            info_message.set(None);
+                                            reset_composer_state(
+                                                dragging_tile_id,
+                                                selected_blank_letter,
+                                                staged_placements,
+                                                selected_cell,
+                                                exchange_mode,
+                                                exchange_selected,
+                                                direction_override,
+                                            );
+                                            websocket_game_id.set(None);
+                                            game.set(Some(game_state));
+                                            if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                                game_summaries.set(summaries);
+                                            }
+                                        }
+                                        Err(error) => error_message.set(Some(error)),
                                     }
                                 }
                                 Err(error) => error_message.set(Some(error)),
@@ -613,6 +629,22 @@ pub fn RootApp() -> Element {
                         dragging_from_board_index.set(None);
                     },
                     on_drag_end_rack_tile: move |_| {
+                        dragging_tile_id.set(None);
+                    },
+                    on_drop_rack_tile: move |target_id: usize| {
+                        if dragging_from_board_index().is_some() {
+                            // A staged board tile dropped back onto the
+                            // rack — leave dragging_from_board_index alone
+                            // so on_drag_end_staged_tile's fallback still
+                            // unstages it; nothing to reorder here.
+                            return;
+                        }
+                        let Some(dragged_id) = dragging_tile_id() else {
+                            return;
+                        };
+                        rack_order.with_mut(|order| {
+                            *order = reorder_rack_order(order, dragged_id, target_id);
+                        });
                         dragging_tile_id.set(None);
                     },
                     on_drag_staged_tile: move |board_index: usize| {
@@ -2238,6 +2270,27 @@ fn apply_rack_order(tiles: &[RackTileView], order: &[usize]) -> Vec<RackTileView
     order.iter().filter_map(|&i| tiles.get(i).cloned()).collect()
 }
 
+/// Moves `dragged_id` to sit where `target_id` currently is (dragging a
+/// rack tile onto another one to reorder the rack), shifting everything
+/// between them over by one. A no-op (returns `order` unchanged) if either
+/// id isn't present or they're the same tile.
+fn reorder_rack_order(order: &[usize], dragged_id: usize, target_id: usize) -> Vec<usize> {
+    if dragged_id == target_id {
+        return order.to_vec();
+    }
+    let (Some(from), Some(to)) = (
+        order.iter().position(|&id| id == dragged_id),
+        order.iter().position(|&id| id == target_id),
+    ) else {
+        return order.to_vec();
+    };
+    let mut new_order = order.to_vec();
+    new_order.remove(from);
+    let insert_at = if from < to { to - 1 } else { to };
+    new_order.insert(insert_at, dragged_id);
+    new_order
+}
+
 #[cfg(target_arch = "wasm32")]
 fn random_index_below(bound: usize) -> usize {
     (js_sys::Math::random() * bound as f64) as usize
@@ -2284,6 +2337,29 @@ mod tests {
         let reordered = apply_rack_order(&tiles, &[1, 5, 0]);
         let letters: Vec<char> = reordered.iter().map(|t| t.display).collect();
         assert_eq!(letters, vec!['B', 'A']);
+    }
+
+    #[test]
+    fn reorder_rack_order_moves_a_tile_forward_to_the_target() {
+        // [A,B,C,D], drag A onto C -> A ends up right before C.
+        assert_eq!(reorder_rack_order(&[0, 1, 2, 3], 0, 2), vec![1, 0, 2, 3]);
+    }
+
+    #[test]
+    fn reorder_rack_order_moves_a_tile_backward_to_the_target() {
+        // [A,B,C,D], drag D onto B -> D takes B's slot, B and C shift right.
+        assert_eq!(reorder_rack_order(&[0, 1, 2, 3], 3, 1), vec![0, 3, 1, 2]);
+    }
+
+    #[test]
+    fn reorder_rack_order_dropping_a_tile_on_itself_is_a_no_op() {
+        assert_eq!(reorder_rack_order(&[0, 1, 2], 1, 1), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn reorder_rack_order_ignores_an_unknown_id() {
+        assert_eq!(reorder_rack_order(&[0, 1, 2], 5, 1), vec![0, 1, 2]);
+        assert_eq!(reorder_rack_order(&[0, 1, 2], 0, 5), vec![0, 1, 2]);
     }
 
     #[test]

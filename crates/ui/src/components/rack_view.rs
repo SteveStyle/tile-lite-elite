@@ -10,6 +10,7 @@ pub fn RackView(
     exchange_selected: HashSet<usize>,
     on_drag_start: EventHandler<usize>,
     on_drag_end: EventHandler<()>,
+    on_drop_tile: EventHandler<usize>,
     on_click_tile: EventHandler<usize>,
     on_toggle_exchange_tile: EventHandler<usize>,
 ) -> Element {
@@ -37,6 +38,18 @@ pub fn RackView(
                     }
                 },
                 ondragend: move |_| on_drag_end.call(()),
+                // Accepts drops so tiles dragged within the rack can reorder
+                // it (see on_drop_tile in app.rs) — same "always call
+                // prevent_default" reasoning as the board cells, otherwise
+                // the browser never treats this as a valid drop target at
+                // all and `ondrop` would never fire here.
+                ondragover: move |event| {
+                    event.prevent_default();
+                },
+                ondrop: move |event| {
+                    event.prevent_default();
+                    on_drop_tile.call(tile.id);
+                },
                 onclick: move |_| {
                     if !clickable {
                         return;
