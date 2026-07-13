@@ -15,6 +15,7 @@ pub fn Home(
     info_message: Option<String>,
     error_message: Option<String>,
     rack_tiles: Vec<RackTileView>,
+    on_shuffle_rack: EventHandler<()>,
     can_view_rack: bool,
     staged_placements: Vec<StagedPlacementView>,
     can_stage_moves: bool,
@@ -34,6 +35,8 @@ pub fn Home(
     staged_preview: Option<MovePreviewView>,
     can_pass: bool,
     on_pass: EventHandler<()>,
+    can_resign: bool,
+    on_resign: EventHandler<()>,
     can_submit_manual: bool,
     on_submit_manual: EventHandler<()>,
     exchange_mode: bool,
@@ -157,6 +160,13 @@ pub fn Home(
                 div { class: "rack-panel",
                     div { class: "panel-header",
                         span { class: "meta-chip", "Bag {game.bag_count}" }
+                        if !rack_tiles.is_empty() {
+                            button {
+                                class: "direction-button direction-button-muted",
+                                onclick: move |_| on_shuffle_rack.call(()),
+                                "Shuffle"
+                            }
+                        }
                         if !staged_placements.is_empty() {
                             button {
                                 class: "direction-button direction-button-muted",
@@ -238,6 +248,12 @@ pub fn Home(
                                 disabled: is_loading || !can_submit_manual,
                                 onclick: move |_| on_submit_manual.call(()),
                                 "Play"
+                            }
+                            button {
+                                class: "toggle-button toggle-button-muted resign-button",
+                                disabled: is_loading || !can_resign,
+                                onclick: move |_| on_resign.call(()),
+                                "Resign"
                             }
                         }
                     }

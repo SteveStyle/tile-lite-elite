@@ -6,6 +6,56 @@ enum AuthMode {
     Register,
 }
 
+/// Shared by the submit button's onclick and the Enter-key handler on each
+/// input — a plain function taking every signal it needs explicitly rather
+/// than a shared closure, since a closure capturing non-Copy state (the
+/// server URL) can't be reused across several `move` handlers in the same
+/// render without fighting the borrow checker.
+#[allow(clippy::too_many_arguments)]
+fn submit_login_or_register(
+    server_url: String,
+    mode: AuthMode,
+    display_name: Signal<String>,
+    email: Signal<String>,
+    password: Signal<String>,
+    remember_me: Signal<bool>,
+    stay_logged_in: Signal<bool>,
+    mut is_submitting: Signal<bool>,
+    mut error_message: Signal<Option<String>>,
+    on_authenticated: EventHandler<(api::PlayerSessionDto, bool, bool)>,
+) {
+    let name = display_name().trim().to_string();
+    let email_value = email().trim().to_string();
+    let password_value = password();
+    let remember = remember_me();
+    let stay = stay_logged_in();
+
+    if name.is_empty() || password_value.is_empty() {
+        error_message.set(Some("Display name and password are required".to_string()));
+        return;
+    }
+    if mode == AuthMode::Register && email_value.is_empty() {
+        error_message.set(Some("Email is required to register".to_string()));
+        return;
+    }
+
+    spawn(async move {
+        is_submitting.set(true);
+        error_message.set(None);
+        let outcome = match mode {
+            AuthMode::Login => crate::app::login_player(&server_url, &name, &password_value).await,
+            AuthMode::Register => {
+                crate::app::register_player(&server_url, &name, &email_value, &password_value).await
+            }
+        };
+        match outcome {
+            Ok(session) => on_authenticated.call((session, remember, stay)),
+            Err(error) => error_message.set(Some(error)),
+        }
+        is_submitting.set(false);
+    });
+}
+
 #[component]
 pub fn AuthPanel(
     server_url: String,
@@ -25,7 +75,7 @@ pub fn AuthPanel(
     let mut remember_me = use_signal(move || has_remembered_name);
     let mut stay_logged_in = use_signal(|| false);
     let mut error_message = use_signal(|| None::<String>);
-    let mut is_submitting = use_signal(|| false);
+    let is_submitting = use_signal(|| false);
 
     let mut show_change_password = use_signal(|| false);
     let mut current_password_input = use_signal(String::new);
@@ -167,6 +217,13 @@ pub fn AuthPanel(
     } else {
         "Register"
     };
+    // Each `move` closure below needs its own owned copy — `server_url` is
+    // a plain (non-Copy) String, so one `move` closure capturing it would
+    // leave nothing for the rest.
+    let server_url_for_display_enter = server_url.clone();
+    let server_url_for_email_enter = server_url.clone();
+    let server_url_for_password_enter = server_url.clone();
+    let server_url_for_button = server_url.clone();
 
     rsx! {
         div { class: "auth-modal-backdrop",
@@ -197,6 +254,22 @@ pub fn AuthPanel(
                 placeholder: "Display name",
                 value: "{display_name}",
                 oninput: move |event| display_name.set(event.value()),
+                onkeydown: move |event| {
+                    if event.key() == Key::Enter {
+                        submit_login_or_register(
+                            server_url_for_display_enter.clone(),
+                            mode(),
+                            display_name,
+                            email,
+                            password,
+                            remember_me,
+                            stay_logged_in,
+                            is_submitting,
+                            error_message,
+                            on_authenticated,
+                        );
+                    }
+                },
             }
             if mode() == AuthMode::Register {
                 input {
@@ -204,6 +277,22 @@ pub fn AuthPanel(
                     placeholder: "Email",
                     value: "{email}",
                     oninput: move |event| email.set(event.value()),
+                    onkeydown: move |event| {
+                        if event.key() == Key::Enter {
+                            submit_login_or_register(
+                                server_url_for_email_enter.clone(),
+                                mode(),
+                                display_name,
+                                email,
+                                password,
+                                remember_me,
+                                stay_logged_in,
+                                is_submitting,
+                                error_message,
+                                on_authenticated,
+                            );
+                        }
+                    },
                 }
             }
             input {
@@ -212,6 +301,22 @@ pub fn AuthPanel(
                 placeholder: "Password",
                 value: "{password}",
                 oninput: move |event| password.set(event.value()),
+                onkeydown: move |event| {
+                    if event.key() == Key::Enter {
+                        submit_login_or_register(
+                            server_url_for_password_enter.clone(),
+                            mode(),
+                            display_name,
+                            email,
+                            password,
+                            remember_me,
+                            stay_logged_in,
+                            is_submitting,
+                            error_message,
+                            on_authenticated,
+                        );
+                    }
+                },
             }
 
             label {
@@ -244,43 +349,18 @@ pub fn AuthPanel(
                     class: "toggle-button",
                     disabled: is_submitting(),
                     onclick: move |_| {
-                        let server_url = server_url.clone();
-                        let name = display_name().trim().to_string();
-                        let email_value = email().trim().to_string();
-                        let password_value = password();
-                        let remember = remember_me();
-                        let stay = stay_logged_in();
-                        let mode_value = mode();
-
-                        if name.is_empty() || password_value.is_empty() {
-                            error_message.set(Some("Display name and password are required".to_string()));
-                            return;
-                        }
-                        if mode_value == AuthMode::Register && email_value.is_empty() {
-                            error_message.set(Some("Email is required to register".to_string()));
-                            return;
-                        }
-
-                        spawn(async move {
-                            is_submitting.set(true);
-                            error_message.set(None);
-                            let outcome = match mode_value {
-                                AuthMode::Login => {
-                                    crate::app::login_player(&server_url, &name, &password_value).await
-                                }
-                                AuthMode::Register => {
-                                    crate::app::register_player(&server_url, &name, &email_value, &password_value)
-                                        .await
-                                }
-                            };
-                            match outcome {
-                                Ok(session) => {
-                                    on_authenticated.call((session, remember, stay));
-                                }
-                                Err(error) => error_message.set(Some(error)),
-                            }
-                            is_submitting.set(false);
-                        });
+                        submit_login_or_register(
+                            server_url_for_button.clone(),
+                            mode(),
+                            display_name,
+                            email,
+                            password,
+                            remember_me,
+                            stay_logged_in,
+                            is_submitting,
+                            error_message,
+                            on_authenticated,
+                        );
                     },
                     "{submit_label}"
                 }

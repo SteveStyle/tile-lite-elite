@@ -112,6 +112,12 @@ pub fn RootApp() -> Element {
     let mut selected_cell = use_signal(|| None::<usize>);
     let mut exchange_mode = use_signal(|| false);
     let mut exchange_selected = use_signal(HashSet::<usize>::new);
+    // Purely a display order for the rack — reset to identity whenever the
+    // rack's tile count changes (a new turn's refill), shuffled in place by
+    // the Shuffle button otherwise. `rack_tiles_for_seat` always returns
+    // tiles in the same alphabetical order, so without this the rack would
+    // never actually look shuffled.
+    let mut rack_order = use_signal(Vec::<usize>::new);
 
     if !bootstrapped() {
         bootstrapped.set(true);
@@ -276,7 +282,12 @@ pub fn RootApp() -> Element {
     // after the fact.
     let viewer_rack_seat = viewer_rack_seat(&game_for_view, viewer_player_id.as_deref());
     let can_view_rack = viewer_rack_seat.is_some();
-    let rack_tiles = rack_tiles_for_seat(&game_for_view, viewer_rack_seat, &staged_placements());
+    let unordered_rack_tiles =
+        rack_tiles_for_seat(&game_for_view, viewer_rack_seat, &staged_placements());
+    if rack_order().len() != unordered_rack_tiles.len() {
+        rack_order.set((0..unordered_rack_tiles.len()).collect());
+    }
+    let rack_tiles = apply_rack_order(&unordered_rack_tiles, &rack_order());
     let can_submit_manual_action =
         can_submit_human_action && !exchange_mode() && !staged_placements().is_empty();
 
@@ -314,6 +325,7 @@ pub fn RootApp() -> Element {
     let server_url_for_start = server_url.clone();
     let server_url_for_exchange = server_url.clone();
     let server_url_for_pass = server_url.clone();
+    let server_url_for_resign = server_url.clone();
     let server_url_for_manual = server_url.clone();
     let game_for_home = game_for_view.clone();
     let game_for_drop = game_for_view.clone();
@@ -549,6 +561,9 @@ pub fn RootApp() -> Element {
                     info_message: info_message().clone(),
                     error_message: error_message().clone(),
                     rack_tiles,
+                    on_shuffle_rack: move |_| {
+                        rack_order.with_mut(|order| shuffle_order(order));
+                    },
                     can_view_rack,
                     staged_placements: staged_placements().clone(),
                     can_stage_moves: can_submit_human_action && !exchange_mode(),
@@ -764,6 +779,37 @@ pub fn RootApp() -> Element {
                                 match submit_pass(&server_url, &current_game, token.as_deref()).await {
                                     Ok(updated) => {
                                         info_message.set(Some("Submitted pass action.".to_string()));
+                                        reset_composer_state(
+                                            dragging_tile_id,
+                                            selected_blank_letter,
+                                            staged_placements,
+                                            selected_cell,
+                                            exchange_mode,
+                                            exchange_selected,
+                                        );
+                                        game.set(Some(updated));
+                                        if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                            game_summaries.set(summaries);
+                                        }
+                                    }
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    can_resign: can_submit_human_action && !exchange_mode(),
+                    on_resign: move |_| {
+                        let server_url = server_url_for_resign.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match submit_resign(&server_url, &current_game, token.as_deref()).await {
+                                    Ok(updated) => {
+                                        info_message.set(None);
                                         reset_composer_state(
                                             dragging_tile_id,
                                             selected_blank_letter,
@@ -1207,6 +1253,18 @@ async fn submit_pass(
     let request = GameActionRequest {
         seat_number: game.current_seat,
         action: api::PlayerActionDto::Pass,
+    };
+    post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
+}
+
+async fn submit_resign(
+    server_url: &str,
+    game: &GameStateDto,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    let request = GameActionRequest {
+        seat_number: game.current_seat,
+        action: api::PlayerActionDto::Resign,
     };
     post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
 }
@@ -1949,9 +2007,79 @@ fn rack_tiles_for_seat(
     tiles
 }
 
+/// Reorders already-computed rack tiles for display — `rack_tiles_for_seat`
+/// always returns them in a fixed alphabetical order, so the visual
+/// shuffle lives entirely in which permutation gets applied on top of it.
+/// Out-of-range indices (shouldn't happen; `order` is reset to identity
+/// whenever the tile count changes) are silently dropped rather than
+/// panicking.
+fn apply_rack_order(tiles: &[RackTileView], order: &[usize]) -> Vec<RackTileView> {
+    order.iter().filter_map(|&i| tiles.get(i).cloned()).collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn random_index_below(bound: usize) -> usize {
+    (js_sys::Math::random() * bound as f64) as usize
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn random_index_below(bound: usize) -> usize {
+    use rand::Rng;
+    rand::thread_rng().gen_range(0..bound)
+}
+
+/// Fisher–Yates, in place.
+fn shuffle_order(order: &mut [usize]) {
+    for i in (1..order.len()).rev() {
+        let j = random_index_below(i + 1);
+        order.swap(i, j);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_tile(id: usize, letter: char) -> RackTileView {
+        RackTileView {
+            id,
+            display: letter,
+            tile: TileDto::Letter { letter },
+            is_used: false,
+        }
+    }
+
+    #[test]
+    fn apply_rack_order_reorders_tiles_to_match() {
+        let tiles = vec![sample_tile(0, 'A'), sample_tile(1, 'B'), sample_tile(2, 'C')];
+        let reordered = apply_rack_order(&tiles, &[2, 0, 1]);
+        let letters: Vec<char> = reordered.iter().map(|t| t.display).collect();
+        assert_eq!(letters, vec!['C', 'A', 'B']);
+    }
+
+    #[test]
+    fn apply_rack_order_drops_out_of_range_indices_defensively() {
+        let tiles = vec![sample_tile(0, 'A'), sample_tile(1, 'B')];
+        let reordered = apply_rack_order(&tiles, &[1, 5, 0]);
+        let letters: Vec<char> = reordered.iter().map(|t| t.display).collect();
+        assert_eq!(letters, vec!['B', 'A']);
+    }
+
+    #[test]
+    fn shuffle_order_stays_a_permutation_of_the_same_indices() {
+        let mut order: Vec<usize> = (0..7).collect();
+        shuffle_order(&mut order);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn shuffle_order_leaves_a_single_tile_in_place() {
+        let mut order = vec![0];
+        shuffle_order(&mut order);
+        assert_eq!(order, vec![0]);
+    }
 
     #[test]
     fn websocket_url_rewrites_http_and_https_schemes() {

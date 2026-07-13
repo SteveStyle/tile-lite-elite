@@ -4558,6 +4558,7 @@ dependencies = [
  "gloo-storage",
  "gloo-timers",
  "js-sys",
+ "rand 0.8.5",
  "reqwest",
  "serde",
  "serde_json",
