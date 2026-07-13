@@ -264,6 +264,14 @@ pub fn GamesPanel(
         .all(|seat| seat.kind != AdditionalSeatKind::Named || !seat.name.trim().is_empty())
         && (include_creator() || !additional_seats().is_empty());
 
+    // A draft with only engine seats (plus optionally you) has nobody left
+    // to hear from — creating it lands straight on "Ready to start" with
+    // no invitation in flight, so the button says so instead of "Invite".
+    let needs_invitations = additional_seats()
+        .iter()
+        .any(|seat| matches!(seat.kind, AdditionalSeatKind::Named | AdditionalSeatKind::Open));
+    let submit_label = if needs_invitations { "Invite" } else { "Start" };
+
     rsx! {
         aside { class: "games-panel",
             div { class: "games-panel-header",
@@ -392,7 +400,7 @@ pub fn GamesPanel(
                                     });
                                     drafting.set(false);
                                 },
-                                "Invite"
+                                "{submit_label}"
                             }
                             button {
                                 class: "toggle-button toggle-button-muted",
@@ -439,7 +447,6 @@ fn game_row(
     } else {
         "game-row"
     };
-    let badge_class = format!("game-status-badge game-status-{}", status_slug(&summary.status));
     let participants_label = if summary.participants.is_empty() {
         "No seats yet".to_string()
     } else {
@@ -463,6 +470,11 @@ fn game_row(
             None => (summary.participants.clone(), Vec::new()),
         };
     let loaded_matches = current_game.is_some_and(|g| g.id == summary.id);
+    let ready = is_ready_to_start(&participants);
+    let badge_class = format!(
+        "game-status-badge game-status-{}",
+        status_slug(&summary.status, ready)
+    );
 
     rsx! {
         div { key: "{summary.id}", class: "game-row-wrapper",
@@ -473,7 +485,7 @@ fn game_row(
                     on_select.call(select_id.clone());
                 },
                 div { class: "game-row-top",
-                    span { class: "{badge_class}", "{status_label(&summary.status)}" }
+                    span { class: "{badge_class}", "{status_label(&summary.status, ready)}" }
                     span { class: "game-row-time", "{relative_time}" }
                 }
                 p { class: "game-row-participants", "{participants_label}" }
@@ -485,9 +497,12 @@ fn game_row(
                         div { class: "game-builder-add-row",
                             button {
                                 class: "toggle-button",
-                                disabled: is_loading || !(can_start && loaded_matches),
+                                disabled: is_loading || !(can_start && loaded_matches && ready),
                                 onclick: move |_| on_start.call(()),
                                 "Start"
+                            }
+                            if !ready {
+                                span { class: "games-panel-hint", "Waiting for every seat to be filled" }
                             }
                         }
                     }
@@ -644,16 +659,31 @@ fn seat_draft_kind_label(kind: AdditionalSeatKind) -> &'static str {
     }
 }
 
-fn status_label(status: &GameStatus) -> &'static str {
+/// Whether every human seat has a real occupant — mirrors the server's own
+/// `start_game` check exactly (see `crates/server-game/src/app.rs`), so
+/// "ready" here means "the Start request would actually succeed", not just
+/// a cosmetic guess. A `Waiting` game only changes to this once every
+/// invitation has been responded to (accepted or the seat otherwise
+/// filled) — an unclaimed `Open` or unaccepted `Named` seat keeps it at
+/// plain "Waiting".
+fn is_ready_to_start(participants: &[ParticipantDto]) -> bool {
+    participants
+        .iter()
+        .all(|p| p.kind == SeatKind::Engine || p.player_id.is_some())
+}
+
+fn status_label(status: &GameStatus, ready_to_start: bool) -> &'static str {
     match status {
+        GameStatus::Waiting if ready_to_start => "Ready to start",
         GameStatus::Waiting => "Waiting",
         GameStatus::Active => "Playing",
         GameStatus::Finished => "Finished",
     }
 }
 
-fn status_slug(status: &GameStatus) -> &'static str {
+fn status_slug(status: &GameStatus, ready_to_start: bool) -> &'static str {
     match status {
+        GameStatus::Waiting if ready_to_start => "ready",
         GameStatus::Waiting => "waiting",
         GameStatus::Active => "active",
         GameStatus::Finished => "finished",
@@ -754,5 +784,40 @@ mod tests {
     #[test]
     fn last_move_cell_is_none_when_seat_has_no_moves() {
         assert_eq!(last_move_cell(&[], 0), LastMoveCell::None);
+    }
+
+    fn participant(kind: SeatKind, player_id: Option<&str>) -> ParticipantDto {
+        ParticipantDto {
+            seat_number: 0,
+            kind,
+            display_name: "Someone".to_string(),
+            player_id: player_id.map(str::to_string),
+            engine_id: None,
+            score: 0,
+        }
+    }
+
+    #[test]
+    fn ready_to_start_when_every_human_seat_is_claimed() {
+        let participants = vec![
+            participant(SeatKind::Human, Some("p1")),
+            participant(SeatKind::Engine, None),
+        ];
+        assert!(is_ready_to_start(&participants));
+    }
+
+    #[test]
+    fn not_ready_while_a_human_seat_is_unclaimed() {
+        let participants = vec![
+            participant(SeatKind::Human, Some("p1")),
+            participant(SeatKind::Human, None),
+        ];
+        assert!(!is_ready_to_start(&participants));
+    }
+
+    #[test]
+    fn all_engine_seats_are_always_ready() {
+        let participants = vec![participant(SeatKind::Engine, None), participant(SeatKind::Engine, None)];
+        assert!(is_ready_to_start(&participants));
     }
 }

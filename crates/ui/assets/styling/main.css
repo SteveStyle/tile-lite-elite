@@ -40,6 +40,7 @@ button {
 
 button:disabled {
     cursor: default;
+    opacity: 0.45;
 }
 
 .app-shell {
@@ -500,6 +501,12 @@ button:disabled {
     color: rgba(35, 25, 15, 0.6);
 }
 
+.games-panel-hint {
+    font-size: 0.8rem;
+    color: rgba(35, 25, 15, 0.55);
+    align-self: center;
+}
+
 .games-panel-new-game .toggle-button {
     padding: 8px 14px;
     font-size: 0.85rem;
@@ -554,6 +561,10 @@ button:disabled {
 
 .game-status-waiting {
     background: rgba(157, 198, 216, 0.4);
+}
+
+.game-status-ready {
+    background: rgba(138, 160, 123, 0.5);
 }
 
 .game-status-active {
