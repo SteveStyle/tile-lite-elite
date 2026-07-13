@@ -14,7 +14,7 @@
 # :80 requests get redirected to https:// automatically too.
 
 129.151.69.246.sslip.io {
-	encode gzip
+	encode zstd gzip
 
 	# Caddy's automatic directive ordering runs try_files/file_server before
 	# reverse_proxy by default, regardless of source order — which rewrites
