@@ -30,6 +30,7 @@ body {
 
 h1,
 h2,
+h3,
 p {
     margin: 0;
 }
@@ -454,12 +455,15 @@ button:disabled {
     border: 1px solid rgba(111, 75, 44, 0.1);
 }
 
-/* Always reserved, whether or not a preview is currently showing, so the
-   rack never shifts as this content appears/disappears while composing a
-   move. */
+/* The single message slot above the rack (live preview, submit error, or a
+   plain turn-status line) — a fixed height, not just a reserved minimum, so
+   it never grows and shifts the tiles below it no matter which of those is
+   showing or how long the text runs. Tall enough for the two-line case
+   (headline+score, plus a cross-words detail line). */
 .preview-slot {
-    min-height: 40px;
+    height: 80px;
     margin-bottom: 10px;
+    overflow: hidden;
 }
 
 .preview-banner {

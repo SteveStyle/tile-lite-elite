@@ -39,6 +39,7 @@ pub fn Home(
     on_set_blank_letter: EventHandler<char>,
     selected_blank_letter: Option<char>,
     staged_preview: Option<MovePreviewView>,
+    is_your_turn: bool,
     can_pass: bool,
     on_pass: EventHandler<()>,
     can_resign: bool,
@@ -221,6 +222,11 @@ pub fn Home(
                             div { class: "blank-picker-grid", {blank_letter_buttons} }
                         }
                     }
+                    // The one message slot for this composer — a fixed
+                    // size regardless of which of these is showing, so it
+                    // never shifts the tiles below it. Priority: the live
+                    // preview of what's currently staged, else a submit
+                    // error, else a plain status line (whose turn it is).
                     div { class: "preview-slot",
                         if let Some(preview) = staged_preview {
                             div { class: if preview.is_legal { "preview-banner" } else { "preview-banner preview-banner-error" },
@@ -232,6 +238,16 @@ pub fn Home(
                                 }
                                 if preview.is_legal && !preview.detail.is_empty() {
                                     p { class: "composer-copy", "{preview.detail}" }
+                                }
+                            }
+                        } else if let Some(error_message) = error_message.clone() {
+                            div { class: "preview-banner preview-banner-error",
+                                p { class: "composer-copy", "{error_message}" }
+                            }
+                        } else if is_active {
+                            div { class: "preview-banner",
+                                p { class: "composer-copy",
+                                    if is_your_turn { "Your turn" } else { "Waiting for {current_turn_name(&game)}" }
                                 }
                             }
                         }
@@ -246,19 +262,6 @@ pub fn Home(
                         on_drop_tile: on_drop_rack_tile,
                         on_click_tile: on_click_rack_tile,
                         on_toggle_exchange_tile,
-                    }
-
-                    // Below the tiles rather than above them — these come
-                    // and go with every action, and a message appearing or
-                    // disappearing above the rack used to shift the tiles
-                    // up and down while you were trying to use them. Only
-                    // one of info/error shows at a time (error wins) so
-                    // there's a single message here, not two that can
-                    // contradict each other.
-                    if let Some(error_message) = error_message.clone() {
-                        p { class: "error-banner", "{error_message}" }
-                    } else if let Some(info_message) = info_message.clone() {
-                        p { class: "status-banner", "{info_message}" }
                     }
 
                     div { class: "turn-actions",

@@ -544,7 +544,7 @@ async fn preview_move(
                 validated.preview.main_word, validated.score.total
             ),
             detail: if validated.preview.cross_words.is_empty() {
-                "No cross words.".to_string()
+                String::new()
             } else {
                 format!(
                     "Cross words: {}",

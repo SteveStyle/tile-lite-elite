@@ -325,10 +325,29 @@ pub fn RootApp() -> Element {
                     staged_preview.set(None);
                     return;
                 }
-                if let Some(game) = game_val {
-                    let preview =
-                        fetch_server_preview(&server_url, &game, &staged, direction, token.as_deref()).await;
-                    staged_preview.set(preview);
+                if let Some(current_game) = game_val {
+                    let preview = fetch_server_preview(
+                        &server_url,
+                        &current_game,
+                        &staged,
+                        direction,
+                        token.as_deref(),
+                    )
+                    .await;
+                    // The fetch is async, and the composer can move on
+                    // while it's in flight — e.g. the move gets submitted
+                    // and the staged tiles clear before this resolves. A
+                    // response for staged tiles / a turn that's no longer
+                    // current is stale and would otherwise overwrite a
+                    // correct, already-cleared preview with a bogus
+                    // "Incorrect tile placement" (the old candidate,
+                    // re-checked against the board the move just filled).
+                    let still_current = staged_placements() == staged
+                        && game().as_ref().map(|g| (g.id.as_str(), g.turn_number))
+                            == Some((current_game.id.as_str(), current_game.turn_number));
+                    if still_current {
+                        staged_preview.set(preview);
+                    }
                 }
             });
         });
@@ -908,7 +927,7 @@ pub fn RootApp() -> Element {
                         selected_cell.set(None);
                         direction_override.set(None);
                         error_message.set(None);
-                        info_message.set(Some("Cleared staged placements.".to_string()));
+                        info_message.set(None);
                     },
                     on_remove_staged: move |board_index| {
                         error_message.set(None);
@@ -937,6 +956,7 @@ pub fn RootApp() -> Element {
                     },
                     selected_blank_letter: selected_blank_letter(),
                     staged_preview,
+                    is_your_turn: can_submit_human_action,
                     can_pass: can_submit_human_action && !exchange_mode(),
                     on_pass: move |_| {
                         let server_url = server_url_for_pass.clone();
@@ -948,7 +968,7 @@ pub fn RootApp() -> Element {
                                 error_message.set(None);
                                 match submit_pass(&server_url, &current_game, token.as_deref()).await {
                                     Ok(updated) => {
-                                        info_message.set(Some("Submitted pass action.".to_string()));
+                                        info_message.set(None);
                                         reset_composer_state(
                                             dragging_tile_id,
                                             selected_blank_letter,
@@ -1027,7 +1047,7 @@ pub fn RootApp() -> Element {
                                     .await
                                 {
                                     Ok(updated) => {
-                                        info_message.set(Some("Played a move.".to_string()));
+                                        info_message.set(None);
                                         reset_composer_state(
                                             dragging_tile_id,
                                             selected_blank_letter,
@@ -1100,7 +1120,7 @@ pub fn RootApp() -> Element {
                                 error_message.set(None);
                                 match submit_exchange(&server_url, &current_game, tiles, token.as_deref()).await {
                                     Ok(updated) => {
-                                        info_message.set(Some("Exchanged tiles.".to_string()));
+                                        info_message.set(None);
                                         reset_composer_state(
                                             dragging_tile_id,
                                             selected_blank_letter,
