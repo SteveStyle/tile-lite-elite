@@ -67,8 +67,7 @@ button:disabled {
 }
 
 .topbar-title,
-.hero-panel h1,
-.panel-header h2 {
+.hero-panel h1 {
     font-family: "Palatino Linotype", "Book Antiqua", Georgia, serif;
 }
 

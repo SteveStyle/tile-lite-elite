@@ -110,24 +110,24 @@ pub fn Home(
                 }
             },
             div { class: "status-strip",
-                span { class: "meta-chip", "{format_status(&game)}" }
+                if is_live {
+                    span { class: "meta-chip", "{format_status(&game)}" }
+                }
                 if is_active {
                     span { class: "meta-chip", "Turn: {current_turn_name(&game)}" }
                     span { class: "meta-chip", "{crate::time_format::format_time_remaining(&game.turn_started_at, game.move_time_limit_seconds)}" }
-                }
-                span { class: "meta-chip", "Bag {game.bag_count}" }
-                if !is_live {
-                    span { class: "meta-chip", "No game selected" }
                 }
                 if is_loading {
                     span { class: "meta-chip", "Working..." }
                 }
             }
-            if let Some(info_message) = info_message {
-                p { class: "status-banner", "{info_message}" }
-            }
-            if let Some(error_message) = error_message {
-                p { class: "error-banner", "{error_message}" }
+            if !has_rack {
+                if let Some(info_message) = info_message.clone() {
+                    p { class: "status-banner", "{info_message}" }
+                }
+                if let Some(error_message) = error_message.clone() {
+                    p { class: "error-banner", "{error_message}" }
+                }
             }
 
             div { class: "board-panel",
@@ -152,7 +152,7 @@ pub fn Home(
             if has_rack {
                 div { class: "rack-panel",
                     div { class: "panel-header",
-                        h2 { "Rack" }
+                        span { class: "meta-chip", "Bag {game.bag_count}" }
                         if !staged_placements.is_empty() {
                             button {
                                 class: "direction-button direction-button-muted",
@@ -160,6 +160,12 @@ pub fn Home(
                                 "Clear"
                             }
                         }
+                    }
+                    if let Some(info_message) = info_message.clone() {
+                        p { class: "status-banner", "{info_message}" }
+                    }
+                    if let Some(error_message) = error_message.clone() {
+                        p { class: "error-banner", "{error_message}" }
                     }
                     if has_unresolved_blank {
                         div { class: "blank-picker",
@@ -243,7 +249,7 @@ fn current_turn_name(game: &GameStateDto) -> &str {
 fn format_status(game: &GameStateDto) -> &'static str {
     match game.status {
         api::GameStatus::Waiting => "Waiting",
-        api::GameStatus::Active => "Active",
+        api::GameStatus::Active => "Playing",
         api::GameStatus::Finished => "Finished",
     }
 }
