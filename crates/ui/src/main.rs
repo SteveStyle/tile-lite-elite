@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 mod app;
+mod client_rules;
 mod components;
 #[cfg(not(target_arch = "wasm32"))]
 mod config;

@@ -24,10 +24,10 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::game_state::{
-    EngineRegistry, GameSession, ParticipantState, format_move_error, move_candidate_from_dto,
-    tile_from_dto,
+    EngineRegistry, GameSession, ParticipantState, move_candidate_from_dto, tile_from_dto,
 };
 use crate::persistence;
+use rules_shared::format_move_error;
 
 #[derive(Clone)]
 pub struct AppState {

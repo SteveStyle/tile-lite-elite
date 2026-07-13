@@ -8,6 +8,7 @@ edition.workspace=true
 
 [dependencies]
 api = { path = "../api" }
+rules-shared = { path = "../rules-shared" }
 dioxus = { version = "0.6", features = ["web"] }
 dioxus-web = "0.6.3"
 dioxus-desktop = { version = "0.6", optional = true }

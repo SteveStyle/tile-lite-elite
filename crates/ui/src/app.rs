@@ -304,55 +304,22 @@ pub fn RootApp() -> Element {
     let can_submit_manual_action =
         can_submit_human_action && !exchange_mode() && !staged_placements().is_empty();
 
-    let mut staged_preview: Signal<Option<MovePreviewView>> = use_signal(|| None);
-    {
-        let server_url_for_preview = server_url.clone();
-        let game_for_direction = game_for_view.clone();
-        use_effect(move || {
-            let staged = staged_placements();
-            let game_val = game();
-            let direction = infer_typing_direction(
-                &game_for_direction,
-                &staged,
-                selected_cell(),
-                direction_override(),
-            );
-            let is_human_turn = can_submit_human_action;
-            let server_url = server_url_for_preview.clone();
-            let token = session().map(|current| current.session_token.clone());
-            spawn(async move {
-                if !is_human_turn || staged.is_empty() {
-                    staged_preview.set(None);
-                    return;
-                }
-                if let Some(current_game) = game_val {
-                    let preview = fetch_server_preview(
-                        &server_url,
-                        &current_game,
-                        &staged,
-                        direction,
-                        token.as_deref(),
-                    )
-                    .await;
-                    // The fetch is async, and the composer can move on
-                    // while it's in flight — e.g. the move gets submitted
-                    // and the staged tiles clear before this resolves. A
-                    // response for staged tiles / a turn that's no longer
-                    // current is stale and would otherwise overwrite a
-                    // correct, already-cleared preview with a bogus
-                    // "Incorrect tile placement" (the old candidate,
-                    // re-checked against the board the move just filled).
-                    let still_current = staged_placements() == staged
-                        && game().as_ref().map(|g| (g.id.as_str(), g.turn_number))
-                            == Some((current_game.id.as_str(), current_game.turn_number));
-                    if still_current {
-                        staged_preview.set(preview);
-                    }
-                }
-            });
-        });
-    }
-    let staged_preview = staged_preview();
+    // Computed straight from current state, not a signal — this runs the
+    // same `RulesEngine::validate_game_move` the server does, entirely
+    // locally, so there's no network round-trip and (since nothing here is
+    // async) no possibility of a stale response landing after the state
+    // it was computed from has moved on.
+    let staged_preview = if can_submit_human_action && !staged_placements().is_empty() {
+        let direction = infer_typing_direction(
+            &game_for_view,
+            &staged_placements(),
+            selected_cell(),
+            direction_override(),
+        );
+        compute_client_preview(&game_for_view, &staged_placements(), direction)
+    } else {
+        None
+    };
     let server_url_for_login = server_url.clone();
     let server_url_for_custom_create = server_url.clone();
     let server_url_for_accept = server_url.clone();
@@ -1894,12 +1861,16 @@ fn build_manual_move_request(
     })
 }
 
-async fn fetch_server_preview(
-    server_url: &str,
+/// Runs the same validation/scoring the server would for this candidate —
+/// entirely locally, via `rules-shared` (the crate the server's own move
+/// handling is built on) — so the live preview is instant and needs no
+/// network round-trip. The server still gets the final say when the move
+/// is actually submitted (`submit_manual_move`); this is purely a
+/// responsiveness optimization for the composer, not a trust boundary.
+fn compute_client_preview(
     game: &GameStateDto,
     staged: &[StagedPlacementView],
     direction_hint: DirectionDto,
-    token: Option<&str>,
 ) -> Option<MovePreviewView> {
     let request = match build_manual_move_request(game, staged, direction_hint) {
         Ok(r) => r,
@@ -1912,28 +1883,63 @@ async fn fetch_server_preview(
             });
         }
     };
-    let candidate = match request.action {
+    let candidate_dto = match request.action {
         api::PlayerActionDto::Place { candidate } => candidate,
         _ => return None,
     };
-    let preview_request = api::PreviewMoveRequest {
-        seat_number: request.seat_number,
-        candidate,
-    };
-    match post_json::<_, api::PreviewMoveResponse>(
-        &format!("{server_url}/games/{}/preview", game.id),
-        token,
-        &preview_request,
-    )
-    .await
+
+    // Only variant this app ever creates a game with — see `GameStateDto`'s
+    // fields, always "official"/"sowpods"/"official" server-side. Falls
+    // back to no preview (rather than a wrong one) if that ever changes.
+    if game.variant != "official" || game.language != "sowpods" || game.board_layout != "official"
     {
-        Ok(response) => Some(MovePreviewView {
-            is_legal: response.is_legal,
-            headline: response.headline,
-            detail: response.detail,
-            score: response.score,
+        return None;
+    }
+
+    let rules = rules_shared::VariantRules::official();
+    let board_state = crate::client_rules::to_rules_board_state(&game.board);
+    let dictionary = &*rules_shared::SOWPODS;
+    let state = rules_shared::GameState::from_board(board_state, &rules, dictionary);
+    let rack = game
+        .racks
+        .get(request.seat_number as usize)
+        .map(crate::client_rules::to_rules_rack);
+    let candidate = crate::client_rules::to_rules_candidate(&candidate_dto);
+
+    let engine = rules_shared::RulesEngine {
+        rules: &rules,
+        dictionary,
+    };
+
+    match engine.validate_game_move(&state, rack.as_ref(), &candidate) {
+        Ok(validated) => Some(MovePreviewView {
+            is_legal: true,
+            headline: format!(
+                "{} for {} points",
+                validated.preview.main_word, validated.score.total
+            ),
+            detail: if validated.preview.cross_words.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "Cross words: {}",
+                    validated
+                        .preview
+                        .cross_words
+                        .iter()
+                        .map(|w| w.word.clone())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            },
+            score: Some(validated.score.total),
         }),
-        Err(_) => None,
+        Err(error) => Some(MovePreviewView {
+            is_legal: false,
+            headline: rules_shared::format_move_error(&error),
+            detail: String::new(),
+            score: None,
+        }),
     }
 }
 
