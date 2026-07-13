@@ -608,17 +608,25 @@ pub fn RootApp() -> Element {
                         if !can_submit_human_action || exchange_mode() {
                             return;
                         }
-                        if game_for_drop
+                        let target_is_taken = game_for_drop
                             .board
                             .get(board_index)
                             .is_some_and(|cell: &BoardCellDto| cell.letter.is_some())
-                        {
-                            return;
-                        }
-                        if staged_placements()
-                            .iter()
-                            .any(|p| p.board_index == board_index)
-                        {
+                            || staged_placements()
+                                .iter()
+                                .any(|p| p.board_index == board_index);
+                        if target_is_taken {
+                            // Dropping on an occupied/staged cell just
+                            // fails — if this drag picked up an existing
+                            // placement, clear the "in flight" marker so
+                            // on_drag_end_staged_tile (which fires next,
+                            // regardless of drop outcome) sees it's already
+                            // been dealt with and leaves the tile exactly
+                            // where it was, rather than reading a failed
+                            // drop here the same as a genuine drop off the
+                            // board entirely.
+                            dragging_tile_id.set(None);
+                            dragging_from_board_index.set(None);
                             return;
                         }
                         let Some(tile_id) = dragging_tile_id() else {

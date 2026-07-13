@@ -65,16 +65,20 @@ pub fn BoardView(
                 key: "{index}",
                 class: "{class_name}",
                 draggable: "{staged_draggable}",
+                // Accepts the drop on every cell, not just a valid
+                // (empty, unstaged) one — a `dragover` that never calls
+                // `prevent_default` tells the browser this isn't a drop
+                // target at all, so `ondrop` would never fire here for an
+                // invalid cell, and the app would have no chance to tell
+                // "dropped on an occupied cell" apart from "dropped off
+                // the board entirely" (see on_drop_board_cell in app.rs,
+                // which now makes that distinction itself).
                 ondragover: move |event| {
-                    if can_drop {
-                        event.prevent_default();
-                    }
+                    event.prevent_default();
                 },
                 ondrop: move |event| {
                     event.prevent_default();
-                    if can_drop {
-                        on_drop_tile.call(index);
-                    }
+                    on_drop_tile.call(index);
                 },
                 ondragstart: move |_| {
                     if staged_draggable {
