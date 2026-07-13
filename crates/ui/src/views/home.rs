@@ -178,7 +178,12 @@ pub fn Home(
                     div { class: "preview-slot",
                         if let Some(preview) = staged_preview {
                             div { class: if preview.is_legal { "preview-banner" } else { "preview-banner preview-banner-error" },
-                                h3 { class: "preview-title", "{preview.headline}" }
+                                div { class: "preview-banner-top",
+                                    h3 { class: "preview-title", "{preview.headline}" }
+                                    if let Some(score) = preview.score {
+                                        span { class: "preview-score", "+{score}" }
+                                    }
+                                }
                                 if preview.is_legal && !preview.detail.is_empty() {
                                     p { class: "composer-copy", "{preview.detail}" }
                                 }

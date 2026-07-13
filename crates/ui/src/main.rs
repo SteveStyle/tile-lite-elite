@@ -4,6 +4,7 @@ mod components;
 #[cfg(not(target_arch = "wasm32"))]
 mod config;
 mod local_storage;
+mod tile_value;
 mod time_format;
 mod views;
 

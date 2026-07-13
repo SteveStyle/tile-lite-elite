@@ -74,9 +74,15 @@ pub fn BoardView(
                     }
                 },
                 if let Some(letter) = cell.letter {
-                    div { class: "tile-face", "{letter}" }
+                    div { class: "tile-face",
+                        span { class: "tile-letter", "{letter}" }
+                        span { class: "tile-value", "{crate::tile_value::board_cell_point_value(letter, cell.is_blank)}" }
+                    }
                 } else if let Some(staged) = staged {
-                    div { class: "tile-face tile-face-staged", "{staged.display}" }
+                    div { class: "tile-face tile-face-staged",
+                        span { class: "tile-letter", "{staged.display}" }
+                        span { class: "tile-value", "{crate::tile_value::tile_point_value(&staged.tile)}" }
+                    }
                 } else {
                     div { class: "premium-label", "{premium_label(&cell.premium)}" }
                 }

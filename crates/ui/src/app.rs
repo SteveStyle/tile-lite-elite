@@ -74,6 +74,10 @@ pub struct MovePreviewView {
     pub is_legal: bool,
     pub headline: String,
     pub detail: String,
+    /// `None` for an illegal arrangement — a rejected placement doesn't
+    /// have a meaningful score. Shown as its own badge (see `Home`)
+    /// rather than left buried inside `headline`'s prose.
+    pub score: Option<i16>,
 }
 
 #[component]
@@ -286,6 +290,7 @@ pub fn RootApp() -> Element {
             let direction = infer_typing_direction(&game_for_direction, &staged);
             let is_human_turn = can_submit_human_action;
             let server_url = server_url_for_preview.clone();
+            let token = session().map(|current| current.session_token.clone());
             spawn(async move {
                 if !is_human_turn || staged.is_empty() {
                     staged_preview.set(None);
@@ -293,7 +298,7 @@ pub fn RootApp() -> Element {
                 }
                 if let Some(game) = game_val {
                     let preview =
-                        fetch_server_preview(&server_url, &game, &staged, direction).await;
+                        fetch_server_preview(&server_url, &game, &staged, direction, token.as_deref()).await;
                     staged_preview.set(preview);
                 }
             });
@@ -1609,6 +1614,7 @@ async fn fetch_server_preview(
     game: &GameStateDto,
     staged: &[StagedPlacementView],
     direction_hint: DirectionDto,
+    token: Option<&str>,
 ) -> Option<MovePreviewView> {
     let request = match build_manual_move_request(game, staged, direction_hint) {
         Ok(r) => r,
@@ -1617,6 +1623,7 @@ async fn fetch_server_preview(
                 is_legal: false,
                 headline: "Cannot preview this arrangement".to_string(),
                 detail,
+                score: None,
             });
         }
     };
@@ -1630,7 +1637,7 @@ async fn fetch_server_preview(
     };
     match post_json::<_, api::PreviewMoveResponse>(
         &format!("{server_url}/games/{}/preview", game.id),
-        None,
+        token,
         &preview_request,
     )
     .await
@@ -1639,6 +1646,7 @@ async fn fetch_server_preview(
             is_legal: response.is_legal,
             headline: response.headline,
             detail: response.detail,
+            score: response.score,
         }),
         Err(_) => None,
     }

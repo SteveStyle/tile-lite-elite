@@ -47,7 +47,8 @@ pub fn RackView(
                         on_click_tile.call(tile.id);
                     }
                 },
-                "{tile.display}"
+                span { class: "tile-letter", "{tile.display}" }
+                span { class: "tile-value", "{crate::tile_value::tile_point_value(&tile.tile)}" }
             }
         }
     });
