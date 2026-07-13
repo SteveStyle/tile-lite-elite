@@ -18,7 +18,6 @@ pub fn AuthPanel(
     let has_remembered_name = stored.remembered_name.is_some();
     let remembered_name = stored.remembered_name.unwrap_or_default();
 
-    let mut is_open = use_signal(|| false);
     let mut mode = use_signal(|| AuthMode::Login);
     let mut display_name = use_signal(move || remembered_name);
     let mut email = use_signal(String::new);
@@ -137,18 +136,10 @@ pub fn AuthPanel(
         };
     }
 
-    if !is_open() {
-        return rsx! {
-            div { class: "auth-widget",
-                button {
-                    class: "toggle-button toggle-button-muted",
-                    onclick: move |_| is_open.set(true),
-                    "Log in"
-                }
-            }
-        };
-    }
-
+    // Nothing in the app works while signed out (every action needs a
+    // player), so this is a blocking modal rather than a dismissable
+    // widget — no "Cancel", no collapsed state. It's the first thing you
+    // see on open.
     let submit_label = if mode() == AuthMode::Login {
         "Log in"
     } else {
@@ -156,7 +147,10 @@ pub fn AuthPanel(
     };
 
     rsx! {
-        div { class: "auth-panel",
+        div { class: "auth-modal-backdrop",
+        div { class: "auth-panel auth-modal-card",
+            h2 { class: "auth-modal-title", "Welcome to Scrabble PX" }
+            p { class: "auth-modal-copy", "Log in or register to create and play games." }
             div { class: "auth-panel-tabs",
                 button {
                     class: if mode() == AuthMode::Login { "auth-tab auth-tab-active" } else { "auth-tab" },
@@ -221,15 +215,6 @@ pub fn AuthPanel(
 
             div { class: "auth-panel-actions",
                 button {
-                    class: "toggle-button toggle-button-muted",
-                    disabled: is_submitting(),
-                    onclick: move |_| {
-                        is_open.set(false);
-                        error_message.set(None);
-                    },
-                    "Cancel"
-                }
-                button {
                     class: "toggle-button",
                     disabled: is_submitting(),
                     onclick: move |_| {
@@ -264,7 +249,6 @@ pub fn AuthPanel(
                             };
                             match outcome {
                                 Ok(session) => {
-                                    is_open.set(false);
                                     on_authenticated.call((session, remember, stay));
                                 }
                                 Err(error) => error_message.set(Some(error)),
@@ -275,6 +259,7 @@ pub fn AuthPanel(
                     "{submit_label}"
                 }
             }
+        }
         }
     }
 }

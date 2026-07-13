@@ -820,6 +820,62 @@ button:disabled {
     gap: 6px;
 }
 
+/* Blocking modal shown whenever there's no session — nothing in the app
+   works signed out, so this covers the whole viewport rather than being
+   a dismissable widget (see `AuthPanel` in auth_panel.rs). */
+.auth-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(35, 25, 15, 0.6);
+    backdrop-filter: blur(2px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+    z-index: 1000;
+}
+
+.auth-modal-card {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    flex-wrap: nowrap;
+    gap: 14px;
+    width: 100%;
+    max-width: 380px;
+    border-radius: 24px;
+    padding: 32px;
+}
+
+.auth-modal-title {
+    font-family: "Palatino Linotype", "Book Antiqua", Georgia, serif;
+    font-size: 1.6rem;
+}
+
+.auth-modal-copy {
+    color: rgba(35, 25, 15, 0.72);
+    margin-bottom: 4px;
+}
+
+.auth-modal-card .auth-panel-tabs {
+    justify-content: center;
+}
+
+.auth-modal-card .auth-input {
+    width: 100%;
+    border-radius: 12px;
+    padding: 10px 14px;
+    font-size: 0.95rem;
+}
+
+.auth-modal-card .auth-panel-actions {
+    margin-top: 6px;
+}
+
+.auth-modal-card .auth-panel-actions button {
+    flex: 1;
+}
+
 @media (max-width: 1080px) {
     .workspace-shell {
         grid-template-columns: 1fr;
