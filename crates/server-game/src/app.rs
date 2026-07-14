@@ -266,7 +266,10 @@ async fn create_game(
         }
     }
 
-    let rules = rules_shared::VariantRules::official();
+    let variant_name = request.variant.as_deref().unwrap_or("official");
+    let rules = rules_shared::VariantRules::by_name(variant_name).ok_or_else(|| {
+        ApiProblem::bad_request(format!("Unknown game variant '{variant_name}'"))
+    })?;
     let participants = request
         .seats
         .into_iter()
@@ -2113,6 +2116,234 @@ mod tests {
         assert_eq!(restored.id, created.id);
         assert_eq!(restored.status, api::GameStatus::Active);
         assert_eq!(restored.participants.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn creating_a_game_with_an_unknown_variant_is_rejected() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            "/games",
+            Some(&alice.session_token),
+            &CreateGameRequest {
+                seats: vec![CreateSeatRequest {
+                    kind: SeatKind::Human,
+                    display_name: "Alice".to_string(),
+                    engine_id: None,
+                    claim: Some(SeatClaim::Creator),
+                }],
+                seed: Some(1),
+                variant: Some("not-a-real-variant".to_string()),
+                language: None,
+                board_layout: None,
+                move_time_limit_seconds: None,
+            },
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// The whole point of the edition registry: the exact same move, played
+    /// under two different bundled rulesets, must score differently and
+    /// must be persisted/reloaded under the ruleset it was actually created
+    /// with — never silently falling back to official.
+    #[tokio::test]
+    async fn wordfeud_game_scores_the_same_move_differently_and_persists_its_own_rules() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        async fn create_and_start(
+            app: Router,
+            token: &str,
+            variant: Option<String>,
+            seed: u64,
+        ) -> GameStateDto {
+            let created: GameStateDto = read_json(
+                send_json_auth(
+                    app.clone(),
+                    Method::POST,
+                    "/games",
+                    Some(token),
+                    &CreateGameRequest {
+                        seats: vec![
+                            CreateSeatRequest {
+                                kind: SeatKind::Human,
+                                display_name: "Alice".to_string(),
+                                engine_id: None,
+                                claim: Some(SeatClaim::Creator),
+                            },
+                            CreateSeatRequest {
+                                kind: SeatKind::Engine,
+                                display_name: "Greedy".to_string(),
+                                engine_id: Some("greedy-v1".to_string()),
+                                claim: None,
+                            },
+                        ],
+                        seed: Some(seed),
+                        variant,
+                        language: None,
+                        board_layout: None,
+                        move_time_limit_seconds: None,
+                    },
+                )
+                .await,
+            )
+            .await;
+            read_json(
+                send_json_auth(
+                    app,
+                    Method::POST,
+                    &format!("/games/{}/start", created.id),
+                    Some(token),
+                    &StartGameRequest::default(),
+                )
+                .await,
+            )
+            .await
+        }
+
+        let official_game =
+            create_and_start(app.clone(), &alice.session_token, None, 501).await;
+        let wordfeud_game = create_and_start(
+            app.clone(),
+            &alice.session_token,
+            Some("wordfeud".to_string()),
+            502,
+        )
+        .await;
+        assert_eq!(wordfeud_game.variant, "wordfeud");
+        assert_eq!(wordfeud_game.board_layout, "wordfeud");
+        assert_eq!(wordfeud_game.language, "sowpods");
+
+        // Letter values for B/A/G genuinely differ between the two
+        // rulesets (see `VariantRules::official`/`wordfeud`), and the
+        // center square is a double-word premium in official but a plain
+        // square in Wordfeud's layout — so "BAG" played through the center
+        // on an otherwise-empty board scores differently under each,
+        // purely from the rules, with everything else held constant.
+        let official_rules = VariantRules::official();
+        let wordfeud_rules = VariantRules::wordfeud();
+        // Premiums live on the board itself, not on `RulesEngine.rules` — so
+        // computing an "expected wordfeud score" needs the wordfeud game's
+        // own board (with wordfeud's premium layout), not the official
+        // game's, even though both are still empty at this point.
+        let official_board =
+            board_from_dto(&official_game.board).expect("fresh board should parse");
+        let wordfeud_board =
+            board_from_dto(&wordfeud_game.board).expect("fresh board should parse");
+        let official_position = GameState::from_board(official_board, &official_rules, &*SOWPODS);
+        let wordfeud_position = GameState::from_board(wordfeud_board, &wordfeud_rules, &*SOWPODS);
+        let rack = rack_with_letters(&['B', 'A', 'G']);
+        // Enumeration only depends on board geometry/dictionary/rack (not
+        // premiums or letter values), so the same candidate is valid and
+        // identical under either ruleset — reusing it is what makes this
+        // an apples-to-apples comparison of the rules, not of two
+        // different words.
+        let official_engine = RulesEngine {
+            rules: &official_rules,
+            dictionary: &*SOWPODS,
+        };
+        let candidate = official_engine
+            .enumerate_legal_moves(&official_position, &rack)
+            .next()
+            .expect("B/A/G should have a legal opening move");
+        let expected_official_score = official_engine
+            .validate_game_move(&official_position, Some(&rack), &candidate)
+            .expect("candidate should be legal under official rules")
+            .score
+            .total;
+        let wordfeud_engine = RulesEngine {
+            rules: &wordfeud_rules,
+            dictionary: &*SOWPODS,
+        };
+        let expected_wordfeud_score = wordfeud_engine
+            .validate_game_move(&wordfeud_position, Some(&rack), &candidate)
+            .expect("the same candidate should also be legal under wordfeud rules")
+            .score
+            .total;
+        assert_ne!(
+            expected_official_score, expected_wordfeud_score,
+            "test setup should pick a move whose score actually differs between rulesets"
+        );
+
+        // Force both seats' racks to the exact known letters (bypassing the
+        // random deal) so the same candidate is legal to actually submit,
+        // same technique `human_move_endpoint_advances_state_and_triggers_engine_reply`
+        // uses.
+        for game_id in [&official_game.id, &wordfeud_game.id] {
+            let mut games = state.games.write().await;
+            let game = games
+                .get_mut(game_id)
+                .expect("created game should exist in memory");
+            game.bag = vec![rules_shared::Tile::Letter(Letter::from('X')); 20];
+            game.participants[0].rack = rack;
+            game.participants[1].rack = rack_with_letters(&['Q']);
+        }
+
+        let candidate_dto = move_candidate_to_dto(&candidate);
+        let official_response: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/actions", official_game.id),
+                Some(&alice.session_token),
+                &GameActionRequest {
+                    seat_number: 0,
+                    action: PlayerActionDto::Place {
+                        candidate: candidate_dto.clone(),
+                    },
+                },
+            )
+            .await,
+        )
+        .await;
+        let wordfeud_response: GameStateDto = read_json(
+            send_json_auth(
+                app,
+                Method::POST,
+                &format!("/games/{}/actions", wordfeud_game.id),
+                Some(&alice.session_token),
+                &GameActionRequest {
+                    seat_number: 0,
+                    action: PlayerActionDto::Place {
+                        candidate: candidate_dto,
+                    },
+                },
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(
+            official_response.participants[0].score,
+            expected_official_score as i32
+        );
+        assert_eq!(
+            wordfeud_response.participants[0].score,
+            expected_wordfeud_score as i32
+        );
+
+        // Persistence round-trip: a fresh AppState reading the same DB must
+        // reconstruct the wordfeud game with wordfeud's rules, not silently
+        // default back to official.
+        let reloaded = create_test_state(&database_url).await;
+        let games = reloaded.games.read().await;
+        let restored = games
+            .get(&wordfeud_game.id)
+            .expect("wordfeud game should reload from its sqlite snapshot");
+        assert_eq!(restored.variant, "wordfeud");
+        assert_eq!(restored.rules.bingo_bonus, wordfeud_rules.bingo_bonus);
+        assert_eq!(restored.rules.letter_values, wordfeud_rules.letter_values);
     }
 
     async fn register_player(app: Router, display_name: &str) -> PlayerSessionDto {

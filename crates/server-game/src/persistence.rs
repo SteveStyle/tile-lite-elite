@@ -4,7 +4,75 @@ use sqlx::{Pool, Row, Sqlite, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOp
 use std::str::FromStr;
 
 use crate::game_state::{GameSession, MoveRecord, ParticipantState, board_from_dto};
-use rules_shared::{GameState, SOWPODS, Tile, VariantRules};
+use rules_shared::{GameState, Premium, SOWPODS, Score, Tile, VariantRules};
+
+/// Mirrors `rules_shared::VariantRules` field-for-field, but as its own type
+/// rather than deriving `Serialize`/`Deserialize` directly on the internal
+/// one — that type's shape is expected to keep evolving (board size,
+/// alphabet width) as more editions/languages are added, and pinning the DB
+/// schema straight to it would turn each of those changes into a data
+/// migration. This struct is the DB's problem to keep stable; `VariantRules`
+/// is free to change shape as long as the conversions below keep up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedVariantRules {
+    name: String,
+    language: String,
+    letter_values: [u8; 26],
+    tile_distribution: [u8; 26],
+    blank_tiles: u8,
+    rack_size: u8,
+    width: u8,
+    height: u8,
+    bingo_bonus: Score,
+    premiums: Vec<Premium>,
+}
+
+impl From<&VariantRules> for PersistedVariantRules {
+    fn from(rules: &VariantRules) -> Self {
+        Self {
+            name: rules.name.clone(),
+            language: rules.language.clone(),
+            letter_values: rules.letter_values,
+            tile_distribution: rules.tile_distribution,
+            blank_tiles: rules.blank_tiles,
+            rack_size: rules.rack_size,
+            width: rules.width,
+            height: rules.height,
+            bingo_bonus: rules.bingo_bonus,
+            premiums: rules.premiums.to_vec(),
+        }
+    }
+}
+
+impl TryFrom<PersistedVariantRules> for VariantRules {
+    type Error = String;
+
+    fn try_from(persisted: PersistedVariantRules) -> Result<Self, Self::Error> {
+        let premiums: [Premium; 225] = persisted
+            .premiums
+            .try_into()
+            .map_err(|_| "persisted premiums length did not match the board size".to_string())?;
+        Ok(VariantRules {
+            name: persisted.name,
+            language: persisted.language,
+            letter_values: persisted.letter_values,
+            tile_distribution: persisted.tile_distribution,
+            blank_tiles: persisted.blank_tiles,
+            rack_size: persisted.rack_size,
+            width: persisted.width,
+            height: persisted.height,
+            bingo_bonus: persisted.bingo_bonus,
+            premiums,
+        })
+    }
+}
+
+/// A game snapshot persisted before per-game rules existed has no `rules`
+/// field to deserialize — falls back to official, matching the hardcoded
+/// behavior every such game was actually created and played under.
+fn default_persisted_variant_rules() -> PersistedVariantRules {
+    PersistedVariantRules::from(&VariantRules::official())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedGame {
@@ -13,6 +81,8 @@ struct PersistedGame {
     variant: String,
     language: String,
     board_layout: String,
+    #[serde(default = "default_persisted_variant_rules")]
+    rules: PersistedVariantRules,
     turn_number: i64,
     current_seat: u8,
     winner_seat: Option<u8>,
@@ -191,6 +261,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         variant: session.variant.clone(),
         language: session.language.clone(),
         board_layout: session.board_layout.clone(),
+        rules: PersistedVariantRules::from(&session.rules),
         turn_number: session.turn_number,
         current_seat: session.current_seat,
         winner_seat: session.winner_seat,
@@ -312,7 +383,8 @@ pub async fn load_game(pool: &Pool<Sqlite>, id: &str) -> Result<Option<GameSessi
     Ok(row.map(|row| row.get::<String, _>(0)).map(|json| {
         let persisted =
             serde_json::from_str::<PersistedGame>(&json).expect("persisted game should parse");
-        let rules = VariantRules::official();
+        let rules = VariantRules::try_from(persisted.rules)
+            .expect("persisted variant rules should be valid");
         let board = board_from_dto(&persisted.board).expect("persisted board should be valid");
         let state = GameState::from_board(board, &rules, &*SOWPODS);
         GameSession {

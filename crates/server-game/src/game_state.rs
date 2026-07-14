@@ -127,9 +127,12 @@ impl GameSession {
         Self {
             id,
             status: GameStatus::Waiting,
-            variant: "official".to_string(),
-            language: "sowpods".to_string(),
-            board_layout: "official".to_string(),
+            variant: rules.name.clone(),
+            language: rules.language.clone(),
+            // Board layout is bundled into the edition, not an independent
+            // axis (see `VariantRules`) — the DTO field stays around for
+            // display/API compatibility, mirroring the edition name.
+            board_layout: rules.name.clone(),
             turn_number: 0,
             current_seat: 0,
             winner_seat: None,
@@ -480,9 +483,21 @@ impl GameSession {
         let engine = engines
             .find(&engine_id)
             .ok_or_else(|| format!("Unknown engine: {engine_id}"))?;
+        if !engine
+            .metadata()
+            .supported_variants
+            .iter()
+            .any(|variant| variant == &self.variant)
+        {
+            return Err(format!(
+                "Engine '{engine_id}' does not support the '{}' variant",
+                self.variant
+            ));
+        }
         let rack = current.rack;
         let seat_number = self.current_seat;
         let state_snapshot = self.state.clone();
+        let rules_snapshot = self.rules.clone();
         let time_budget_ms = engine_timeout.as_millis() as u64;
 
         let outcome = tokio::time::timeout(
@@ -492,6 +507,7 @@ impl GameSession {
                     state: &state_snapshot,
                     seat_number,
                     rack: &rack,
+                    rules: &rules_snapshot,
                     time_budget_ms: Some(time_budget_ms),
                 })
             }),

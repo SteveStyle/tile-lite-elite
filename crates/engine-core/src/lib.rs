@@ -20,11 +20,15 @@ pub struct EngineMetadata {
     pub capabilities: EngineCapabilities,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub struct EngineRequest<'a> {
     pub state: &'a GameState,
     pub seat_number: u8,
     pub rack: &'a Rack,
+    /// The actual game's rules — an engine must score/generate moves under
+    /// these, not some rules it happens to carry internally, or it would
+    /// silently misplay any edition other than whatever it was built for.
+    pub rules: &'a VariantRules,
     pub time_budget_ms: Option<u64>,
 }
 
@@ -58,7 +62,6 @@ pub trait ScrabbleEngine: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct GreedyEngine {
     metadata: EngineMetadata,
-    rules: VariantRules,
 }
 
 impl GreedyEngine {
@@ -73,14 +76,18 @@ impl GreedyEngine {
                     "Chooses the highest-scoring legal move from the shared move generator."
                         .to_string(),
                 ),
-                supported_variants: vec!["official".to_string()],
+                // The algorithm itself has no edition-specific logic — it
+                // just runs the shared move generator/validator under
+                // whichever `VariantRules` the request carries — so every
+                // edition the server knows about is listed here explicitly
+                // as a deliberate declaration, not a limitation.
+                supported_variants: vec!["official".to_string(), "wordfeud".to_string()],
                 capabilities: EngineCapabilities {
                     supports_timed_play: false,
                     supports_analysis: false,
                     supports_ranking: false,
                 },
             },
-            rules: VariantRules::official(),
         }
     }
 }
@@ -98,7 +105,7 @@ impl ScrabbleEngine for GreedyEngine {
 
     fn choose_action(&self, request: EngineRequest<'_>) -> EngineResponse {
         let engine = RulesEngine {
-            rules: &self.rules,
+            rules: request.rules,
             dictionary: &*SOWPODS,
         };
 
@@ -157,6 +164,33 @@ mod tests {
             state: &state,
             seat_number: 0,
             rack: &rack,
+            rules: &rules,
+            time_budget_ms: None,
+        });
+
+        assert!(matches!(response.action, EngineAction::Place(_)));
+    }
+
+    #[test]
+    fn greedy_engine_plays_correctly_under_a_non_official_ruleset_too() {
+        // Regression test: the engine used to hardcode `VariantRules::official()`
+        // internally regardless of what `EngineRequest` carried, which would
+        // have silently misplayed (wrong letter values/premiums) any other
+        // edition. It must actually use `request.rules`.
+        let rules = VariantRules::wordfeud();
+        let state = GameState::new(&rules, &*SOWPODS);
+        let engine = GreedyEngine::new();
+        let mut rack = Rack::default();
+        rack.add_letter(Letter::from('A'));
+        rack.add_letter(Letter::from('T'));
+
+        assert!(engine.metadata().supported_variants.contains(&rules.name));
+
+        let response = engine.choose_action(EngineRequest {
+            state: &state,
+            seat_number: 0,
+            rack: &rack,
+            rules: &rules,
             time_budget_ms: None,
         });
 

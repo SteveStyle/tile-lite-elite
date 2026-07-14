@@ -283,6 +283,12 @@ impl Rack {
 
 #[derive(Debug, Clone)]
 pub struct VariantRules {
+    /// The bundled edition name ("official", "wordfeud", ...) — board
+    /// layout, letter values, tile distribution, and dictionary all travel
+    /// together under this one name (real Scrabble editions don't mix and
+    /// match these independently, so neither does this type).
+    pub name: String,
+    pub language: String,
     pub letter_values: [u8; 26],
     pub tile_distribution: [u8; 26],
     pub blank_tiles: u8,
@@ -296,6 +302,8 @@ pub struct VariantRules {
 impl VariantRules {
     pub fn official() -> Self {
         Self {
+            name: "official".to_string(),
+            language: "sowpods".to_string(),
             letter_values: [
                 1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3, 1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10,
             ],
@@ -307,34 +315,92 @@ impl VariantRules {
             width: 15,
             height: 15,
             bingo_bonus: 50,
-            premiums: official_premiums(),
+            premiums: mirrored_premiums(&[
+                (0, 0, Premium::TripleWord),
+                (3, 0, Premium::DoubleLetter),
+                (7, 0, Premium::TripleWord),
+                (1, 1, Premium::DoubleWord),
+                (5, 1, Premium::TripleLetter),
+                (2, 2, Premium::DoubleWord),
+                (6, 2, Premium::DoubleLetter),
+                (0, 3, Premium::DoubleLetter),
+                (3, 3, Premium::DoubleWord),
+                (7, 3, Premium::DoubleLetter),
+                (4, 4, Premium::DoubleWord),
+                (1, 5, Premium::TripleLetter),
+                (5, 5, Premium::TripleLetter),
+                (2, 6, Premium::DoubleLetter),
+                (6, 6, Premium::DoubleLetter),
+                (0, 7, Premium::TripleWord),
+                (3, 7, Premium::DoubleLetter),
+                (7, 7, Premium::DoubleWord),
+            ]),
+        }
+    }
+
+    /// Wordfeud's actual numbers (letter values, tile distribution, bingo
+    /// bonus, premium layout all genuinely differ from official) — reused
+    /// verbatim from `old-crates/*/src/board.rs`'s `SCRABBLE_VARIANT_WORDFEUD`,
+    /// the project's own superseded-but-still-accurate prior art. Still
+    /// English/ASCII and still 15×15, so this is proof of the edition
+    /// registry, not of any board-size or alphabet generalization.
+    pub fn wordfeud() -> Self {
+        Self {
+            name: "wordfeud".to_string(),
+            language: "sowpods".to_string(),
+            letter_values: [
+                1, 4, 4, 2, 1, 4, 3, 4, 1, 10, 5, 1, 3, 1, 1, 4, 10, 1, 1, 1, 2, 4, 4, 8, 4, 10,
+            ],
+            tile_distribution: [
+                10, 2, 2, 5, 12, 2, 3, 3, 9, 1, 1, 4, 2, 6, 7, 2, 1, 6, 5, 7, 4, 2, 2, 1, 2, 1,
+            ],
+            blank_tiles: 2,
+            rack_size: 7,
+            width: 15,
+            height: 15,
+            bingo_bonus: 40,
+            premiums: mirrored_premiums(&[
+                (0, 0, Premium::TripleLetter),
+                (4, 0, Premium::TripleWord),
+                (7, 0, Premium::DoubleLetter),
+                (1, 1, Premium::DoubleLetter),
+                (5, 1, Premium::TripleLetter),
+                (2, 2, Premium::DoubleWord),
+                (6, 2, Premium::DoubleLetter),
+                (3, 3, Premium::TripleLetter),
+                (7, 3, Premium::DoubleWord),
+                (0, 4, Premium::TripleWord),
+                (4, 4, Premium::DoubleWord),
+                (6, 4, Premium::DoubleLetter),
+                (1, 5, Premium::TripleLetter),
+                (5, 5, Premium::TripleLetter),
+                (2, 6, Premium::DoubleLetter),
+                (4, 6, Premium::DoubleLetter),
+                (0, 7, Premium::DoubleLetter),
+                (3, 7, Premium::DoubleWord),
+            ]),
+        }
+    }
+
+    /// The edition registry — every bundled ruleset this server knows
+    /// about, looked up by name. `None` for an unrecognized name (the
+    /// caller decides whether that's a client error).
+    pub fn by_name(name: &str) -> Option<Self> {
+        match name {
+            "official" => Some(Self::official()),
+            "wordfeud" => Some(Self::wordfeud()),
+            _ => None,
         }
     }
 }
 
-fn official_premiums() -> [Premium; 225] {
+/// Expands 18 canonical premium-square positions (one symmetric quadrant)
+/// into the full 225-cell board via 4-way mirroring — every edition's board
+/// is symmetric, so this is shared regardless of which premiums it uses.
+fn mirrored_premiums(canonical: &[(u8, u8, Premium)]) -> [Premium; 225] {
     let mut premiums = [Premium::Blank; 225];
 
-    for (x, y, premium) in [
-        (0, 0, Premium::TripleWord),
-        (3, 0, Premium::DoubleLetter),
-        (7, 0, Premium::TripleWord),
-        (1, 1, Premium::DoubleWord),
-        (5, 1, Premium::TripleLetter),
-        (2, 2, Premium::DoubleWord),
-        (6, 2, Premium::DoubleLetter),
-        (0, 3, Premium::DoubleLetter),
-        (3, 3, Premium::DoubleWord),
-        (7, 3, Premium::DoubleLetter),
-        (4, 4, Premium::DoubleWord),
-        (1, 5, Premium::TripleLetter),
-        (5, 5, Premium::TripleLetter),
-        (2, 6, Premium::DoubleLetter),
-        (6, 6, Premium::DoubleLetter),
-        (0, 7, Premium::TripleWord),
-        (3, 7, Premium::DoubleLetter),
-        (7, 7, Premium::DoubleWord),
-    ] {
+    for &(x, y, premium) in canonical {
         for (mx, my) in mirror_positions(x, y) {
             premiums[(my as usize) * 15 + (mx as usize)] = premium;
         }
@@ -408,8 +474,8 @@ pub enum MoveError {
 #[cfg(test)]
 mod tests {
     use super::{
-        Direction, Letter, LetterMask, Position, Rack, Tile, mask_contains, mask_insert,
-        mask_is_empty, mask_remove,
+        Direction, Letter, LetterMask, Position, Rack, Tile, VariantRules, mask_contains,
+        mask_insert, mask_is_empty, mask_remove,
     };
     use std::str::FromStr;
 
@@ -461,5 +527,46 @@ mod tests {
             acting_as: Some(Letter::from('B')),
         }));
         assert!(!rack.consume_tile(Tile::Letter(Letter::from('Z'))));
+    }
+
+    #[test]
+    fn wordfeud_bundles_its_own_letter_values_and_bingo_bonus_distinct_from_official() {
+        let official = VariantRules::official();
+        let wordfeud = VariantRules::wordfeud();
+        assert_eq!(official.name, "official");
+        assert_eq!(wordfeud.name, "wordfeud");
+        assert_ne!(official.bingo_bonus, wordfeud.bingo_bonus);
+        assert_ne!(official.letter_values, wordfeud.letter_values);
+        assert_ne!(official.tile_distribution, wordfeud.tile_distribution);
+        // Both editions are still 15x15/English at this stage of the
+        // project — only the bundled economics/board layout differ.
+        assert_eq!(official.width, wordfeud.width);
+        assert_eq!(official.height, wordfeud.height);
+        assert_eq!(official.language, wordfeud.language);
+    }
+
+    #[test]
+    fn by_name_resolves_known_editions_and_rejects_unknown_ones() {
+        assert_eq!(VariantRules::by_name("official").unwrap().name, "official");
+        assert_eq!(VariantRules::by_name("wordfeud").unwrap().name, "wordfeud");
+        assert!(VariantRules::by_name("not-a-real-edition").is_none());
+    }
+
+    #[test]
+    fn every_editions_premiums_are_still_a_symmetric_15x15_board() {
+        for rules in [VariantRules::official(), VariantRules::wordfeud()] {
+            assert_eq!(rules.premiums.len(), 225);
+            for y in 0..15u8 {
+                for x in 0..15u8 {
+                    let mirrored = rules.premiums[(y as usize) * 15 + (14 - x) as usize];
+                    let original = rules.premiums[(y as usize) * 15 + x as usize];
+                    assert_eq!(
+                        mirrored, original,
+                        "{}'s premiums should be left/right symmetric at ({x}, {y})",
+                        rules.name
+                    );
+                }
+            }
+        }
     }
 }
