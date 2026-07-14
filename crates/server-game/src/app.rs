@@ -82,6 +82,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/engines", get(list_engines))
+        .route("/dictionaries/{name}", get(get_dictionary))
         // Authentication
         .route("/auth/register", post(register_player))
         .route("/auth/login", post(login_player))
@@ -137,6 +138,20 @@ async fn health() -> Json<api::HealthDto> {
 
 async fn list_engines(State(state): State<AppState>) -> Json<Vec<api::EngineProfileDto>> {
     Json(state.engines.metadata())
+}
+
+/// Serves a dictionary's raw word-list text on request, for clients (the
+/// wasm/web build specifically) that fetch it at runtime rather than
+/// embedding it at compile time — the server already has this exact text
+/// compiled in (`rules_shared::sowpods_word_list`), so this is just
+/// re-serving it, not a second copy of the file anywhere. Unauthenticated,
+/// same as `/health`/`/engines` — a word list isn't sensitive, and every
+/// signed-in player's client needs it regardless of which game they're in.
+async fn get_dictionary(Path(name): Path<String>) -> Result<String, ApiProblem> {
+    match name.as_str() {
+        "sowpods" => Ok(rules_shared::sowpods_word_list().to_string()),
+        _ => Err(ApiProblem::not_found(format!("Unknown dictionary '{name}'"))),
+    }
 }
 
 async fn list_games(
@@ -1638,6 +1653,31 @@ mod tests {
             rack.add_letter(Letter::from(*letter));
         }
         rack
+    }
+
+    #[tokio::test]
+    async fn dictionary_endpoint_serves_sowpods_unauthenticated() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_empty(app, Method::GET, "/dictionaries/sowpods").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(bytes.to_vec()).expect("dictionary should be valid utf8");
+        assert!(text.split_whitespace().any(|word| word == "ACE"));
+    }
+
+    #[tokio::test]
+    async fn dictionary_endpoint_404s_for_an_unknown_name() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_empty(app, Method::GET, "/dictionaries/not-a-real-dictionary").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -105,6 +105,13 @@ pub fn RootApp() -> Element {
     let mut info_message = use_signal(|| Some("Loading games from server...".to_string()));
     let mut error_message = use_signal(|| None::<String>);
     let mut bootstrapped = use_signal(|| false);
+    // `None` until the dictionary used for the live move preview has
+    // loaded — on native builds this resolves immediately (the dictionary
+    // is compiled in), on wasm it's a real async fetch (see
+    // `load_client_dictionary`), so the preview just shows nothing for
+    // that brief window rather than blocking on it.
+    let mut client_dictionary: Signal<Option<&'static rules_shared::SowpodsDictionary>> =
+        use_signal(|| None);
     let mut websocket_game_id = use_signal(|| None::<String>);
     let mut dragging_tile_id = use_signal(|| None::<usize>);
     // `Some(index)` while dragging a tile that was already staged on the
@@ -132,6 +139,7 @@ pub fn RootApp() -> Element {
 
     if !bootstrapped() {
         bootstrapped.set(true);
+        let server_url_for_dictionary = server_url.clone();
         let server_url = server_url.clone();
         spawn(async move {
             match check_api_version(&server_url).await {
@@ -193,6 +201,13 @@ pub fn RootApp() -> Element {
             )
             .await;
             is_loading.set(false);
+        });
+
+        // Independent of (and concurrent with) the games/auth bootstrap
+        // above — the preview dictionary isn't needed until the player
+        // actually stages a tile, so it doesn't need to block anything.
+        spawn(async move {
+            client_dictionary.set(load_client_dictionary(&server_url_for_dictionary).await);
         });
     }
 
@@ -308,17 +323,23 @@ pub fn RootApp() -> Element {
     // same `RulesEngine::validate_game_move` the server does, entirely
     // locally, so there's no network round-trip and (since nothing here is
     // async) no possibility of a stale response landing after the state
-    // it was computed from has moved on.
-    let staged_preview = if can_submit_human_action && !staged_placements().is_empty() {
-        let direction = infer_typing_direction(
-            &game_for_view,
-            &staged_placements(),
-            selected_cell(),
-            direction_override(),
-        );
-        compute_client_preview(&game_for_view, &staged_placements(), direction)
-    } else {
-        None
+    // it was computed from has moved on. Needs `client_dictionary` to have
+    // finished loading first (instant on native, a real fetch on wasm) —
+    // until then this just shows nothing, same as "nothing staged yet".
+    let staged_preview = match (
+        can_submit_human_action && !staged_placements().is_empty(),
+        client_dictionary(),
+    ) {
+        (true, Some(dictionary)) => {
+            let direction = infer_typing_direction(
+                &game_for_view,
+                &staged_placements(),
+                selected_cell(),
+                direction_override(),
+            );
+            compute_client_preview(&game_for_view, &staged_placements(), direction, dictionary)
+        }
+        _ => None,
     };
     let server_url_for_login = server_url.clone();
     let server_url_for_custom_create = server_url.clone();
@@ -1565,6 +1586,44 @@ where
         .map_err(|error| error.to_string())
 }
 
+/// Plain-text GET — for the dictionary word list (`get_json` assumes a
+/// JSON body, which this isn't). Only the wasm build calls this: the
+/// native dictionary is compiled in, so `load_client_dictionary`'s native
+/// path never needs to fetch anything.
+#[cfg(target_arch = "wasm32")]
+async fn get_text(url: &str) -> Result<String, String> {
+    let response = Request::get(url)
+        .send()
+        .await
+        .map_err(|_| mark_offline())?;
+    mark_online();
+    if !response.ok() {
+        return Err(format!("HTTP {} {}", response.status(), response.status_text()));
+    }
+    response.text().await.map_err(|error| error.to_string())
+}
+
+/// The dictionary the live move preview validates against. Native builds
+/// (server and desktop) already have SOWPODS compiled in — nothing to
+/// fetch. The wasm/web build deliberately doesn't embed it (see
+/// `rules_shared::dictionary`'s doc comments), so this is a real network
+/// round-trip there, resolving to `None` if it fails (the preview just
+/// stays absent, same as while nothing's staged yet — never a hard error).
+#[cfg(not(target_arch = "wasm32"))]
+async fn load_client_dictionary(_server_url: &str) -> Option<&'static rules_shared::SowpodsDictionary> {
+    Some(&*rules_shared::SOWPODS)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_client_dictionary(server_url: &str) -> Option<&'static rules_shared::SowpodsDictionary> {
+    let text = get_text(&format!("{server_url}/dictionaries/sowpods"))
+        .await
+        .ok()?;
+    Some(Box::leak(Box::new(
+        rules_shared::SowpodsDictionary::from_word_list(text),
+    )))
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 async fn post_json_impl<T, R>(url: &str, token: Option<&str>, payload: &T) -> Result<R, String>
 where
@@ -1871,6 +1930,7 @@ fn compute_client_preview(
     game: &GameStateDto,
     staged: &[StagedPlacementView],
     direction_hint: DirectionDto,
+    dictionary: &rules_shared::SowpodsDictionary,
 ) -> Option<MovePreviewView> {
     let request = match build_manual_move_request(game, staged, direction_hint) {
         Ok(r) => r,
@@ -1898,7 +1958,6 @@ fn compute_client_preview(
 
     let rules = rules_shared::VariantRules::official();
     let board_state = crate::client_rules::to_rules_board_state(&game.board);
-    let dictionary = &*rules_shared::SOWPODS;
     let state = rules_shared::GameState::from_board(board_state, &rules, dictionary);
     let rack = game
         .racks

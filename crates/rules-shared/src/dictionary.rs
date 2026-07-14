@@ -1,9 +1,27 @@
 use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::LazyLock;
 
 use crate::model::{Alphabet, Letter};
 
+/// Embedded at compile time for every non-wasm target (the server, and the
+/// desktop client) — for those, this is free: no network cost, and disk
+/// space isn't a constraint the way page-load size is. The wasm/web client
+/// deliberately does *not* embed this (see `SowpodsDictionary::from_word_list`
+/// and `sowpods_word_list()` below) — baking a ~2.7MB word list into every
+/// page load doesn't scale once a second dictionary exists, and the server
+/// already has this exact text in memory to serve on request instead.
+#[cfg(not(target_arch = "wasm32"))]
 const SOWPODS_WORD_FILE: &str = include_str!("sowpods.txt");
+
+/// The raw SOWPODS word list text, for whoever serves it to clients that
+/// fetch it at runtime instead of embedding it (see `crates/server-game`'s
+/// `/dictionaries/:name` endpoint). Not meaningful on wasm, where nothing
+/// has this text compiled in to begin with.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn sowpods_word_list() -> &'static str {
+    SOWPODS_WORD_FILE
+}
 
 pub trait Dictionary {
     fn is_word(&self, word: &str) -> bool;
@@ -62,8 +80,28 @@ pub struct SowpodsDictionary {
 }
 
 impl SowpodsDictionary {
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
-        let words: HashSet<&'static str> = SOWPODS_WORD_FILE.split_whitespace().collect();
+        Self::from_static_word_list(SOWPODS_WORD_FILE)
+    }
+
+    /// Builds a dictionary from word-list text fetched at runtime (one
+    /// word per whitespace-separated token, same format as `sowpods.txt`)
+    /// rather than embedded at compile time — this is how the wasm/web
+    /// client gets its dictionary (see `crates/ui/src/app.rs`'s
+    /// `load_client_dictionary`), fetching it from the server's
+    /// `/dictionaries/:name` endpoint instead of bundling it into the page.
+    ///
+    /// `text` is leaked into a `&'static str` — accepted here since this is
+    /// only ever called once per dictionary actually in use, for the
+    /// program's whole lifetime (a page load, a server process), the same
+    /// trade-off `include_str!` makes implicitly for the non-wasm path.
+    pub fn from_word_list(text: String) -> Self {
+        Self::from_static_word_list(Box::leak(text.into_boxed_str()))
+    }
+
+    fn from_static_word_list(text: &'static str) -> Self {
+        let words: HashSet<&'static str> = text.split_whitespace().collect();
         let mut sorted_words: Vec<Vec<char>> =
             words.iter().map(|word| word.chars().collect()).collect();
         sorted_words.sort_unstable();
@@ -80,6 +118,7 @@ impl SowpodsDictionary {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Default for SowpodsDictionary {
     fn default() -> Self {
         Self::new()
@@ -157,8 +196,10 @@ impl<'a> PrefixCursor for SortedPrefixCursor<'a> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub static SOWPODS: LazyLock<SowpodsDictionary> = LazyLock::new(SowpodsDictionary::new);
 
+#[cfg(not(target_arch = "wasm32"))]
 pub fn is_word(word: &str) -> bool {
     SOWPODS.is_word(word)
 }

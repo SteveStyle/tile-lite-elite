@@ -11,7 +11,9 @@ pub use board::{BoardCell, BoardState, EmptyCell, FilledCell};
 pub use cache::{
     AnchorFlags, CachedCell, ConstrainedCrossCheck, CrossCheck, LineExtents, RuleCache,
 };
-pub use dictionary::{Dictionary, SOWPODS, SowpodsDictionary, is_word};
+pub use dictionary::{Dictionary, SowpodsDictionary};
+#[cfg(not(target_arch = "wasm32"))]
+pub use dictionary::{SOWPODS, is_word, sowpods_word_list};
 pub use format::format_move_error;
 pub use generate::MoveGenerator;
 pub use model::{
