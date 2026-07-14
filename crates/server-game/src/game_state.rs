@@ -272,7 +272,14 @@ impl GameSession {
                 .participants
                 .iter()
                 .map(|participant| RackDto {
-                    counts: participant.rack.counts,
+                    // The wire format stays 26-wide for now — nothing
+                    // client-facing needs more than the standard Latin
+                    // alphabet yet (see rules_shared::MAX_ALPHABET_SIZE's
+                    // doc comment), so only the first 26 of the internal
+                    // Rack's slots ever carry anything for editions today.
+                    counts: participant.rack.counts[..26]
+                        .try_into()
+                        .expect("first 26 rack slots always fit the wire RackDto"),
                     blanks: participant.rack.blanks,
                 })
                 .collect(),

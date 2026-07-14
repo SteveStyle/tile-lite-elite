@@ -4,7 +4,7 @@ use sqlx::{Pool, Row, Sqlite, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOp
 use std::str::FromStr;
 
 use crate::game_state::{GameSession, MoveRecord, ParticipantState, board_from_dto};
-use rules_shared::{GameState, Premium, SOWPODS, Score, Tile, VariantRules};
+use rules_shared::{Alphabet, GameState, Premium, SOWPODS, Score, Tile, VariantRules};
 
 /// Mirrors `rules_shared::VariantRules` field-for-field, but as its own type
 /// rather than deriving `Serialize`/`Deserialize` directly on the internal
@@ -29,11 +29,19 @@ struct PersistedVariantRules {
 
 impl From<&VariantRules> for PersistedVariantRules {
     fn from(rules: &VariantRules) -> Self {
+        // The persisted format stays 26-wide for now (see
+        // rules_shared::MAX_ALPHABET_SIZE's doc comment) — every edition in
+        // production today is Alphabet::latin26(), so only the first 26 of
+        // the internal (wider) arrays ever hold anything real.
+        let mut letter_values = [0u8; 26];
+        letter_values.copy_from_slice(&rules.letter_values[..26]);
+        let mut tile_distribution = [0u8; 26];
+        tile_distribution.copy_from_slice(&rules.tile_distribution[..26]);
         Self {
             name: rules.name.clone(),
             language: rules.language.clone(),
-            letter_values: rules.letter_values,
-            tile_distribution: rules.tile_distribution,
+            letter_values,
+            tile_distribution,
             blank_tiles: rules.blank_tiles,
             rack_size: rules.rack_size,
             width: rules.width,
@@ -52,11 +60,19 @@ impl TryFrom<PersistedVariantRules> for VariantRules {
             .premiums
             .try_into()
             .map_err(|_| "persisted premiums length did not match the board size".to_string())?;
+        let mut letter_values = [0u8; rules_shared::MAX_ALPHABET_SIZE];
+        letter_values[..26].copy_from_slice(&persisted.letter_values);
+        let mut tile_distribution = [0u8; rules_shared::MAX_ALPHABET_SIZE];
+        tile_distribution[..26].copy_from_slice(&persisted.tile_distribution);
         Ok(VariantRules {
             name: persisted.name,
+            // Every persisted game to date is the standard Latin alphabet —
+            // this will need to actually vary once a non-Latin edition can
+            // be persisted (Phase 5), presumably keyed off `language`.
+            alphabet: Alphabet::latin26(),
             language: persisted.language,
-            letter_values: persisted.letter_values,
-            tile_distribution: persisted.tile_distribution,
+            letter_values,
+            tile_distribution,
             blank_tiles: persisted.blank_tiles,
             rack_size: persisted.rack_size,
             width: persisted.width,

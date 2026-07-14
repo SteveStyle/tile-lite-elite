@@ -2,7 +2,7 @@ use crate::board::{BoardCell, BoardState};
 use crate::dictionary::Dictionary;
 use crate::model::{
     mask_contains, mask_insert, Direction, Letter, LetterMask, Position, Score, VariantRules,
-    ALPHABET,
+    MAX_ALPHABET_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,7 +68,7 @@ impl CrossCheck {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConstrainedCrossCheck {
     pub allowed_mask: LetterMask,
-    pub score_by_letter: [Score; 26],
+    pub score_by_letter: [Score; MAX_ALPHABET_SIZE],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -291,16 +291,16 @@ pub fn compute_cross_check<D: Dictionary>(
     }
 
     let mut allowed_mask = 0;
-    let mut score_by_letter = [0; 26];
+    let mut score_by_letter = [0; MAX_ALPHABET_SIZE];
 
-    for letter in ALPHABET {
+    for letter in rules.letters() {
         let mut word = String::with_capacity(before.len() + 1 + after.len());
         for existing in before.iter().rev() {
-            word.push(existing.as_char());
+            word.push(rules.letter_char(*existing));
         }
-        word.push(letter.as_char());
+        word.push(rules.letter_char(letter));
         for existing in &after {
-            word.push(existing.as_char());
+            word.push(rules.letter_char(*existing));
         }
 
         if dictionary.is_word(&word) {

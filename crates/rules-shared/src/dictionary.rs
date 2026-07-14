@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use crate::model::Letter;
+use crate::model::{Alphabet, Letter};
 
 const SOWPODS_WORD_FILE: &str = include_str!("sowpods.txt");
 
@@ -35,29 +35,37 @@ pub trait Dictionary {
 pub trait PrefixCursor: Copy {
     /// Narrows to the search state after also matching `letter`, or
     /// `None` if no word can possibly continue with it — the prune
-    /// signal.
-    fn advance(&self, letter: Letter) -> Option<Self>;
+    /// signal. `alphabet` resolves `letter` to the actual character it
+    /// means under the current ruleset (see `VariantRules::alphabet`) —
+    /// a cursor has no ambient alphabet of its own to assume.
+    fn advance(&self, letter: Letter, alphabet: &Alphabet) -> Option<Self>;
 }
 
 impl PrefixCursor for () {
-    fn advance(&self, _letter: Letter) -> Option<Self> {
+    fn advance(&self, _letter: Letter, _alphabet: &Alphabet) -> Option<Self> {
         Some(())
     }
 }
 
 pub struct SowpodsDictionary {
     words: HashSet<&'static str>,
-    /// Sorted once at construction — the backing store for
-    /// `SortedPrefixCursor`, which narrows a sub-slice of this one letter
-    /// at a time instead of re-searching the whole dictionary at every
-    /// step of move generation.
-    sorted_words: Vec<&'static str>,
+    /// Tokenized into characters (not left as raw UTF-8 bytes) and sorted
+    /// once at construction — the backing store for `SortedPrefixCursor`,
+    /// which narrows a sub-slice one *character* at a time instead of
+    /// re-searching the whole dictionary at every step of move generation.
+    /// SOWPODS itself is plain ASCII, so this only matters once a
+    /// dictionary actually contains multi-byte UTF-8 words — but the
+    /// search structure has to be character-indexed regardless of which
+    /// dictionary it's built for, since byte-indexing silently desyncs
+    /// the moment any word has a multi-byte character earlier in it.
+    sorted_words: Vec<Vec<char>>,
 }
 
 impl SowpodsDictionary {
     pub fn new() -> Self {
         let words: HashSet<&'static str> = SOWPODS_WORD_FILE.split_whitespace().collect();
-        let mut sorted_words: Vec<&'static str> = words.iter().copied().collect();
+        let mut sorted_words: Vec<Vec<char>> =
+            words.iter().map(|word| word.chars().collect()).collect();
         sorted_words.sort_unstable();
         Self { words, sorted_words }
     }
@@ -92,7 +100,9 @@ impl Dictionary for SowpodsDictionary {
 
 /// A position in an incremental search over the sorted word list: `words`
 /// is the sub-slice of (still sorted) entries that share the prefix
-/// matched so far, and `depth` is how many characters that prefix has.
+/// matched so far, and `depth` is how many *characters* that prefix has
+/// (not bytes — a word's `Vec<char>` length, so a multi-byte character
+/// still only ever counts as one step, unlike indexing raw UTF-8 bytes).
 ///
 /// Advancing by one more letter binary-searches *within* `words` for the
 /// narrower sub-range that also matches at position `depth` — a shrinking
@@ -104,13 +114,13 @@ impl Dictionary for SowpodsDictionary {
 /// time.
 #[derive(Debug, Clone, Copy)]
 pub struct SortedPrefixCursor<'a> {
-    words: &'a [&'a str],
+    words: &'a [Vec<char>],
     depth: usize,
 }
 
 impl<'a> SortedPrefixCursor<'a> {
-    fn byte_at(word: &str, index: usize) -> Option<u8> {
-        word.as_bytes().get(index).copied()
+    fn char_at(word: &[char], index: usize) -> Option<char> {
+        word.get(index).copied()
     }
 
     /// True if the prefix matched so far is itself a complete word. Since
@@ -129,13 +139,13 @@ impl<'a> PrefixCursor for SortedPrefixCursor<'a> {
     /// `None` if nothing does — the prune signal: no word can possibly
     /// start with this prefix, so the caller doesn't need to keep
     /// building on top of it.
-    fn advance(&self, letter: Letter) -> Option<SortedPrefixCursor<'a>> {
-        let target = Some(letter.as_char() as u8);
+    fn advance(&self, letter: Letter, alphabet: &Alphabet) -> Option<SortedPrefixCursor<'a>> {
+        let target = alphabet.to_char(letter);
         let lo = self
             .words
-            .partition_point(|word| Self::byte_at(word, self.depth) < target);
+            .partition_point(|word| Self::char_at(word, self.depth) < target);
         let hi = lo
-            + self.words[lo..].partition_point(|word| Self::byte_at(word, self.depth) == target);
+            + self.words[lo..].partition_point(|word| Self::char_at(word, self.depth) == target);
         if lo == hi {
             None
         } else {
@@ -156,14 +166,15 @@ pub fn is_word(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{PrefixCursor, SOWPODS, SortedPrefixCursor, is_word};
-    use crate::model::Letter;
+    use crate::model::{Alphabet, Letter};
 
     fn advance_all<'a>(
         mut cursor: SortedPrefixCursor<'a>,
         word: &str,
     ) -> Option<SortedPrefixCursor<'a>> {
+        let alphabet = Alphabet::latin26();
         for ch in word.chars() {
-            cursor = cursor.advance(Letter::from(ch))?;
+            cursor = cursor.advance(Letter::from(ch), &alphabet)?;
         }
         Some(cursor)
     }
@@ -200,5 +211,75 @@ mod tests {
     fn prefix_cursor_finds_short_words() {
         let cursor = advance_all(SOWPODS.prefix_cursor(), "ZA").expect("ZA should be reachable");
         assert!(cursor.is_word());
+    }
+
+    /// A synthetic, non-ASCII, >26-letter toy alphabet — not a real shipped
+    /// language, just enough to prove the cursor is genuinely
+    /// character-indexed rather than byte-indexed. `É` is two UTF-8 bytes;
+    /// the old byte-indexed cursor would desync `depth` from "letters
+    /// matched" the moment it appeared anywhere but the very end of a word,
+    /// silently corrupting every comparison after it.
+    fn toy_alphabet() -> Alphabet {
+        Alphabet::from_chars(('A'..='Z').chain(['É', 'Ñ']))
+    }
+
+    fn toy_words(words: &[&str]) -> Vec<Vec<char>> {
+        let mut sorted: Vec<Vec<char>> = words.iter().map(|w| w.chars().collect()).collect();
+        sorted.sort_unstable();
+        sorted
+    }
+
+    #[test]
+    fn prefix_cursor_finds_a_word_with_a_multi_byte_letter_in_the_middle() {
+        let sorted = toy_words(&["ÉCLAT", "ÉCLATS", "CAT"]);
+        let alphabet = toy_alphabet();
+        let root = SortedPrefixCursor {
+            words: &sorted,
+            depth: 0,
+        };
+        let cursor = advance_all_with(root, "ÉCLAT", &alphabet)
+            .expect("ÉCLAT should be reachable despite É being multi-byte");
+        assert!(cursor.is_word());
+    }
+
+    #[test]
+    fn prefix_cursor_still_recognizes_a_live_prefix_past_a_multi_byte_letter() {
+        let sorted = toy_words(&["ÉCLAT", "ÉCLATS", "CAT"]);
+        let alphabet = toy_alphabet();
+        let root = SortedPrefixCursor {
+            words: &sorted,
+            depth: 0,
+        };
+        // "ÉCLAT" is itself a complete word, but also a live prefix of
+        // "ÉCLATS" — both should be true, same as the plain-ASCII
+        // `prefix_cursor_recognizes_a_prefix_that_is_not_yet_a_word` case.
+        let cursor = advance_all_with(root, "ÉCLAT", &alphabet).expect("should be reachable");
+        assert!(cursor.is_word());
+        let extended =
+            advance_all_with(root, "ÉCLATS", &alphabet).expect("ÉCLATS should be reachable too");
+        assert!(extended.is_word());
+    }
+
+    #[test]
+    fn prefix_cursor_prunes_a_dead_end_with_a_multi_byte_letter() {
+        let sorted = toy_words(&["ÉCLAT", "CAT"]);
+        let alphabet = toy_alphabet();
+        let root = SortedPrefixCursor {
+            words: &sorted,
+            depth: 0,
+        };
+        assert!(advance_all_with(root, "ÑOPE", &alphabet).is_none());
+    }
+
+    fn advance_all_with<'a>(
+        mut cursor: SortedPrefixCursor<'a>,
+        word: &str,
+        alphabet: &Alphabet,
+    ) -> Option<SortedPrefixCursor<'a>> {
+        for ch in word.chars() {
+            let letter = alphabet.to_letter(ch)?;
+            cursor = cursor.advance(letter, alphabet)?;
+        }
+        Some(cursor)
     }
 }

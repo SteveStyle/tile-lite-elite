@@ -67,7 +67,13 @@ impl<'a, D: Dictionary> RulesEngine<'a, D> {
                     // starting fresh) — the cursor tracks the *whole*
                     // word being built, not just the newly placed part.
                     let Some(cursor) =
-                        seed_cursor(self.dictionary.root_cursor(), &state.board, start, direction)
+                        seed_cursor(
+                            self.dictionary.root_cursor(),
+                            &state.board,
+                            start,
+                            direction,
+                            &self.rules.alphabet,
+                        )
                     else {
                         continue;
                     };
@@ -142,7 +148,7 @@ impl<'a, D: Dictionary> RulesEngine<'a, D> {
                 // If it somehow doesn't extend any real word (shouldn't
                 // happen: only fully-valid words ever get placed), that's
                 // a legitimate dead end for this lane, not a bug.
-                let Some(cursor) = cursor.advance(filled.letter) else {
+                let Some(cursor) = cursor.advance(filled.letter, &self.rules.alphabet) else {
                     return;
                 };
                 if let Some(next_pos) = next {
@@ -170,7 +176,9 @@ impl<'a, D: Dictionary> RulesEngine<'a, D> {
                     Direction::Vertical => cached.vertical,
                 };
 
-                for tile in available_tiles_for_crosscheck(remaining, cross_check) {
+                for tile in
+                    available_tiles_for_crosscheck(remaining, cross_check, self.rules.alphabet.len())
+                {
                     // The actual pruning win: skip a letter entirely (no
                     // recursion, no rack mutation) the moment it can't
                     // possibly continue toward any real word, rather than
@@ -179,7 +187,7 @@ impl<'a, D: Dictionary> RulesEngine<'a, D> {
                     let Some(letter) = tile.letter() else {
                         continue;
                     };
-                    let Some(next_cursor) = cursor.advance(letter) else {
+                    let Some(next_cursor) = cursor.advance(letter, &self.rules.alphabet) else {
                         continue;
                     };
                     if !remaining.consume_tile(tile) {
@@ -236,6 +244,7 @@ fn seed_cursor<C: PrefixCursor>(
     board: &BoardState,
     pos: Position,
     direction: Direction,
+    alphabet: &crate::model::Alphabet,
 ) -> Option<C> {
     let mut letters = Vec::new();
     let mut current = pos;
@@ -252,15 +261,19 @@ fn seed_cursor<C: PrefixCursor>(
 
     let mut cursor = root;
     for letter in letters {
-        cursor = cursor.advance(letter)?;
+        cursor = cursor.advance(letter, alphabet)?;
     }
     Some(cursor)
 }
 
-fn available_tiles_for_crosscheck(rack: &Rack, cross_check: CrossCheck) -> Vec<Tile> {
+fn available_tiles_for_crosscheck(
+    rack: &Rack,
+    cross_check: CrossCheck,
+    alphabet_len: usize,
+) -> Vec<Tile> {
     let mut tiles = Vec::new();
 
-    for i in 0..26 {
+    for i in 0..alphabet_len {
         let letter = Letter::from(i as u8);
         if rack.counts[i] > 0 && cross_check.allows(letter) {
             tiles.push(Tile::Letter(letter));
@@ -268,7 +281,7 @@ fn available_tiles_for_crosscheck(rack: &Rack, cross_check: CrossCheck) -> Vec<T
     }
 
     if rack.blanks > 0 {
-        for i in 0..26 {
+        for i in 0..alphabet_len {
             let letter = Letter::from(i as u8);
             if !cross_check.allows(letter) {
                 continue;
@@ -388,7 +401,7 @@ mod tests {
 
         let state = GameState::new(&rules, &dictionary);
         let rack = Rack {
-            counts: [0; 26],
+            counts: [0; crate::model::MAX_ALPHABET_SIZE],
             blanks: 1,
         };
 
@@ -398,6 +411,74 @@ mod tests {
                 && candidate.tiles.len() == 1
                 && matches!(candidate.tiles[0].tile, Tile::Blank { acting_as: Some(letter) } if letter == Letter::from('A'))
         }));
+    }
+
+    /// A synthetic, non-ASCII, 27-letter toy ruleset (not a real shipped
+    /// edition) — proves the whole `RulesEngine` path (move generation,
+    /// validation, scoring, and the word-building that feeds the
+    /// dictionary) is genuinely driven by `VariantRules::alphabet`, not a
+    /// hardcoded assumption of the standard 26-letter Latin alphabet.
+    fn toy_non_ascii_rules() -> crate::model::VariantRules {
+        use crate::model::{Alphabet, Letter, Premium, VariantRules};
+
+        let alphabet = Alphabet::from_chars(('A'..='Z').chain(['É']));
+        let mut letter_values = [1u8; crate::model::MAX_ALPHABET_SIZE];
+        let mut tile_distribution = [0u8; crate::model::MAX_ALPHABET_SIZE];
+        for letter in 0..alphabet.len() {
+            tile_distribution[letter] = 4;
+        }
+        // Give the non-ASCII letter a distinctive value so a test can
+        // confirm it actually took effect, rather than just defaulting.
+        letter_values[Letter::from(26u8).as_usize()] = 9;
+        let official = VariantRules::official();
+        VariantRules {
+            name: "toy-non-ascii".to_string(),
+            language: "toy".to_string(),
+            alphabet,
+            letter_values,
+            tile_distribution,
+            blank_tiles: 0,
+            rack_size: 7,
+            width: official.width,
+            height: official.height,
+            bingo_bonus: official.bingo_bonus,
+            premiums: [Premium::Blank; 225],
+        }
+    }
+
+    #[test]
+    fn rules_engine_finds_and_scores_a_word_using_the_non_ascii_letter() {
+        let rules = toy_non_ascii_rules();
+        // "CAFÉ" as a toy dictionary entry — deliberately not a real
+        // dictionary/language, just proves a word containing the
+        // alphabet's non-ASCII letter is found, validated, and scored
+        // correctly end to end.
+        let dictionary = TinyDictionary::new(["CAFÉ"]);
+        let engine = RulesEngine {
+            rules: &rules,
+            dictionary: &dictionary,
+        };
+        let state = GameState::new(&rules, &dictionary);
+
+        let mut rack = Rack::default();
+        for ch in "CAFÉ".chars() {
+            rack.add_letter(rules.alphabet.to_letter(ch).expect("toy alphabet has this letter"));
+        }
+
+        let moves = engine.enumerate_legal_multi_tile_moves(&state, &rack);
+        let candidate = moves
+            .iter()
+            .find(|candidate| candidate.tiles.len() == 4)
+            .expect("CAFÉ should be a legal opening move using the whole rack");
+
+        let validated = engine
+            .validate_game_move(&state, Some(&rack), candidate)
+            .expect("CAFÉ should validate under the toy ruleset");
+        assert_eq!(validated.preview.main_word, "CAFÉ");
+        // Letter values: C=1, A=1, F=1, É=9 (the distinctive value set
+        // above) — confirms scoring actually consulted the non-ASCII
+        // letter's value, not just found the word.
+        assert_eq!(validated.score.main_word_score, 1 + 1 + 1 + 9);
     }
 
     #[test]

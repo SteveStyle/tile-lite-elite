@@ -15,7 +15,8 @@ pub use dictionary::{Dictionary, SOWPODS, SowpodsDictionary, is_word};
 pub use format::format_move_error;
 pub use generate::MoveGenerator;
 pub use model::{
-    CrossWordPreview, Direction, Letter, LetterMask, MoveCandidate, MoveError, MovePreview,
-    MoveScore, Position, Premium, Rack, Score, Tile, TilePlacement, ValidatedMove, VariantRules,
+    Alphabet, CrossWordPreview, Direction, Letter, LetterMask, MAX_ALPHABET_SIZE, MoveCandidate,
+    MoveError, MovePreview, MoveScore, Position, Premium, Rack, Score, Tile, TilePlacement,
+    ValidatedMove, VariantRules,
 };
 pub use validate::{GameState, MoveValidator, RulesEngine, RulesPosition};

@@ -187,7 +187,7 @@ impl<D: Dictionary> RulesEngine<'_, D> {
         loop {
             match state.board.get(current) {
                 Some(BoardCell::Filled(cell)) => {
-                    word.push(cell.letter.as_char());
+                    word.push(self.rules.letter_char(cell.letter));
                     if !cell.is_blank {
                         main_word_score +=
                             self.rules.letter_values[cell.letter.as_usize()] as Score;
@@ -217,7 +217,7 @@ impl<D: Dictionary> RulesEngine<'_, D> {
                     }
 
                     saw_placement = true;
-                    word.push(letter.as_char());
+                    word.push(self.rules.letter_char(letter));
                     let tile_score = if matches!(placement.tile, crate::model::Tile::Blank { .. }) {
                         0
                     } else {
@@ -507,15 +507,15 @@ fn build_cross_word(
 
     let mut word = String::with_capacity(8);
     for letter in before.iter().rev() {
-        word.push(letter.as_char());
+        word.push(rules.letter_char(*letter));
     }
-    word.push(placed_letter.as_char());
+    word.push(rules.letter_char(placed_letter));
 
     current = pos;
     while let Some(next) = current.try_step_forward(perpendicular, rules.width, rules.height) {
         match board.filled_letter(next) {
             Some((letter, _)) => {
-                word.push(letter.as_char());
+                word.push(rules.letter_char(letter));
                 current = next;
             }
             None => break,

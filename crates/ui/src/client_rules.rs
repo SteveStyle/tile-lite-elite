@@ -35,8 +35,13 @@ pub fn to_rules_tile(tile: &TileDto) -> rules_shared::Tile {
 }
 
 pub fn to_rules_rack(rack: &api::RackDto) -> rules_shared::Rack {
+    // The wire format stays 26-wide for now (see rules_shared's
+    // MAX_ALPHABET_SIZE doc comment) — pad out to the internal Rack's
+    // width, leaving the rest at zero.
+    let mut counts = [0u8; rules_shared::MAX_ALPHABET_SIZE];
+    counts[..26].copy_from_slice(&rack.counts);
     rules_shared::Rack {
-        counts: rack.counts,
+        counts,
         blanks: rack.blanks,
     }
 }
@@ -127,7 +132,8 @@ mod tests {
         let mut counts = [0u8; 26];
         counts[0] = 2;
         let rack = to_rules_rack(&api::RackDto { counts, blanks: 1 });
-        assert_eq!(rack.counts, counts);
+        assert_eq!(rack.counts[..26].to_vec(), counts.to_vec());
+        assert!(rack.counts[26..].iter().all(|&count| count == 0));
         assert_eq!(rack.blanks, 1);
     }
 

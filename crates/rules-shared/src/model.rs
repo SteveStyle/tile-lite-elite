@@ -134,34 +134,56 @@ impl Display for Letter {
     }
 }
 
-pub const ALPHABET: [Letter; 26] = [
-    Letter(0),
-    Letter(1),
-    Letter(2),
-    Letter(3),
-    Letter(4),
-    Letter(5),
-    Letter(6),
-    Letter(7),
-    Letter(8),
-    Letter(9),
-    Letter(10),
-    Letter(11),
-    Letter(12),
-    Letter(13),
-    Letter(14),
-    Letter(15),
-    Letter(16),
-    Letter(17),
-    Letter(18),
-    Letter(19),
-    Letter(20),
-    Letter(21),
-    Letter(22),
-    Letter(23),
-    Letter(24),
-    Letter(25),
-];
+/// The ordered set of characters a ruleset's `Letter`s actually mean —
+/// `Letter` is just a compact index (0.., see `Letter::as_usize`), and
+/// without an `Alphabet` to look it up in, that index has no inherent
+/// meaning. Every ruleset in production today uses `Alphabet::latin26()`,
+/// but nothing in `rules-shared`'s core logic (dictionary search,
+/// cross-checks, scoring) hardcodes that assumption anymore — it always
+/// goes through whichever alphabet the current `VariantRules` carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Alphabet {
+    chars: Vec<char>,
+}
+
+impl Alphabet {
+    /// The standard 26-letter Latin alphabet (A-Z) — every edition this
+    /// project ships today uses this.
+    pub fn latin26() -> Self {
+        Self {
+            chars: ('A'..='Z').collect(),
+        }
+    }
+
+    /// Builds an alphabet from an explicit, ordered list of characters —
+    /// for a language whose letters aren't a dense run starting at 'A'
+    /// (accented Latin, a different script, ...). `Letter(i)` means
+    /// `chars[i]`, for whatever order is given here.
+    pub fn from_chars(chars: impl IntoIterator<Item = char>) -> Self {
+        Self {
+            chars: chars.into_iter().collect(),
+        }
+    }
+
+    pub fn to_char(&self, letter: Letter) -> Option<char> {
+        self.chars.get(letter.as_usize()).copied()
+    }
+
+    pub fn to_letter(&self, ch: char) -> Option<Letter> {
+        self.chars
+            .iter()
+            .position(|&candidate| candidate == ch)
+            .map(|index| Letter(index as u8))
+    }
+
+    pub fn len(&self) -> usize {
+        self.chars.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chars.is_empty()
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Tile {
@@ -205,10 +227,23 @@ impl Premium {
     }
 }
 
-pub type LetterMask = u32;
+/// Widened from `u32`: still a plain bitmask (one bit per letter, cheap
+/// branchless test/set), but `u32` capped every ruleset at 32 distinct
+/// letters. `u64` comfortably covers any realistic single-codepoint
+/// alphabet (Cyrillic ~33, for instance) without needing a dynamic bitset.
+pub type LetterMask = u64;
 pub type Score = i16;
 
-pub const FULL_LETTER_MASK: LetterMask = (1 << 26) - 1;
+/// Every `Rack`/`VariantRules` letter-indexed array is a fixed array sized
+/// to this, rather than growing per-alphabet (`Vec`) — deliberately, to
+/// keep `Rack` cheaply `Copy` (it's passed and stored by value throughout
+/// move generation and game state) instead of a heap-allocated `Vec` no
+/// alphabet in production actually needs yet. Matches `LetterMask`'s bit
+/// width, since a letter index that didn't fit in the mask couldn't be
+/// checked/pruned anyway.
+pub const MAX_ALPHABET_SIZE: usize = 64;
+
+pub const FULL_LETTER_MASK: LetterMask = LetterMask::MAX;
 
 pub const fn mask_contains(mask: LetterMask, letter: Letter) -> bool {
     (mask & (1 << letter.as_usize())) != 0
@@ -230,10 +265,53 @@ pub const fn mask_is_full(mask: LetterMask) -> bool {
     mask == FULL_LETTER_MASK
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rack {
-    pub counts: [u8; 26],
+    // `std::array::from_fn`/serde's own array impls only go up to 32
+    // elements natively — `Default` and `Serialize`/`Deserialize` are
+    // written by hand below rather than pulling in a
+    // fixed-size-array-serde crate for this one field.
+    #[serde(
+        serialize_with = "serialize_letter_array",
+        deserialize_with = "deserialize_letter_array"
+    )]
+    pub counts: [u8; MAX_ALPHABET_SIZE],
     pub blanks: u8,
+}
+
+impl Default for Rack {
+    fn default() -> Self {
+        Self {
+            counts: [0; MAX_ALPHABET_SIZE],
+            blanks: 0,
+        }
+    }
+}
+
+fn serialize_letter_array<S: serde::Serializer>(
+    counts: &[u8; MAX_ALPHABET_SIZE],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    counts.as_slice().serialize(serializer)
+}
+
+fn deserialize_letter_array<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<[u8; MAX_ALPHABET_SIZE], D::Error> {
+    let values = Vec::<u8>::deserialize(deserializer)?;
+    if values.len() > MAX_ALPHABET_SIZE {
+        return Err(serde::de::Error::invalid_length(
+            values.len(),
+            &"at most MAX_ALPHABET_SIZE letter counts",
+        ));
+    }
+    // Accepts anything up to MAX_ALPHABET_SIZE, zero-padding the rest —
+    // not just an exact match — so a rack persisted before this array was
+    // widened (26 counts) still deserializes correctly instead of every
+    // pre-existing saved game failing to load.
+    let mut counts = [0u8; MAX_ALPHABET_SIZE];
+    counts[..values.len()].copy_from_slice(&values);
+    Ok(counts)
 }
 
 impl Rack {
@@ -289,8 +367,12 @@ pub struct VariantRules {
     /// match these independently, so neither does this type).
     pub name: String,
     pub language: String,
-    pub letter_values: [u8; 26],
-    pub tile_distribution: [u8; 26],
+    /// The characters this ruleset's `Letter`s mean — see `Alphabet`.
+    /// Every edition today is `Alphabet::latin26()`, but nothing else in
+    /// this type or in `rules-shared`'s search/scoring logic assumes that.
+    pub alphabet: Alphabet,
+    pub letter_values: [u8; MAX_ALPHABET_SIZE],
+    pub tile_distribution: [u8; MAX_ALPHABET_SIZE],
     pub blank_tiles: u8,
     pub rack_size: u8,
     pub width: u8,
@@ -300,16 +382,34 @@ pub struct VariantRules {
 }
 
 impl VariantRules {
+    /// The actual character `letter` represents under this ruleset's
+    /// alphabet — unlike `Letter::as_char()` (a fixed ASCII-offset guess
+    /// that's only ever right for the default Latin alphabet), this is
+    /// correct for whichever alphabet this specific ruleset actually uses.
+    pub fn letter_char(&self, letter: Letter) -> char {
+        self.alphabet
+            .to_char(letter)
+            .expect("Letter should be valid for this ruleset's alphabet")
+    }
+
+    /// Every letter this ruleset's alphabet defines, in index order —
+    /// replaces the old global `ALPHABET` constant, which silently assumed
+    /// every ruleset used the same 26-letter Latin alphabet.
+    pub fn letters(&self) -> impl Iterator<Item = Letter> + '_ {
+        (0..self.alphabet.len()).map(|index| Letter(index as u8))
+    }
+
     pub fn official() -> Self {
         Self {
             name: "official".to_string(),
             language: "sowpods".to_string(),
-            letter_values: [
+            alphabet: Alphabet::latin26(),
+            letter_values: pad_latin26([
                 1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3, 1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10,
-            ],
-            tile_distribution: [
+            ]),
+            tile_distribution: pad_latin26([
                 9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2, 6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1,
-            ],
+            ]),
             blank_tiles: 2,
             rack_size: 7,
             width: 15,
@@ -348,12 +448,13 @@ impl VariantRules {
         Self {
             name: "wordfeud".to_string(),
             language: "sowpods".to_string(),
-            letter_values: [
+            alphabet: Alphabet::latin26(),
+            letter_values: pad_latin26([
                 1, 4, 4, 2, 1, 4, 3, 4, 1, 10, 5, 1, 3, 1, 1, 4, 10, 1, 1, 1, 2, 4, 4, 8, 4, 10,
-            ],
-            tile_distribution: [
+            ]),
+            tile_distribution: pad_latin26([
                 10, 2, 2, 5, 12, 2, 3, 3, 9, 1, 1, 4, 2, 6, 7, 2, 1, 6, 5, 7, 4, 2, 2, 1, 2, 1,
-            ],
+            ]),
             blank_tiles: 2,
             rack_size: 7,
             width: 15,
@@ -392,6 +493,16 @@ impl VariantRules {
             _ => None,
         }
     }
+}
+
+/// Pads a 26-value Latin-alphabet table (letter values, tile distribution)
+/// out to `MAX_ALPHABET_SIZE` — every edition's actual `Alphabet` (not this
+/// array's length) is what bounds which slots are ever read, so the tail
+/// stays zeroed and unused for any 26-letter edition.
+fn pad_latin26(values: [u8; 26]) -> [u8; MAX_ALPHABET_SIZE] {
+    let mut padded = [0u8; MAX_ALPHABET_SIZE];
+    padded[..26].copy_from_slice(&values);
+    padded
 }
 
 /// Expands 18 canonical premium-square positions (one symmetric quadrant)
@@ -486,6 +597,29 @@ mod tests {
     }
 
     #[test]
+    fn rack_deserializes_a_pre_widening_26_count_snapshot() {
+        // Regression test: `Rack.counts` widened from [u8;26] to
+        // [u8;MAX_ALPHABET_SIZE] — a rack persisted before that change is
+        // exactly this 26-element JSON shape, and must still load instead
+        // of every pre-existing saved game failing at startup.
+        let json = r#"{"counts":[1,0,2,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"blanks":1}"#;
+        let rack: Rack = serde_json::from_str(json).expect("old 26-count rack should still parse");
+        assert_eq!(rack.counts[0], 1);
+        assert_eq!(rack.counts[2], 2);
+        assert_eq!(rack.blanks, 1);
+        assert!(rack.counts[26..].iter().all(|&count| count == 0));
+    }
+
+    #[test]
+    fn rack_round_trips_a_full_64_count_snapshot() {
+        let mut rack = Rack::default();
+        rack.add_letter(Letter::from(30u8));
+        let json = serde_json::to_string(&rack).expect("rack should serialize");
+        let restored: Rack = serde_json::from_str(&json).expect("rack should round-trip");
+        assert_eq!(restored, rack);
+    }
+
+    #[test]
     fn step_position() {
         let pos = Position::new(7, 7);
         assert_eq!(
@@ -517,8 +651,8 @@ mod tests {
     #[test]
     fn rack_consumes_tiles() {
         let mut rack = Rack {
-            counts: [0; 26],
             blanks: 1,
+            ..Rack::default()
         };
         rack.add_letter(Letter::from('A'));
 
