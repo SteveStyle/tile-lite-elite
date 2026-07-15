@@ -4,12 +4,18 @@ use dioxus::prelude::*;
 use std::collections::HashSet;
 
 #[component]
+#[allow(clippy::too_many_arguments)]
 pub fn BoardView(
     board: Vec<BoardCellDto>,
     staged_placements: Vec<StagedPlacementView>,
     last_move_cells: HashSet<usize>,
     can_stage_moves: bool,
     selected_cell: Option<usize>,
+    /// The active game's letter values/alphabet, for tile-face point
+    /// values — different editions (Wordfeud, German, ...) genuinely
+    /// differ here, so this can't be a hardcoded constant.
+    letter_values: [u8; rules_shared::MAX_ALPHABET_SIZE],
+    alphabet: rules_shared::Alphabet,
     on_drop_tile: EventHandler<usize>,
     on_remove_staged: EventHandler<usize>,
     on_drag_staged_tile: EventHandler<usize>,
@@ -101,15 +107,15 @@ pub fn BoardView(
                         on_remove_staged.call(index);
                     }
                 },
-                if let Some(letter) = cell.letter {
+                if let Some(letter) = &cell.letter {
                     div { class: "tile-face",
                         span { class: "tile-letter", "{letter}" }
-                        span { class: "tile-value", "{crate::tile_value::board_cell_point_value(letter, cell.is_blank)}" }
+                        span { class: "tile-value", "{crate::tile_value::board_cell_point_value(letter, cell.is_blank, &letter_values, &alphabet)}" }
                     }
                 } else if let Some(staged) = staged {
                     div { class: "tile-face tile-face-staged",
                         span { class: "tile-letter", "{staged.display}" }
-                        span { class: "tile-value", "{crate::tile_value::tile_point_value(&staged.tile)}" }
+                        span { class: "tile-value", "{crate::tile_value::tile_point_value(&staged.tile, &letter_values, &alphabet)}" }
                     }
                 } else {
                     div { class: "premium-label", "{premium_label(&cell.premium)}" }

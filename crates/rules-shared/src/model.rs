@@ -134,54 +134,126 @@ impl Display for Letter {
     }
 }
 
-/// The ordered set of characters a ruleset's `Letter`s actually mean —
+/// A tile's face — most are a single Unicode codepoint, but traditional
+/// Castilian Spanish's CH/LL/RR digraph tiles are genuinely two: one
+/// physical tile, one board square, one rack slot, that happens to
+/// display two characters. `Copy` and fixed-size (never heap-allocated),
+/// so an `Alphabet`'s `Vec<Grapheme>` is one contiguous block — unlike a
+/// `Vec<Box<str>>`, which would scatter one small heap allocation per
+/// entry. Deliberately capped at two characters: that's the actual scope
+/// (a handful of real digraph tiles), not a general grapheme-cluster
+/// facility for arbitrary complex scripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Grapheme {
+    Single(char),
+    Double(char, char),
+}
+
+impl Grapheme {
+    pub fn chars(self) -> GraphemeChars {
+        GraphemeChars {
+            grapheme: self,
+            index: 0,
+        }
+    }
+}
+
+impl Display for Grapheme {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        for ch in self.chars() {
+            write!(f, "{ch}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Yields a `Grapheme`'s one or two characters in order — no allocation,
+/// since `Grapheme` is already `Copy`.
+pub struct GraphemeChars {
+    grapheme: Grapheme,
+    index: u8,
+}
+
+impl Iterator for GraphemeChars {
+    type Item = char;
+
+    fn next(&mut self) -> Option<char> {
+        let result = match (self.grapheme, self.index) {
+            (Grapheme::Single(a), 0) => Some(a),
+            (Grapheme::Double(a, _), 0) => Some(a),
+            (Grapheme::Double(_, b), 1) => Some(b),
+            _ => None,
+        };
+        if result.is_some() {
+            self.index += 1;
+        }
+        result
+    }
+}
+
+/// The ordered set of graphemes a ruleset's `Letter`s actually mean —
 /// `Letter` is just a compact index (0.., see `Letter::as_usize`), and
 /// without an `Alphabet` to look it up in, that index has no inherent
-/// meaning. Every ruleset in production today uses `Alphabet::latin26()`,
-/// but nothing in `rules-shared`'s core logic (dictionary search,
-/// cross-checks, scoring) hardcodes that assumption anymore — it always
+/// meaning. Most editions use single-character graphemes
+/// (`Alphabet::latin26()`, or `latin26()` plus a few accented letters),
+/// but a `Letter` can also mean a digraph tile — see `Grapheme`. Nothing
+/// in `rules-shared`'s core logic (dictionary search, cross-checks,
+/// scoring) hardcodes a single-character assumption anymore — it always
 /// goes through whichever alphabet the current `VariantRules` carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Alphabet {
-    chars: Vec<char>,
+    graphemes: Vec<Grapheme>,
 }
 
 impl Alphabet {
     /// The standard 26-letter Latin alphabet (A-Z) — every edition this
     /// project ships today uses this.
     pub fn latin26() -> Self {
-        Self {
-            chars: ('A'..='Z').collect(),
-        }
+        Self::from_chars('A'..='Z')
     }
 
-    /// Builds an alphabet from an explicit, ordered list of characters —
-    /// for a language whose letters aren't a dense run starting at 'A'
-    /// (accented Latin, a different script, ...). `Letter(i)` means
-    /// `chars[i]`, for whatever order is given here.
+    /// Builds an alphabet from an explicit, ordered list of single
+    /// characters — for a language whose letters aren't a dense run
+    /// starting at 'A' (accented Latin, a different script, ...).
+    /// `Letter(i)` means `chars[i]`, for whatever order is given here.
     pub fn from_chars(chars: impl IntoIterator<Item = char>) -> Self {
         Self {
-            chars: chars.into_iter().collect(),
+            graphemes: chars.into_iter().map(Grapheme::Single).collect(),
         }
     }
 
-    pub fn to_char(&self, letter: Letter) -> Option<char> {
-        self.chars.get(letter.as_usize()).copied()
+    /// Builds an alphabet from an explicit, ordered list of graphemes,
+    /// some of which may be digraphs — for a digraph-tile edition
+    /// (Spanish's CH/LL/RR). `Letter(i)` means `graphemes[i]`.
+    pub fn from_graphemes(graphemes: impl IntoIterator<Item = Grapheme>) -> Self {
+        Self {
+            graphemes: graphemes.into_iter().collect(),
+        }
     }
 
-    pub fn to_letter(&self, ch: char) -> Option<Letter> {
-        self.chars
+    pub fn to_grapheme(&self, letter: Letter) -> Option<Grapheme> {
+        self.graphemes.get(letter.as_usize()).copied()
+    }
+
+    /// Resolves the `Letter` whose grapheme's rendered text exactly equals
+    /// `s` — this is an exact match, not a longest-match tokenizer over
+    /// free text: every caller already hands this an already-delimited,
+    /// single-tile string (a wire DTO field, a rack tile's known content),
+    /// never a longer run of concatenated text that would need splitting
+    /// up.
+    pub fn to_letter(&self, s: &str) -> Option<Letter> {
+        self.graphemes
             .iter()
-            .position(|&candidate| candidate == ch)
+            .position(|candidate| candidate.chars().eq(s.chars()))
             .map(|index| Letter(index as u8))
     }
 
     pub fn len(&self) -> usize {
-        self.chars.len()
+        self.graphemes.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.chars.is_empty()
+        self.graphemes.is_empty()
     }
 }
 
@@ -382,13 +454,15 @@ pub struct VariantRules {
 }
 
 impl VariantRules {
-    /// The actual character `letter` represents under this ruleset's
+    /// The actual grapheme `letter` represents under this ruleset's
     /// alphabet — unlike `Letter::as_char()` (a fixed ASCII-offset guess
-    /// that's only ever right for the default Latin alphabet), this is
-    /// correct for whichever alphabet this specific ruleset actually uses.
-    pub fn letter_char(&self, letter: Letter) -> char {
+    /// that's only ever right for the default Latin alphabet, and only
+    /// ever one character), this is correct for whichever alphabet this
+    /// specific ruleset actually uses, including multi-character digraph
+    /// tiles (Spanish's CH/LL/RR).
+    pub fn letter_grapheme(&self, letter: Letter) -> Grapheme {
         self.alphabet
-            .to_char(letter)
+            .to_grapheme(letter)
             .expect("Letter should be valid for this ruleset's alphabet")
     }
 
@@ -404,10 +478,10 @@ impl VariantRules {
             name: "official".to_string(),
             language: "sowpods".to_string(),
             alphabet: Alphabet::latin26(),
-            letter_values: pad_latin26([
+            letter_values: pad::<26>([
                 1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3, 1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10,
             ]),
-            tile_distribution: pad_latin26([
+            tile_distribution: pad::<26>([
                 9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2, 6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1,
             ]),
             blank_tiles: 2,
@@ -449,10 +523,10 @@ impl VariantRules {
             name: "wordfeud".to_string(),
             language: "sowpods".to_string(),
             alphabet: Alphabet::latin26(),
-            letter_values: pad_latin26([
+            letter_values: pad::<26>([
                 1, 4, 4, 2, 1, 4, 3, 4, 1, 10, 5, 1, 3, 1, 1, 4, 10, 1, 1, 1, 2, 4, 4, 8, 4, 10,
             ]),
-            tile_distribution: pad_latin26([
+            tile_distribution: pad::<26>([
                 10, 2, 2, 5, 12, 2, 3, 3, 9, 1, 1, 4, 2, 6, 7, 2, 1, 6, 5, 7, 4, 2, 2, 1, 2, 1,
             ]),
             blank_tiles: 2,
@@ -483,6 +557,181 @@ impl VariantRules {
         }
     }
 
+    /// North American English Scrabble (TWL/NWL word list territory).
+    /// Real North American (Hasbro) and International (Mattel) sets are
+    /// economically identical — same 100 tiles, same letter values, same
+    /// board — the only real-world difference is the word list, so this
+    /// deliberately duplicates `official()`'s numbers verbatim rather than
+    /// deriving from it: it's a coincidence that they start out equal, not
+    /// a guarantee, and the two should be free to diverge independently if
+    /// either edition's numbers are ever tuned.
+    pub fn north_american() -> Self {
+        Self {
+            name: "north_american".to_string(),
+            language: "enable2k".to_string(),
+            alphabet: Alphabet::latin26(),
+            letter_values: pad::<26>([
+                1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 5, 1, 3, 1, 1, 3, 10, 1, 1, 1, 1, 4, 4, 8, 4, 10,
+            ]),
+            tile_distribution: pad::<26>([
+                9, 2, 2, 4, 12, 2, 3, 2, 9, 1, 1, 4, 2, 6, 8, 2, 1, 6, 4, 6, 4, 2, 2, 1, 2, 1,
+            ]),
+            blank_tiles: 2,
+            rack_size: 7,
+            width: 15,
+            height: 15,
+            bingo_bonus: 50,
+            premiums: mirrored_premiums(&[
+                (0, 0, Premium::TripleWord),
+                (3, 0, Premium::DoubleLetter),
+                (7, 0, Premium::TripleWord),
+                (1, 1, Premium::DoubleWord),
+                (5, 1, Premium::TripleLetter),
+                (2, 2, Premium::DoubleWord),
+                (6, 2, Premium::DoubleLetter),
+                (0, 3, Premium::DoubleLetter),
+                (3, 3, Premium::DoubleWord),
+                (7, 3, Premium::DoubleLetter),
+                (4, 4, Premium::DoubleWord),
+                (1, 5, Premium::TripleLetter),
+                (5, 5, Premium::TripleLetter),
+                (2, 6, Premium::DoubleLetter),
+                (6, 6, Premium::DoubleLetter),
+                (0, 7, Premium::TripleWord),
+                (3, 7, Premium::DoubleLetter),
+                (7, 7, Premium::DoubleWord),
+            ]),
+        }
+    }
+
+    /// German Scrabble — a genuinely distinct alphabet (A-Z plus Ä/Ö/Ü, 29
+    /// letters total) with its own point values/distribution, verified
+    /// against two independent sources (Wikipedia's Scrabble letter
+    /// distributions page and gtoal.com/scrabble/details/german): 100
+    /// letter tiles + 2 blanks = 102 total (vs. English's 100). No ß tile —
+    /// real German Scrabble sets have none; ß-words are physically played
+    /// as two separate S tiles (`STRASSE`, not `STRAßE`), which is exactly
+    /// why the German S count (7) is higher than English's (4). Board
+    /// layout/bingo bonus are the same as `official()` — that's standard
+    /// across language editions of standard Scrabble; only Wordfeud (a
+    /// different company's game) differs there.
+    pub fn german() -> Self {
+        Self {
+            name: "german".to_string(),
+            language: "german".to_string(),
+            alphabet: Alphabet::from_chars(('A'..='Z').chain(['Ä', 'Ö', 'Ü'])),
+            // A..Z, then Ä, Ö, Ü.
+            letter_values: pad::<29>([
+                1, 3, 4, 1, 1, 4, 2, 2, 1, 6, 4, 2, 3, 1, 2, 4, 10, 1, 1, 1, 1, 6, 3, 8, 10, 3, 6,
+                8, 6,
+            ]),
+            tile_distribution: pad::<29>([
+                5, 2, 2, 4, 15, 2, 3, 4, 6, 1, 2, 3, 4, 9, 3, 1, 1, 6, 7, 6, 6, 1, 1, 1, 1, 1, 1,
+                1, 1,
+            ]),
+            blank_tiles: 2,
+            rack_size: 7,
+            width: 15,
+            height: 15,
+            bingo_bonus: 50,
+            premiums: mirrored_premiums(&[
+                (0, 0, Premium::TripleWord),
+                (3, 0, Premium::DoubleLetter),
+                (7, 0, Premium::TripleWord),
+                (1, 1, Premium::DoubleWord),
+                (5, 1, Premium::TripleLetter),
+                (2, 2, Premium::DoubleWord),
+                (6, 2, Premium::DoubleLetter),
+                (0, 3, Premium::DoubleLetter),
+                (3, 3, Premium::DoubleWord),
+                (7, 3, Premium::DoubleLetter),
+                (4, 4, Premium::DoubleWord),
+                (1, 5, Premium::TripleLetter),
+                (5, 5, Premium::TripleLetter),
+                (2, 6, Premium::DoubleLetter),
+                (6, 6, Premium::DoubleLetter),
+                (0, 7, Premium::TripleWord),
+                (3, 7, Premium::DoubleLetter),
+                (7, 7, Premium::DoubleWord),
+            ]),
+        }
+    }
+
+    /// Traditional Castilian Spanish Scrabble — predates, and was never
+    /// updated for, the Real Academia Española's 2010 decision to drop
+    /// CH/LL as separate alphabet letters; the physical tile set still
+    /// uses CH, LL, and RR as genuine digraph tiles (one board square,
+    /// one rack slot, one point value each), verified against two
+    /// independent sources (gtoal.com/scrabble/details/spanish,
+    /// Wikipedia's Scrabble letter distributions page). K and W are
+    /// absent entirely (rarely used in Spanish, zero tiles in the real
+    /// set) rather than present with a zero count. 25 single letters + 3
+    /// digraphs + 2 blanks = 100 tiles.
+    ///
+    /// Real FISE tournament rules forbid substituting two ordinary tiles
+    /// for a digraph tile — you must hold the actual CH tile to play a
+    /// word needing "ch". This deliberately does **not** enforce that:
+    /// both the digraph tile (one square) and two ordinary tiles (two
+    /// squares) are accepted ways to spell the same word. That's not a
+    /// data limitation, it's what lets the dictionary stay completely
+    /// unannotated plain text — `SortedPrefixCursor::advance` just
+    /// narrows once per character in whichever grapheme was placed, so
+    /// both tilings independently reach the same entry.
+    pub fn spanish() -> Self {
+        Self {
+            name: "spanish".to_string(),
+            language: "spanish".to_string(),
+            // A-Z minus K,W, plus Ñ, then the three digraph tiles.
+            alphabet: Alphabet::from_graphemes(
+                "ABCDEFGHIJLMNÑOPQRSTUVXYZ"
+                    .chars()
+                    .map(Grapheme::Single)
+                    .chain([
+                        Grapheme::Double('C', 'H'),
+                        Grapheme::Double('L', 'L'),
+                        Grapheme::Double('R', 'R'),
+                    ]),
+            ),
+            letter_values: pad::<28>([
+                1, 3, 3, 2, 1, 4, 2, 4, 1, 8, 1, 3, 1, 8, 1, 3, 5, 1, 1, 1, 1, 4, 8, 4, 10, 5, 8, 8,
+            ]),
+            tile_distribution: pad::<28>([
+                12, 2, 4, 5, 12, 1, 2, 2, 6, 1, 4, 2, 5, 1, 9, 2, 1, 5, 6, 4, 5, 1, 1, 1, 1, 1, 1,
+                1,
+            ]),
+            blank_tiles: 2,
+            rack_size: 7,
+            width: 15,
+            height: 15,
+            bingo_bonus: 50,
+            premiums: mirrored_premiums(&[
+                (0, 0, Premium::TripleWord),
+                (3, 0, Premium::DoubleLetter),
+                (7, 0, Premium::TripleWord),
+                (1, 1, Premium::DoubleWord),
+                (5, 1, Premium::TripleLetter),
+                (2, 2, Premium::DoubleWord),
+                (6, 2, Premium::DoubleLetter),
+                (0, 3, Premium::DoubleLetter),
+                (3, 3, Premium::DoubleWord),
+                (7, 3, Premium::DoubleLetter),
+                (4, 4, Premium::DoubleWord),
+                (1, 5, Premium::TripleLetter),
+                (5, 5, Premium::TripleLetter),
+                (2, 6, Premium::DoubleLetter),
+                (6, 6, Premium::DoubleLetter),
+                (0, 7, Premium::TripleWord),
+                (3, 7, Premium::DoubleLetter),
+                (7, 7, Premium::DoubleWord),
+            ]),
+        }
+    }
+
+    /// Every edition name the UI's picker can enumerate without duplicating
+    /// the list `by_name` matches against.
+    pub const EDITION_NAMES: &[&str] =
+        &["official", "wordfeud", "north_american", "german", "spanish"];
+
     /// The edition registry — every bundled ruleset this server knows
     /// about, looked up by name. `None` for an unrecognized name (the
     /// caller decides whether that's a client error).
@@ -490,18 +739,22 @@ impl VariantRules {
         match name {
             "official" => Some(Self::official()),
             "wordfeud" => Some(Self::wordfeud()),
+            "north_american" => Some(Self::north_american()),
+            "german" => Some(Self::german()),
+            "spanish" => Some(Self::spanish()),
             _ => None,
         }
     }
 }
 
-/// Pads a 26-value Latin-alphabet table (letter values, tile distribution)
-/// out to `MAX_ALPHABET_SIZE` — every edition's actual `Alphabet` (not this
+/// Pads an `N`-value alphabet table (letter values, tile distribution) out
+/// to `MAX_ALPHABET_SIZE` — every edition's actual `Alphabet` (not this
 /// array's length) is what bounds which slots are ever read, so the tail
-/// stays zeroed and unused for any 26-letter edition.
-fn pad_latin26(values: [u8; 26]) -> [u8; MAX_ALPHABET_SIZE] {
+/// stays zeroed and unused for any edition with fewer than `MAX_ALPHABET_SIZE`
+/// letters.
+fn pad<const N: usize>(values: [u8; N]) -> [u8; MAX_ALPHABET_SIZE] {
     let mut padded = [0u8; MAX_ALPHABET_SIZE];
-    padded[..26].copy_from_slice(&values);
+    padded[..N].copy_from_slice(&values);
     padded
 }
 
@@ -683,6 +936,8 @@ mod tests {
     fn by_name_resolves_known_editions_and_rejects_unknown_ones() {
         assert_eq!(VariantRules::by_name("official").unwrap().name, "official");
         assert_eq!(VariantRules::by_name("wordfeud").unwrap().name, "wordfeud");
+        assert_eq!(VariantRules::by_name("spanish").unwrap().name, "spanish");
+        assert!(VariantRules::EDITION_NAMES.contains(&"spanish"));
         assert!(VariantRules::by_name("not-a-real-edition").is_none());
     }
 

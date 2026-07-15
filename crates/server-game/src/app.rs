@@ -150,6 +150,9 @@ async fn list_engines(State(state): State<AppState>) -> Json<Vec<api::EngineProf
 async fn get_dictionary(Path(name): Path<String>) -> Result<String, ApiProblem> {
     match name.as_str() {
         "sowpods" => Ok(rules_shared::sowpods_word_list().to_string()),
+        "enable2k" => Ok(rules_shared::enable2k_word_list().to_string()),
+        "german" => Ok(rules_shared::german_word_list().to_string()),
+        "spanish" => Ok(rules_shared::spanish_word_list().to_string()),
         _ => Err(ApiProblem::not_found(format!("Unknown dictionary '{name}'"))),
     }
 }
@@ -222,6 +225,16 @@ async fn list_games(
             let mut summary = game.to_summary_dto(last_activity_at);
             summary.relationship = api::GameRelationship::InvitedOpen;
             summary.invitation_id = Some(invitation.id.clone());
+            summaries.push(summary);
+            continue;
+        }
+
+        // Not seated and not invited — still show it if the caller is the
+        // one who created it (e.g. an Engine vs Engine game set up to
+        // watch, where nobody is ever seated as a human).
+        if game.creator_player_id.as_deref() == Some(caller_player_id.as_str()) {
+            let mut summary = game.to_summary_dto(last_activity_at);
+            summary.relationship = api::GameRelationship::Creator;
             summaries.push(summary);
         }
     }
@@ -318,6 +331,7 @@ async fn create_game(
     let game = GameSession::new(
         Uuid::new_v4().to_string(),
         participants,
+        Some(creator_player_id.clone()),
         seed,
         rules,
         move_time_limit_seconds,
@@ -469,9 +483,13 @@ async fn submit_action(
             }
         }
 
+        let action_alphabet = game.rules.alphabet.clone();
         match request.action {
             PlayerActionDto::Place { candidate } => game
-                .apply_place_move(request.seat_number, move_candidate_from_dto(candidate))
+                .apply_place_move(
+                    request.seat_number,
+                    move_candidate_from_dto(candidate, &action_alphabet),
+                )
                 .map_err(ApiProblem::bad_request)?,
             PlayerActionDto::Pass => game
                 .apply_pass(request.seat_number)
@@ -479,7 +497,10 @@ async fn submit_action(
             PlayerActionDto::Exchange { tiles } => game
                 .apply_exchange(
                     request.seat_number,
-                    tiles.into_iter().map(tile_from_dto).collect(),
+                    tiles
+                        .into_iter()
+                        .map(|tile| tile_from_dto(tile, &action_alphabet))
+                        .collect(),
                 )
                 .map_err(ApiProblem::bad_request)?,
             PlayerActionDto::Resign => game
@@ -548,10 +569,11 @@ async fn preview_move(
         .map(|p| p.rack)
         .unwrap_or_default();
 
-    let candidate = move_candidate_from_dto(request.candidate);
+    let candidate = move_candidate_from_dto(request.candidate, &game.rules.alphabet);
     let engine = rules_shared::RulesEngine {
         rules: &game.rules,
-        dictionary: &*rules_shared::SOWPODS,
+        dictionary: rules_shared::dictionary_by_name(&game.rules.language)
+            .expect("game rules should reference a known dictionary"),
     };
 
     let response = match engine.validate_game_move(&game.state, Some(&rack), &candidate) {
@@ -625,7 +647,8 @@ async fn suggest_move(
         let rack = participant.rack;
         let engine = rules_shared::RulesEngine {
             rules: &game.rules,
-            dictionary: &*rules_shared::SOWPODS,
+            dictionary: rules_shared::dictionary_by_name(&game.rules.language)
+                .expect("game rules should reference a known dictionary"),
         };
 
         use rules_shared::MoveGenerator as _;
@@ -1511,7 +1534,8 @@ mod tests {
     use axum::body::{Body, to_bytes};
     use axum::http::{Method, Request};
     use rules_shared::{
-        GameState, Letter, MoveGenerator, Rack, RulesEngine, SOWPODS, VariantRules,
+        Direction, ENABLE2K, GameState, GERMAN, Letter, MoveCandidate, MoveGenerator, Position,
+        Rack, RulesEngine, SOWPODS, Tile, TilePlacement, VariantRules,
     };
     use serde::Serialize;
     use serde::de::DeserializeOwned;
@@ -1668,6 +1692,51 @@ mod tests {
             .expect("body should read");
         let text = String::from_utf8(bytes.to_vec()).expect("dictionary should be valid utf8");
         assert!(text.split_whitespace().any(|word| word == "ACE"));
+    }
+
+    #[tokio::test]
+    async fn dictionary_endpoint_serves_enable2k_unauthenticated() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_empty(app, Method::GET, "/dictionaries/enable2k").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(bytes.to_vec()).expect("dictionary should be valid utf8");
+        assert!(text.split_whitespace().any(|word| word == "ACE"));
+    }
+
+    #[tokio::test]
+    async fn dictionary_endpoint_serves_german_unauthenticated() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_empty(app, Method::GET, "/dictionaries/german").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(bytes.to_vec()).expect("dictionary should be valid utf8");
+        assert!(text.split_whitespace().any(|word| word == "ÖL"));
+    }
+
+    #[tokio::test]
+    async fn dictionary_endpoint_serves_spanish_unauthenticated() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_empty(app, Method::GET, "/dictionaries/spanish").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let text = String::from_utf8(bytes.to_vec()).expect("dictionary should be valid utf8");
+        assert!(text.split_whitespace().any(|word| word == "CARRO"));
     }
 
     #[tokio::test]
@@ -1907,7 +1976,8 @@ mod tests {
         }
 
         let rules = VariantRules::official();
-        let board = board_from_dto(&started.board).expect("board dto should reconstruct");
+        let board = board_from_dto(&started.board, &rules.alphabet)
+            .expect("board dto should reconstruct");
         let position = GameState::from_board(board, &rules, &*SOWPODS);
         let player_rack = rack_with_letters(&['A', 'T']);
         let engine = RulesEngine {
@@ -1927,7 +1997,7 @@ mod tests {
             &GameActionRequest {
                 seat_number: 0,
                 action: PlayerActionDto::Place {
-                    candidate: move_candidate_to_dto(&candidate),
+                    candidate: move_candidate_to_dto(&candidate, &rules.alphabet),
                 },
             },
         )
@@ -1966,7 +2036,8 @@ mod tests {
         }
 
         let rules = VariantRules::official();
-        let board = board_from_dto(&started.game.board).expect("board dto should reconstruct");
+        let board = board_from_dto(&started.game.board, &rules.alphabet)
+            .expect("board dto should reconstruct");
         let position = GameState::from_board(board, &rules, &*SOWPODS);
         let player_rack = rack_with_letters(&['A', 'T']);
         let engine = RulesEngine {
@@ -2005,7 +2076,7 @@ mod tests {
             &GameActionRequest {
                 seat_number: 0,
                 action: PlayerActionDto::Place {
-                    candidate: move_candidate_to_dto(&candidate),
+                    candidate: move_candidate_to_dto(&candidate, &rules.alphabet),
                 },
             },
         )
@@ -2049,7 +2120,8 @@ mod tests {
         }
 
         let rules = VariantRules::official();
-        let board = board_from_dto(&started.game.board).expect("board dto should reconstruct");
+        let board = board_from_dto(&started.game.board, &rules.alphabet)
+            .expect("board dto should reconstruct");
         let position = GameState::from_board(board, &rules, &*SOWPODS);
         let player_rack = rack_with_letters(&['A', 'T']);
         let engine = RulesEngine {
@@ -2069,7 +2141,7 @@ mod tests {
             &GameActionRequest {
                 seat_number: 0,
                 action: PlayerActionDto::Place {
-                    candidate: move_candidate_to_dto(&candidate),
+                    candidate: move_candidate_to_dto(&candidate, &rules.alphabet),
                 },
             },
         )
@@ -2277,10 +2349,10 @@ mod tests {
         // computing an "expected wordfeud score" needs the wordfeud game's
         // own board (with wordfeud's premium layout), not the official
         // game's, even though both are still empty at this point.
-        let official_board =
-            board_from_dto(&official_game.board).expect("fresh board should parse");
-        let wordfeud_board =
-            board_from_dto(&wordfeud_game.board).expect("fresh board should parse");
+        let official_board = board_from_dto(&official_game.board, &official_rules.alphabet)
+            .expect("fresh board should parse");
+        let wordfeud_board = board_from_dto(&wordfeud_game.board, &wordfeud_rules.alphabet)
+            .expect("fresh board should parse");
         let official_position = GameState::from_board(official_board, &official_rules, &*SOWPODS);
         let wordfeud_position = GameState::from_board(wordfeud_board, &wordfeud_rules, &*SOWPODS);
         let rack = rack_with_letters(&['B', 'A', 'G']);
@@ -2330,7 +2402,7 @@ mod tests {
             game.participants[1].rack = rack_with_letters(&['Q']);
         }
 
-        let candidate_dto = move_candidate_to_dto(&candidate);
+        let candidate_dto = move_candidate_to_dto(&candidate, &official_rules.alphabet);
         let official_response: GameStateDto = read_json(
             send_json_auth(
                 app.clone(),
@@ -2384,6 +2456,489 @@ mod tests {
         assert_eq!(restored.variant, "wordfeud");
         assert_eq!(restored.rules.bingo_bonus, wordfeud_rules.bingo_bonus);
         assert_eq!(restored.rules.letter_values, wordfeud_rules.letter_values);
+    }
+
+    /// The North American edition's whole point is a second real
+    /// dictionary (ENABLE2K, not SOWPODS) behind the exact same choke
+    /// point (`dictionary_by_name`) every other call site now goes
+    /// through — this exercises all three of those call sites end to end:
+    /// human move validation (`apply_place_move`), the engine's reply
+    /// (`GreedyEngine::choose_action`), and reloading from persistence.
+    #[tokio::test]
+    async fn north_american_game_plays_a_move_and_persists_its_own_dictionary() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                    ],
+                    seed: Some(88),
+                    variant: Some("north_american".to_string()),
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created.variant, "north_american");
+        assert_eq!(created.language, "enable2k");
+
+        let started: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                Some(&alice.session_token),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+
+        {
+            let mut games = state.games.write().await;
+            let game = games
+                .get_mut(&created.id)
+                .expect("created game should exist in memory");
+            game.bag = vec![rules_shared::Tile::Letter(Letter::from('X')); 20];
+            game.participants[0].rack = rack_with_letters(&['A', 'T']);
+            game.participants[1].rack = rack_with_letters(&['Q']);
+        }
+
+        let rules = VariantRules::north_american();
+        let board = board_from_dto(&started.board, &rules.alphabet)
+            .expect("board dto should reconstruct");
+        let position = GameState::from_board(board, &rules, &*ENABLE2K);
+        let player_rack = rack_with_letters(&['A', 'T']);
+        let engine = RulesEngine {
+            rules: &rules,
+            dictionary: &*ENABLE2K,
+        };
+        let candidate = engine
+            .enumerate_legal_moves(&position, &player_rack)
+            .next()
+            .expect("opening rack should have a legal move");
+
+        let move_response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", created.id),
+            Some(&alice.session_token),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Place {
+                    candidate: move_candidate_to_dto(&candidate, &rules.alphabet),
+                },
+            },
+        )
+        .await;
+        assert_eq!(move_response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(move_response).await;
+        // Confirms `apply_place_move` validated against ENABLE2K (not
+        // SOWPODS) without panicking, and the greedy engine's reply
+        // (`GreedyEngine::choose_action`) resolved its own dictionary the
+        // same way.
+        assert_eq!(updated.moves.len(), 2);
+        assert_eq!(updated.moves[0].seat_number, 0);
+        assert_eq!(updated.moves[1].seat_number, 1);
+
+        let reloaded = create_test_state(&database_url).await;
+        let games = reloaded.games.read().await;
+        let restored = games
+            .get(&created.id)
+            .expect("north_american game should reload from its sqlite snapshot");
+        assert_eq!(restored.variant, "north_american");
+        assert_eq!(restored.language, "enable2k");
+    }
+
+    /// German is the real proof of the widened wire/persistence formats
+    /// (`RackDto.counts`, `PersistedVariantRules`) — unlike north_american
+    /// (still plain ASCII), a German rack genuinely needs a rack slot past
+    /// index 25 (Ö is index 28 of its 29-letter alphabet), so this only
+    /// passes if the whole chain (rack transport, move validation,
+    /// persistence round-trip) is actually alphabet-width-correct rather
+    /// than coincidentally working for a 26-or-fewer-letter edition.
+    #[tokio::test]
+    async fn german_game_plays_a_move_with_an_umlaut_tile_and_persists_it() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                    ],
+                    seed: Some(99),
+                    variant: Some("german".to_string()),
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created.variant, "german");
+        assert_eq!(created.language, "german");
+
+        let started: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                Some(&alice.session_token),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+
+        let rules = VariantRules::german();
+        let umlaut_rack = {
+            let mut rack = Rack::default();
+            for ch in ['Ö', 'L'] {
+                rack.add_letter(
+                    rules
+                        .alphabet
+                        .to_letter(&ch.to_string())
+                        .expect("Ö/L should be in the German alphabet"),
+                );
+            }
+            rack
+        };
+        {
+            let mut games = state.games.write().await;
+            let game = games
+                .get_mut(&created.id)
+                .expect("created game should exist in memory");
+            game.bag = vec![rules_shared::Tile::Letter(Letter::from('X')); 20];
+            game.participants[0].rack = umlaut_rack;
+            game.participants[1].rack = umlaut_rack;
+        }
+
+        let board = board_from_dto(&started.board, &rules.alphabet)
+            .expect("board dto should reconstruct");
+        let position = GameState::from_board(board, &rules, &*GERMAN);
+        let engine = RulesEngine {
+            rules: &rules,
+            dictionary: &*GERMAN,
+        };
+        let candidate = engine
+            .enumerate_legal_moves(&position, &umlaut_rack)
+            .next()
+            .expect("ÖL should have a legal opening move");
+
+        let move_response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", created.id),
+            Some(&alice.session_token),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Place {
+                    candidate: move_candidate_to_dto(&candidate, &rules.alphabet),
+                },
+            },
+        )
+        .await;
+        assert_eq!(move_response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(move_response).await;
+        // Confirms the wire round-trip: the placed Ö actually made it onto
+        // the board through `RackDto`/`TileDto` (both now wider than 26)
+        // without corruption.
+        assert!(
+            updated
+                .board
+                .iter()
+                .any(|cell| cell.letter.as_deref() == Some("Ö"))
+        );
+
+        let reloaded = create_test_state(&database_url).await;
+        let games = reloaded.games.read().await;
+        let restored = games
+            .get(&created.id)
+            .expect("german game should reload from its sqlite snapshot");
+        assert_eq!(restored.variant, "german");
+        assert_eq!(restored.language, "german");
+        assert_eq!(restored.rules.alphabet, rules.alphabet);
+        assert_eq!(restored.rules.letter_values, rules.letter_values);
+    }
+
+    async fn create_and_start_spanish_game(
+        state: &AppState,
+        app: Router,
+    ) -> (PlayerSessionDto, GameStateDto) {
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                    ],
+                    seed: Some(100),
+                    variant: Some("spanish".to_string()),
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created.variant, "spanish");
+        assert_eq!(created.language, "spanish");
+
+        let started: GameStateDto = read_json(
+            send_json_auth(
+                app,
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                Some(&alice.session_token),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+        {
+            let mut games = state.games.write().await;
+            let game = games
+                .get_mut(&created.id)
+                .expect("created game should exist in memory");
+            game.bag = vec![Tile::Letter(Letter::from('X')); 20];
+        }
+        (alice, started)
+    }
+
+    /// Spanish is the real proof of the whole digraph-tile design: the CH/
+    /// LL/RR tiles are genuinely distinct rack/bag objects (their own
+    /// scarcity, their own point value), but the dictionary needs no
+    /// annotation because both tilings of a word are accepted. This test
+    /// covers the digraph-tile spelling — one RR tile, one square.
+    #[tokio::test]
+    async fn spanish_game_plays_carro_with_the_rr_digraph_tile() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+        let (alice, started) = create_and_start_spanish_game(&state, app.clone()).await;
+
+        let rules = VariantRules::spanish();
+        let spanish_letter = |s: &str| rules.alphabet.to_letter(s).expect("real Spanish tile");
+        let carro_via_digraph = MoveCandidate {
+            start: Position::new(7, 7),
+            direction: Direction::Horizontal,
+            tiles: vec![
+                TilePlacement {
+                    offset: 0,
+                    tile: Tile::Letter(spanish_letter("C")),
+                },
+                TilePlacement {
+                    offset: 1,
+                    tile: Tile::Letter(spanish_letter("A")),
+                },
+                TilePlacement {
+                    offset: 2,
+                    tile: Tile::Letter(spanish_letter("RR")),
+                },
+                TilePlacement {
+                    offset: 3,
+                    tile: Tile::Letter(spanish_letter("O")),
+                },
+            ],
+        };
+
+        {
+            let mut games = state.games.write().await;
+            let game = games
+                .get_mut(&started.id)
+                .expect("created game should exist in memory");
+            let mut rack = Rack::default();
+            for letter in ["C", "A", "RR", "O"] {
+                rack.add_letter(spanish_letter(letter));
+            }
+            game.participants[0].rack = rack;
+        }
+
+        let move_response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", started.id),
+            Some(&alice.session_token),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Place {
+                    candidate: move_candidate_to_dto(&carro_via_digraph, &rules.alphabet),
+                },
+            },
+        )
+        .await;
+        assert_eq!(move_response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(move_response).await;
+        // "CARRO" via the digraph tile occupies exactly 4 squares — a
+        // literal "R" cell should not appear at all, only the fused "RR".
+        let placed: Vec<Option<String>> = updated.board[7 * 15 + 7..7 * 15 + 11]
+            .iter()
+            .map(|cell| cell.letter.clone())
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                Some("C".to_string()),
+                Some("A".to_string()),
+                Some("RR".to_string()),
+                Some("O".to_string()),
+            ]
+        );
+        // RR is worth 8, not 2× R's value (1) — confirms it scored as the
+        // real digraph tile, not as two ordinary letters. C=3, A=1, O=1;
+        // the center square (x=7) is a DoubleWord premium and nothing
+        // else in this 4-square span (x=7..10) is a premium, so the raw
+        // sum (3+1+8+1=13) just doubles.
+        assert_eq!(updated.participants[0].score, (3 + 1 + 8 + 1) * 2);
+    }
+
+    /// The other half of the same proof: two *ordinary* R tiles (no RR
+    /// tile at all) spelling the same word is also accepted, occupying 5
+    /// squares instead of 4.
+    #[tokio::test]
+    async fn spanish_game_plays_carro_with_two_ordinary_r_tiles() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+        let (alice, started) = create_and_start_spanish_game(&state, app.clone()).await;
+
+        let rules = VariantRules::spanish();
+        let spanish_letter = |s: &str| rules.alphabet.to_letter(s).expect("real Spanish tile");
+        let carro_via_ordinary_tiles = MoveCandidate {
+            start: Position::new(7, 7),
+            direction: Direction::Horizontal,
+            tiles: vec![
+                TilePlacement {
+                    offset: 0,
+                    tile: Tile::Letter(spanish_letter("C")),
+                },
+                TilePlacement {
+                    offset: 1,
+                    tile: Tile::Letter(spanish_letter("A")),
+                },
+                TilePlacement {
+                    offset: 2,
+                    tile: Tile::Letter(spanish_letter("R")),
+                },
+                TilePlacement {
+                    offset: 3,
+                    tile: Tile::Letter(spanish_letter("R")),
+                },
+                TilePlacement {
+                    offset: 4,
+                    tile: Tile::Letter(spanish_letter("O")),
+                },
+            ],
+        };
+
+        {
+            let mut games = state.games.write().await;
+            let game = games
+                .get_mut(&started.id)
+                .expect("created game should exist in memory");
+            let mut rack = Rack::default();
+            for letter in ["C", "A", "R", "R", "O"] {
+                rack.add_letter(spanish_letter(letter));
+            }
+            game.participants[0].rack = rack;
+        }
+
+        let move_response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", started.id),
+            Some(&alice.session_token),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Place {
+                    candidate: move_candidate_to_dto(&carro_via_ordinary_tiles, &rules.alphabet),
+                },
+            },
+        )
+        .await;
+        assert_eq!(move_response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(move_response).await;
+        let placed: Vec<Option<String>> = updated.board[7 * 15 + 7..7 * 15 + 12]
+            .iter()
+            .map(|cell| cell.letter.clone())
+            .collect();
+        assert_eq!(
+            placed,
+            vec![
+                Some("C".to_string()),
+                Some("A".to_string()),
+                Some("R".to_string()),
+                Some("R".to_string()),
+                Some("O".to_string()),
+            ]
+        );
+        // Two ordinary R tiles score 1 point each (2 total), not RR's 8 —
+        // confirms this really did use two separate letter tiles. This
+        // 5-square span (x=7..11) also reaches a DoubleLetter premium at
+        // x=11 (the O), on top of the center DoubleWord: (3+1+1+1+1×2)*2.
+        assert_eq!(updated.participants[0].score, (3 + 1 + 1 + 1 + 1 * 2) * 2);
     }
 
     async fn register_player(app: Router, display_name: &str) -> PlayerSessionDto {
@@ -2545,8 +3100,8 @@ mod tests {
                 seat_number: 0,
                 action: PlayerActionDto::Exchange {
                     tiles: vec![
-                        api::TileDto::Letter { letter: 'A' },
-                        api::TileDto::Letter { letter: 'T' },
+                        api::TileDto::Letter { letter: "A".to_string() },
+                        api::TileDto::Letter { letter: "T".to_string() },
                     ],
                 },
             },
@@ -2964,7 +3519,7 @@ mod tests {
             direction: api::DirectionDto::Horizontal,
             tiles: vec![api::TilePlacementDto {
                 offset: 0,
-                tile: api::TileDto::Letter { letter: 'A' },
+                tile: api::TileDto::Letter { letter: "A".to_string() },
             }],
         };
 
@@ -3178,6 +3733,74 @@ mod tests {
             finished.participants.iter().any(|participant| participant.score != 0),
             "expected at least one participant to have a non-zero score by game end"
         );
+    }
+
+    #[tokio::test]
+    async fn engine_vs_engine_game_appears_in_its_creators_list() {
+        // The creator holds no seat in an Engine vs Engine game (both seats
+        // are engines), so `list_games` can't find them via `participants`
+        // or an invitation the way it does for every other game kind — this
+        // is what `creator_player_id` exists to cover.
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let owner = register_player(app.clone(), "Referee2").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&owner.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy One".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy Two".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                    ],
+                    seed: Some(778),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            created
+                .participants
+                .iter()
+                .all(|participant| participant.player_id.is_none()),
+            "the creator should not hold a seat in an all-engine game"
+        );
+
+        let listed: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(
+                app.clone(),
+                Method::GET,
+                "/games",
+                Some(&owner.session_token),
+            )
+            .await,
+        )
+        .await;
+        let summary = listed
+            .iter()
+            .find(|summary| summary.id == created.id)
+            .expect("engine-vs-engine game should still appear for its creator");
+        assert_eq!(summary.relationship, api::GameRelationship::Creator);
     }
 
     #[tokio::test]

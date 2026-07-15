@@ -462,7 +462,12 @@ mod tests {
 
         let mut rack = Rack::default();
         for ch in "CAFÉ".chars() {
-            rack.add_letter(rules.alphabet.to_letter(ch).expect("toy alphabet has this letter"));
+            rack.add_letter(
+                rules
+                    .alphabet
+                    .to_letter(&ch.to_string())
+                    .expect("toy alphabet has this letter"),
+            );
         }
 
         let moves = engine.enumerate_legal_multi_tile_moves(&state, &rack);

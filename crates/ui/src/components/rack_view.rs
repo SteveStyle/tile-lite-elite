@@ -3,11 +3,16 @@ use dioxus::prelude::*;
 use std::collections::HashSet;
 
 #[component]
+#[allow(clippy::too_many_arguments)]
 pub fn RackView(
     tiles: Vec<RackTileView>,
     can_stage_moves: bool,
     exchange_mode: bool,
     exchange_selected: HashSet<usize>,
+    /// The active game's letter values/alphabet, for tile-face point
+    /// values — see `BoardView`'s identical props.
+    letter_values: [u8; rules_shared::MAX_ALPHABET_SIZE],
+    alphabet: rules_shared::Alphabet,
     on_drag_start: EventHandler<usize>,
     on_drag_end: EventHandler<()>,
     on_drop_tile: EventHandler<usize>,
@@ -61,7 +66,7 @@ pub fn RackView(
                     }
                 },
                 span { class: "tile-letter", "{tile.display}" }
-                span { class: "tile-value", "{crate::tile_value::tile_point_value(&tile.tile)}" }
+                span { class: "tile-value", "{crate::tile_value::tile_point_value(&tile.tile, &letter_values, &alphabet)}" }
             }
         }
     });

@@ -4,6 +4,7 @@ mod client_rules;
 mod components;
 #[cfg(not(target_arch = "wasm32"))]
 mod config;
+mod edition_label;
 mod local_storage;
 mod tile_value;
 mod time_format;

@@ -7,12 +7,30 @@ use crate::model::{Alphabet, Letter};
 /// Embedded at compile time for every non-wasm target (the server, and the
 /// desktop client) — for those, this is free: no network cost, and disk
 /// space isn't a constraint the way page-load size is. The wasm/web client
-/// deliberately does *not* embed this (see `SowpodsDictionary::from_word_list`
+/// deliberately does *not* embed this (see `WordListDictionary::from_word_list`
 /// and `sowpods_word_list()` below) — baking a ~2.7MB word list into every
 /// page load doesn't scale once a second dictionary exists, and the server
 /// already has this exact text in memory to serve on request instead.
 #[cfg(not(target_arch = "wasm32"))]
 const SOWPODS_WORD_FILE: &str = include_str!("sowpods.txt");
+
+/// Same reasoning as `SOWPODS_WORD_FILE`, for the North American (ENABLE2K)
+/// edition's dictionary.
+#[cfg(not(target_arch = "wasm32"))]
+const ENABLE2K_WORD_FILE: &str = include_str!("enable2k.txt");
+
+/// Same reasoning as `SOWPODS_WORD_FILE`, for the German edition's
+/// dictionary.
+#[cfg(not(target_arch = "wasm32"))]
+const GERMAN_WORD_FILE: &str = include_str!("german.txt");
+
+/// Same reasoning as `SOWPODS_WORD_FILE`, for the Spanish edition's
+/// dictionary. Plain, unannotated text — nothing here marks which "ch"/
+/// "ll"/"rr" substrings are meant as a digraph tile, since the Spanish
+/// edition deliberately doesn't require one (see `VariantRules::spanish`'s
+/// doc comment).
+#[cfg(not(target_arch = "wasm32"))]
+const SPANISH_WORD_FILE: &str = include_str!("spanish.txt");
 
 /// The raw SOWPODS word list text, for whoever serves it to clients that
 /// fetch it at runtime instead of embedding it (see `crates/server-game`'s
@@ -21,6 +39,24 @@ const SOWPODS_WORD_FILE: &str = include_str!("sowpods.txt");
 #[cfg(not(target_arch = "wasm32"))]
 pub fn sowpods_word_list() -> &'static str {
     SOWPODS_WORD_FILE
+}
+
+/// Same as `sowpods_word_list`, for ENABLE2K.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn enable2k_word_list() -> &'static str {
+    ENABLE2K_WORD_FILE
+}
+
+/// Same as `sowpods_word_list`, for German.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn german_word_list() -> &'static str {
+    GERMAN_WORD_FILE
+}
+
+/// Same as `sowpods_word_list`, for Spanish.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn spanish_word_list() -> &'static str {
+    SPANISH_WORD_FILE
 }
 
 pub trait Dictionary {
@@ -36,7 +72,7 @@ pub trait Dictionary {
     ///
     /// The default `Cursor = ()` never prunes (`advance` always
     /// succeeds) — still correct for any `Dictionary` impl, just without
-    /// the speedup. `SowpodsDictionary` overrides this with
+    /// the speedup. `WordListDictionary` overrides this with
     /// `SortedPrefixCursor`, a real implementation.
     type Cursor<'a>: PrefixCursor
     where
@@ -65,13 +101,13 @@ impl PrefixCursor for () {
     }
 }
 
-pub struct SowpodsDictionary {
+pub struct WordListDictionary {
     words: HashSet<&'static str>,
     /// Tokenized into characters (not left as raw UTF-8 bytes) and sorted
     /// once at construction — the backing store for `SortedPrefixCursor`,
     /// which narrows a sub-slice one *character* at a time instead of
     /// re-searching the whole dictionary at every step of move generation.
-    /// SOWPODS itself is plain ASCII, so this only matters once a
+    /// SOWPODS/ENABLE2K are both plain ASCII, so this only matters once a
     /// dictionary actually contains multi-byte UTF-8 words — but the
     /// search structure has to be character-indexed regardless of which
     /// dictionary it's built for, since byte-indexing silently desyncs
@@ -79,10 +115,25 @@ pub struct SowpodsDictionary {
     sorted_words: Vec<Vec<char>>,
 }
 
-impl SowpodsDictionary {
+impl WordListDictionary {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Self {
         Self::from_static_word_list(SOWPODS_WORD_FILE)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn new_enable2k() -> Self {
+        Self::from_static_word_list(ENABLE2K_WORD_FILE)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn new_german() -> Self {
+        Self::from_static_word_list(GERMAN_WORD_FILE)
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn new_spanish() -> Self {
+        Self::from_static_word_list(SPANISH_WORD_FILE)
     }
 
     /// Builds a dictionary from word-list text fetched at runtime (one
@@ -119,13 +170,13 @@ impl SowpodsDictionary {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl Default for SowpodsDictionary {
+impl Default for WordListDictionary {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Dictionary for SowpodsDictionary {
+impl Dictionary for WordListDictionary {
     fn is_word(&self, word: &str) -> bool {
         self.words.contains(word)
     }
@@ -174,40 +225,79 @@ impl<'a> SortedPrefixCursor<'a> {
 }
 
 impl<'a> PrefixCursor for SortedPrefixCursor<'a> {
-    /// Narrows to words that also match `letter` at the next position, or
-    /// `None` if nothing does — the prune signal: no word can possibly
+    /// Narrows to words that also match `letter` at the next position(s),
+    /// or `None` if nothing does — the prune signal: no word can possibly
     /// start with this prefix, so the caller doesn't need to keep
-    /// building on top of it.
+    /// building on top of it. A digraph `Letter` (e.g. Spanish's CH tile)
+    /// resolves to two characters, so this narrows once per character in
+    /// the grapheme — one placed tile can still consume more than one
+    /// `depth` step, which is exactly what makes two different tilings of
+    /// the same word (one tile spelling "ch", or two ordinary tiles
+    /// spelling "c" then "h") both independently reach the same
+    /// dictionary entry at the end.
     fn advance(&self, letter: Letter, alphabet: &Alphabet) -> Option<SortedPrefixCursor<'a>> {
-        let target = alphabet.to_char(letter);
-        let lo = self
-            .words
-            .partition_point(|word| Self::char_at(word, self.depth) < target);
-        let hi = lo
-            + self.words[lo..].partition_point(|word| Self::char_at(word, self.depth) == target);
-        if lo == hi {
-            None
-        } else {
-            Some(SortedPrefixCursor {
-                words: &self.words[lo..hi],
-                depth: self.depth + 1,
-            })
+        let grapheme = alphabet.to_grapheme(letter)?;
+        let mut cursor = *self;
+        for ch in grapheme.chars() {
+            let target = Some(ch);
+            let lo = cursor
+                .words
+                .partition_point(|word| Self::char_at(word, cursor.depth) < target);
+            let hi = lo
+                + cursor.words[lo..]
+                    .partition_point(|word| Self::char_at(word, cursor.depth) == target);
+            if lo == hi {
+                return None;
+            }
+            cursor = SortedPrefixCursor {
+                words: &cursor.words[lo..hi],
+                depth: cursor.depth + 1,
+            };
         }
+        Some(cursor)
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub static SOWPODS: LazyLock<SowpodsDictionary> = LazyLock::new(SowpodsDictionary::new);
+pub static SOWPODS: LazyLock<WordListDictionary> = LazyLock::new(WordListDictionary::new);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub static ENABLE2K: LazyLock<WordListDictionary> = LazyLock::new(WordListDictionary::new_enable2k);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub static GERMAN: LazyLock<WordListDictionary> = LazyLock::new(WordListDictionary::new_german);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub static SPANISH: LazyLock<WordListDictionary> = LazyLock::new(WordListDictionary::new_spanish);
 
 #[cfg(not(target_arch = "wasm32"))]
 pub fn is_word(word: &str) -> bool {
     SOWPODS.is_word(word)
 }
 
+/// Resolves a `VariantRules.language` value to its backing dictionary — the
+/// one choke point every server/desktop/engine call site uses instead of
+/// hardcoding `&*SOWPODS`, so a game's actual edition (not just whichever
+/// dictionary happened to be wired in first) decides what it's validated
+/// against.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn dictionary_by_name(name: &str) -> Option<&'static WordListDictionary> {
+    match name {
+        "sowpods" => Some(&*SOWPODS),
+        "enable2k" => Some(&*ENABLE2K),
+        "german" => Some(&*GERMAN),
+        "spanish" => Some(&*SPANISH),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PrefixCursor, SOWPODS, SortedPrefixCursor, is_word};
-    use crate::model::{Alphabet, Letter};
+    use super::{
+        Dictionary, ENABLE2K, GERMAN, PrefixCursor, SOWPODS, SPANISH, SortedPrefixCursor,
+        dictionary_by_name, is_word,
+    };
+    use crate::model::{Alphabet, Letter, VariantRules};
 
     fn advance_all<'a>(
         mut cursor: SortedPrefixCursor<'a>,
@@ -224,6 +314,89 @@ mod tests {
     fn sowpods_lookup_works() {
         assert!(is_word("ACE"));
         assert!(!is_word("NOTAWORD"));
+    }
+
+    #[test]
+    fn dictionary_by_name_resolves_every_known_dictionary() {
+        assert!(std::ptr::eq(
+            dictionary_by_name("sowpods").unwrap(),
+            &*SOWPODS
+        ));
+        assert!(std::ptr::eq(
+            dictionary_by_name("enable2k").unwrap(),
+            &*ENABLE2K
+        ));
+        assert!(std::ptr::eq(dictionary_by_name("german").unwrap(), &*GERMAN));
+        assert!(std::ptr::eq(
+            dictionary_by_name("spanish").unwrap(),
+            &*SPANISH
+        ));
+        assert!(dictionary_by_name("not-a-real-dictionary").is_none());
+    }
+
+    #[test]
+    fn german_dictionary_recognizes_a_real_umlaut_word() {
+        assert!(GERMAN.is_word("ÖL"));
+        assert!(!GERMAN.is_word("NOTAWORD"));
+    }
+
+    #[test]
+    fn german_prefix_cursor_finds_a_word_with_an_umlaut_letter() {
+        let rules = VariantRules::german();
+        let cursor = advance_all_with(GERMAN.prefix_cursor(), "ÖL", &rules.alphabet)
+            .expect("ÖL should be reachable through the real German dictionary");
+        assert!(cursor.is_word());
+    }
+
+    #[test]
+    fn spanish_dictionary_recognizes_a_real_digraph_word() {
+        assert!(SPANISH.is_word("CARRO"));
+        assert!(SPANISH.is_word("CALLE"));
+        assert!(SPANISH.is_word("CHICO"));
+        assert!(!SPANISH.is_word("NOTAWORD"));
+    }
+
+    /// The core design decision this phase is built on: both tilings of
+    /// the same word validate, since the dictionary is plain unannotated
+    /// text and `advance` just narrows once per character in whichever
+    /// grapheme was actually placed.
+    #[test]
+    fn spanish_prefix_cursor_accepts_both_tilings_of_the_same_word() {
+        let rules = VariantRules::spanish();
+        let rr = rules.alphabet.to_letter("RR").expect("RR is a real tile");
+        let r = rules.alphabet.to_letter("R").expect("R is a real tile");
+
+        let via_digraph_tile = advance_letters(
+            SPANISH.prefix_cursor(),
+            &[c(&rules, 'C'), c(&rules, 'A'), rr, c(&rules, 'O')],
+        )
+        .expect("CARRO should be reachable via the RR tile");
+        assert!(via_digraph_tile.is_word());
+
+        let via_two_ordinary_tiles = advance_letters(
+            SPANISH.prefix_cursor(),
+            &[c(&rules, 'C'), c(&rules, 'A'), r, r, c(&rules, 'O')],
+        )
+        .expect("CARRO should also be reachable via two separate R tiles");
+        assert!(via_two_ordinary_tiles.is_word());
+    }
+
+    fn c(rules: &VariantRules, ch: char) -> Letter {
+        rules
+            .alphabet
+            .to_letter(&ch.to_string())
+            .expect("single ASCII letter should be a real tile")
+    }
+
+    fn advance_letters<'a>(
+        mut cursor: SortedPrefixCursor<'a>,
+        letters: &[Letter],
+    ) -> Option<SortedPrefixCursor<'a>> {
+        let alphabet = &VariantRules::spanish().alphabet;
+        for &letter in letters {
+            cursor = cursor.advance(letter, alphabet)?;
+        }
+        Some(cursor)
     }
 
     #[test]
@@ -318,7 +491,7 @@ mod tests {
         alphabet: &Alphabet,
     ) -> Option<SortedPrefixCursor<'a>> {
         for ch in word.chars() {
-            let letter = alphabet.to_letter(ch)?;
+            let letter = alphabet.to_letter(&ch.to_string())?;
             cursor = cursor.advance(letter, alphabet)?;
         }
         Some(cursor)

@@ -75,8 +75,11 @@ pub struct PositionDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TileDto {
-    Letter { letter: char },
-    Blank { acting_as: Option<char> },
+    /// One or two characters — most tiles are one, but a digraph tile
+    /// (e.g. Spanish's CH/LL/RR) is a single physical tile/board
+    /// square/rack slot that displays two.
+    Letter { letter: String },
+    Blank { acting_as: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -178,6 +181,9 @@ pub enum GameRelationship {
     YourTurn,
     /// You hold a claimed seat, but it's not (currently) your turn.
     Participant,
+    /// You created this game but hold no seat in it (e.g. an Engine vs
+    /// Engine game you set up to watch).
+    Creator,
     /// You've been invited by name to a specific seat.
     InvitedByName,
     /// A seat in this game is open to any logged-in player.
@@ -191,6 +197,9 @@ pub enum GameRelationship {
 pub struct GameSummaryDto {
     pub id: String,
     pub status: GameStatus,
+    /// The bundled edition this game was created under (e.g. "official",
+    /// "wordfeud", "north_american") — see `GameStateDto.variant`.
+    pub variant: String,
     pub current_seat: u8,
     pub participants: Vec<ParticipantDto>,
     /// Seconds since the Unix epoch (as a string, matching the server's
@@ -210,13 +219,20 @@ pub struct GameSummaryDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BoardCellDto {
     pub premium: PremiumDto,
-    pub letter: Option<char>,
+    /// One or two characters — see `TileDto::Letter`.
+    pub letter: Option<String>,
     pub is_blank: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RackDto {
-    pub counts: [u8; 26],
+    /// One count per letter in whichever alphabet the game's edition uses
+    /// (26 for every Latin-alphabet edition, 29 for German, ...) — a `Vec`
+    /// rather than a fixed-size array specifically so this crate doesn't
+    /// need to depend on `rules_shared` just to know `MAX_ALPHABET_SIZE`,
+    /// and so older/shorter snapshots on either side of the wire still
+    /// deserialize fine (the receiving end pads to whatever width it needs).
+    pub counts: Vec<u8>,
     pub blanks: u8,
 }
 

@@ -1,5 +1,6 @@
 use rules_shared::{
-    GameState, MoveCandidate, MoveGenerator, Rack, RulesEngine, SOWPODS, Score, VariantRules,
+    GameState, MoveCandidate, MoveGenerator, Rack, RulesEngine, Score, VariantRules,
+    dictionary_by_name,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,7 +82,13 @@ impl GreedyEngine {
                 // whichever `VariantRules` the request carries — so every
                 // edition the server knows about is listed here explicitly
                 // as a deliberate declaration, not a limitation.
-                supported_variants: vec!["official".to_string(), "wordfeud".to_string()],
+                supported_variants: vec![
+                    "official".to_string(),
+                    "wordfeud".to_string(),
+                    "north_american".to_string(),
+                    "german".to_string(),
+                    "spanish".to_string(),
+                ],
                 capabilities: EngineCapabilities {
                     supports_timed_play: false,
                     supports_analysis: false,
@@ -106,7 +113,8 @@ impl ScrabbleEngine for GreedyEngine {
     fn choose_action(&self, request: EngineRequest<'_>) -> EngineResponse {
         let engine = RulesEngine {
             rules: request.rules,
-            dictionary: &*SOWPODS,
+            dictionary: dictionary_by_name(&request.rules.language)
+                .expect("request rules should reference a known dictionary"),
         };
 
         let mut best: Option<(MoveCandidate, Score)> = None;

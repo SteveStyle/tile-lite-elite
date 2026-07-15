@@ -1,6 +1,7 @@
 use crate::{
     app::{MovePreviewView, RackTileView, StagedPlacementView},
     components::{board_view::BoardView, rack_view::RackView},
+    edition_label::edition_label,
 };
 use api::{DirectionDto, GameStateDto, GameStatus, TileDto};
 use dioxus::prelude::*;
@@ -30,14 +31,15 @@ pub fn Home(
     on_drag_end_staged_tile: EventHandler<usize>,
     on_drop_board_cell: EventHandler<usize>,
     on_select_cell: EventHandler<usize>,
+    on_move_selection: EventHandler<(DirectionDto, bool)>,
     on_click_rack_tile: EventHandler<usize>,
     on_type_letter: EventHandler<char>,
     on_backspace: EventHandler<()>,
     on_delete: EventHandler<()>,
     on_clear_staged: EventHandler<()>,
     on_remove_staged: EventHandler<usize>,
-    on_set_blank_letter: EventHandler<char>,
-    selected_blank_letter: Option<char>,
+    on_set_blank_letter: EventHandler<String>,
+    selected_blank_letter: Option<String>,
     staged_preview: Option<MovePreviewView>,
     is_your_turn: bool,
     can_pass: bool,
@@ -58,30 +60,43 @@ pub fn Home(
     let has_rack = can_view_rack;
     let is_active = game.status == GameStatus::Active;
 
+    // Resolved once and reused everywhere this component needs the active
+    // game's actual alphabet/letter values, rather than assuming the
+    // standard Latin 26 — different editions (Wordfeud, German, ...)
+    // genuinely differ here. Falls back to `official()` only for an
+    // edition name this client build doesn't recognize, which shouldn't
+    // happen for a real loaded game.
+    let rules = rules_shared::VariantRules::by_name(&game.variant)
+        .unwrap_or_else(rules_shared::VariantRules::official);
+
     // Show blank picker when there is a staged blank tile still needing a letter.
     let has_unresolved_blank = staged_placements
         .iter()
         .any(|p| matches!(p.tile, TileDto::Blank { acting_as: None }));
 
     let selected_blank_text = selected_blank_letter
-        .map(|l| l.to_string())
+        .clone()
         .unwrap_or_else(|| "choose a letter".to_string());
 
-    let blank_letter_buttons = ('A'..='Z').map(|letter| {
-        let class_name = if selected_blank_letter == Some(letter) {
-            "blank-letter-button blank-letter-button-active"
-        } else {
-            "blank-letter-button"
-        };
-        rsx! {
-            button {
-                key: "{letter}",
-                class: "{class_name}",
-                onclick: move |_| on_set_blank_letter.call(letter),
-                "{letter}"
+    let blank_letter_buttons = rules
+        .letters()
+        .map(|letter| rules.letter_grapheme(letter).to_string())
+        .map(|letter| {
+            let class_name = if selected_blank_letter.as_deref() == Some(letter.as_str()) {
+                "blank-letter-button blank-letter-button-active"
+            } else {
+                "blank-letter-button"
+            };
+            let letter_for_click = letter.clone();
+            rsx! {
+                button {
+                    key: "{letter}",
+                    class: "{class_name}",
+                    onclick: move |_| on_set_blank_letter.call(letter_for_click.clone()),
+                    "{letter}"
+                }
             }
-        }
-    });
+        });
 
     // Keyboard typing (letter placement, backspace) only works while this
     // element has DOM focus. Clicking a board cell reclaims focus here
@@ -92,6 +107,9 @@ pub fn Home(
     // Resigning ends the game outright, so it's gated behind an explicit
     // confirmation rather than firing straight off the button click.
     let mut confirming_resign = use_signal(|| false);
+    // Cloned for the `move` keydown closure below — `rules` itself is
+    // still needed afterward (passed into `BoardView`/`RackView`).
+    let rules_for_keydown = rules.clone();
 
     rsx! {
         section {
@@ -114,6 +132,22 @@ pub fn Home(
                     return;
                 }
                 match event.key() {
+                    Key::ArrowLeft => {
+                        event.prevent_default();
+                        on_move_selection.call((DirectionDto::Horizontal, false));
+                    }
+                    Key::ArrowRight => {
+                        event.prevent_default();
+                        on_move_selection.call((DirectionDto::Horizontal, true));
+                    }
+                    Key::ArrowUp => {
+                        event.prevent_default();
+                        on_move_selection.call((DirectionDto::Vertical, false));
+                    }
+                    Key::ArrowDown => {
+                        event.prevent_default();
+                        on_move_selection.call((DirectionDto::Vertical, true));
+                    }
                     Key::Character(text) if text == " " => {
                         if can_toggle_direction {
                             event.prevent_default();
@@ -121,9 +155,16 @@ pub fn Home(
                         }
                     }
                     Key::Character(text) if text.chars().count() == 1 => {
-                        if let Some(letter) = text.chars().next().filter(|c| c.is_ascii_alphabetic()) {
-                            event.prevent_default();
-                            on_type_letter.call(letter.to_ascii_uppercase());
+                        if let Some(ch) = text.chars().next() {
+                            let upper = ch.to_uppercase().next().unwrap_or(ch);
+                            if rules_for_keydown
+                                .alphabet
+                                .to_letter(&upper.to_string())
+                                .is_some()
+                            {
+                                event.prevent_default();
+                                on_type_letter.call(upper);
+                            }
                         }
                     }
                     Key::Backspace => {
@@ -139,6 +180,7 @@ pub fn Home(
             },
             div { class: "status-strip",
                 if is_live {
+                    span { class: "meta-chip", "{edition_label(&game.variant)}" }
                     span { class: "meta-chip", "{format_status(&game)}" }
                 }
                 if is_active {
@@ -167,6 +209,8 @@ pub fn Home(
                     last_move_cells: last_move_board_indices(&game.moves),
                     can_stage_moves,
                     selected_cell,
+                    letter_values: rules.letter_values,
+                    alphabet: rules.alphabet.clone(),
                     on_drop_tile: on_drop_board_cell,
                     on_remove_staged,
                     on_drag_staged_tile,
@@ -257,6 +301,8 @@ pub fn Home(
                         can_stage_moves,
                         exchange_mode,
                         exchange_selected: exchange_selected.clone(),
+                        letter_values: rules.letter_values,
+                        alphabet: rules.alphabet.clone(),
                         on_drag_start: on_drag_rack_tile,
                         on_drag_end: on_drag_end_rack_tile,
                         on_drop_tile: on_drop_rack_tile,

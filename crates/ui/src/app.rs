@@ -5,7 +5,7 @@ use api::{
 };
 use dioxus::prelude::*;
 use futures_util::StreamExt;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 #[cfg(target_arch = "wasm32")]
 use gloo_net::{
@@ -50,7 +50,7 @@ async fn sleep_ms(ms: u64) {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RackTileView {
     pub id: usize,
-    pub display: char,
+    pub display: String,
     pub tile: TileDto,
     pub is_used: bool,
 }
@@ -65,7 +65,7 @@ impl RackTileView {
 pub struct StagedPlacementView {
     pub board_index: usize,
     pub rack_tile_id: usize,
-    pub display: char,
+    pub display: String,
     pub tile: TileDto,
 }
 
@@ -105,13 +105,20 @@ pub fn RootApp() -> Element {
     let mut info_message = use_signal(|| Some("Loading games from server...".to_string()));
     let mut error_message = use_signal(|| None::<String>);
     let mut bootstrapped = use_signal(|| false);
-    // `None` until the dictionary used for the live move preview has
-    // loaded — on native builds this resolves immediately (the dictionary
-    // is compiled in), on wasm it's a real async fetch (see
-    // `load_client_dictionary`), so the preview just shows nothing for
-    // that brief window rather than blocking on it.
-    let mut client_dictionary: Signal<Option<&'static rules_shared::SowpodsDictionary>> =
-        use_signal(|| None);
+    // Loaded lazily, keyed by `VariantRules.language` — not fetched until a
+    // game using that language is actually open, and cached for the rest
+    // of the session once loaded (see the reactive block below, mirroring
+    // `websocket_game_id`'s pattern). On native builds resolution is
+    // instant (every dictionary is compiled in), on wasm it's a real async
+    // fetch (see `load_client_dictionary`), so the preview just shows
+    // nothing for that brief window rather than blocking on it.
+    let mut client_dictionaries: Signal<HashMap<String, &'static rules_shared::WordListDictionary>> =
+        use_signal(HashMap::new);
+    // Which languages a fetch has already been dispatched for — set
+    // synchronously (not inside the spawned future) so a re-render while
+    // the first fetch is still in flight doesn't dispatch a second,
+    // redundant one for the same language.
+    let mut dictionary_fetch_started: Signal<HashSet<String>> = use_signal(HashSet::new);
     let mut websocket_game_id = use_signal(|| None::<String>);
     let mut dragging_tile_id = use_signal(|| None::<usize>);
     // `Some(index)` while dragging a tile that was already staged on the
@@ -121,7 +128,7 @@ pub fn RootApp() -> Element {
     // on another valid board cell (including off the board entirely).
     let mut dragging_from_board_index = use_signal(|| None::<usize>);
     let mut staged_placements = use_signal(Vec::<StagedPlacementView>::new);
-    let mut selected_blank_letter = use_signal(|| None::<char>);
+    let mut selected_blank_letter = use_signal(|| None::<String>);
     let mut selected_cell = use_signal(|| None::<usize>);
     // Only meaningful while exactly one tile is staged (direction is
     // otherwise ambiguous) — set by the space-bar/button toggle, cleared
@@ -139,7 +146,6 @@ pub fn RootApp() -> Element {
 
     if !bootstrapped() {
         bootstrapped.set(true);
-        let server_url_for_dictionary = server_url.clone();
         let server_url = server_url.clone();
         spawn(async move {
             match check_api_version(&server_url).await {
@@ -201,13 +207,6 @@ pub fn RootApp() -> Element {
             )
             .await;
             is_loading.set(false);
-        });
-
-        // Independent of (and concurrent with) the games/auth bootstrap
-        // above — the preview dictionary isn't needed until the player
-        // actually stages a tile, so it doesn't need to block anything.
-        spawn(async move {
-            client_dictionary.set(load_client_dictionary(&server_url_for_dictionary).await);
         });
     }
 
@@ -284,6 +283,23 @@ pub fn RootApp() -> Element {
         }
     }
 
+    if let Some(current_game) = game() {
+        let language = current_game.language.clone();
+        if !dictionary_fetch_started().contains(&language) {
+            dictionary_fetch_started.with_mut(|started| {
+                started.insert(language.clone());
+            });
+            let server_url = server_url.clone();
+            spawn(async move {
+                if let Some(dictionary) = load_client_dictionary(&server_url, &language).await {
+                    client_dictionaries.with_mut(|dictionaries| {
+                        dictionaries.insert(language, dictionary);
+                    });
+                }
+            });
+        }
+    }
+
     let game_for_view = game().clone().unwrap_or_else(empty_live_game);
     let viewer_player_id = session().map(|current| current.player_id.clone());
     let can_start = IS_ONLINE()
@@ -323,12 +339,13 @@ pub fn RootApp() -> Element {
     // same `RulesEngine::validate_game_move` the server does, entirely
     // locally, so there's no network round-trip and (since nothing here is
     // async) no possibility of a stale response landing after the state
-    // it was computed from has moved on. Needs `client_dictionary` to have
-    // finished loading first (instant on native, a real fetch on wasm) —
-    // until then this just shows nothing, same as "nothing staged yet".
+    // it was computed from has moved on. Needs the active game's dictionary
+    // to have finished loading first (instant on native, a real fetch on
+    // wasm) — until then this just shows nothing, same as "nothing staged
+    // yet".
     let staged_preview = match (
         can_submit_human_action && !staged_placements().is_empty(),
-        client_dictionary(),
+        client_dictionaries().get(&game_for_view.language).copied(),
     ) {
         (true, Some(dictionary)) => {
             let direction = infer_typing_direction(
@@ -355,6 +372,7 @@ pub fn RootApp() -> Element {
     let game_for_home = game_for_view.clone();
     let game_for_drop = game_for_view.clone();
     let game_for_select = game_for_view.clone();
+    let game_for_move = game_for_view.clone();
     let game_for_click = game_for_view.clone();
     let game_for_type = game_for_view.clone();
     let game_for_backspace = game_for_view.clone();
@@ -765,6 +783,36 @@ pub fn RootApp() -> Element {
                         }
                         selected_cell.set(Some(board_index));
                     },
+                    // Arrow-key navigation: `direction`/`forward` are a raw
+                    // 2D step (Left/Right = Horizontal, Up/Down = Vertical),
+                    // not this turn's inferred typing direction. Uses the
+                    // wrapping variant, not `find_next_placeable_cell` —
+                    // moving the selection by hand should cycle around the
+                    // edge of the board rather than get stuck there (that
+                    // "stop at the edge" behavior is deliberately kept for
+                    // advancing through a word as it's typed/placed — see
+                    // `advance_selection`). Still skips over any occupied
+                    // square — a permanently-played letter or a tile staged
+                    // earlier this turn — landing on the next free cell if
+                    // there's room anywhere in the row/column, or leaving
+                    // the selection where it is if the whole line is full.
+                    on_move_selection: move |(direction, forward): (DirectionDto, bool)| {
+                        if !can_submit_human_action || exchange_mode() {
+                            return;
+                        }
+                        let Some(current) = selected_cell() else {
+                            return;
+                        };
+                        if let Some(next) = find_next_placeable_cell_wrapping(
+                            &game_for_move,
+                            &staged_placements(),
+                            current,
+                            direction,
+                            forward,
+                        ) {
+                            selected_cell.set(Some(next));
+                        }
+                    },
                     on_click_rack_tile: move |tile_id: usize| {
                         if !can_submit_human_action || exchange_mode() {
                             return;
@@ -829,11 +877,12 @@ pub fn RootApp() -> Element {
                         // unused blank, auto-resolved to the typed letter
                         // (skips the manual blank-letter picker, since the
                         // player already told us the letter by typing it).
+                        let typed = letter.to_string();
                         let chosen = rack
                             .iter()
                             .find(|t| {
                                 !t.is_used
-                                    && matches!(&t.tile, TileDto::Letter { letter: l } if *l == letter)
+                                    && matches!(&t.tile, TileDto::Letter { letter: l } if *l == typed)
                             })
                             .or_else(|| {
                                 rack.iter()
@@ -842,7 +891,8 @@ pub fn RootApp() -> Element {
                         let Some(tile) = chosen else {
                             return;
                         };
-                        let resolved = matches!(tile.tile, TileDto::Blank { .. }).then_some(letter);
+                        let resolved =
+                            matches!(tile.tile, TileDto::Blank { .. }).then(|| typed.clone());
                         let placement = stage_tile_at_cell(cell_index, tile, resolved);
                         error_message.set(None);
                         info_message.set(None);
@@ -925,20 +975,20 @@ pub fn RootApp() -> Element {
                                 placements.retain(|p| p.board_index != board_index);
                             });
                     },
-                    on_set_blank_letter: move |letter| {
+                    on_set_blank_letter: move |letter: String| {
                         error_message.set(None);
                         info_message.set(None);
-                        selected_blank_letter.set(Some(letter));
+                        selected_blank_letter.set(Some(letter.clone()));
                         staged_placements
                             .with_mut(|placements| {
                                 if let Some(placement) = placements
                                     .iter_mut()
                                     .find(|p| matches!(p.tile, TileDto::Blank { acting_as: None }))
                                 {
+                                    placement.display = letter.to_lowercase();
                                     placement.tile = TileDto::Blank {
                                         acting_as: Some(letter),
                                     };
-                                    placement.display = letter.to_ascii_lowercase();
                                 }
                             });
                     },
@@ -1163,7 +1213,7 @@ fn empty_live_game() -> GameStateDto {
         }],
         board: empty_board(),
         racks: vec![RackDto {
-            counts: [0; 26],
+            counts: Vec::new(),
             blanks: 0,
         }],
         moves: vec![],
@@ -1352,7 +1402,7 @@ async fn load_summaries_and_game(
     mut info_message: Signal<Option<String>>,
     mut error_message: Signal<Option<String>>,
     dragging_tile_id: Signal<Option<usize>>,
-    selected_blank_letter: Signal<Option<char>>,
+    selected_blank_letter: Signal<Option<String>>,
     staged_placements: Signal<Vec<StagedPlacementView>>,
     selected_cell: Signal<Option<usize>>,
     exchange_mode: Signal<bool>,
@@ -1407,7 +1457,7 @@ async fn create_custom_game(
     let request = CreateGameRequest {
         seats: submission.seats.clone(),
         seed: None,
-        variant: None,
+        variant: submission.variant.clone(),
         language: None,
         board_layout: None,
         move_time_limit_seconds: submission.move_time_limit_seconds,
@@ -1603,24 +1653,32 @@ async fn get_text(url: &str) -> Result<String, String> {
     response.text().await.map_err(|error| error.to_string())
 }
 
-/// The dictionary the live move preview validates against. Native builds
-/// (server and desktop) already have SOWPODS compiled in — nothing to
-/// fetch. The wasm/web build deliberately doesn't embed it (see
-/// `rules_shared::dictionary`'s doc comments), so this is a real network
-/// round-trip there, resolving to `None` if it fails (the preview just
-/// stays absent, same as while nothing's staged yet — never a hard error).
+/// The dictionary the live move preview validates against, for the given
+/// `VariantRules.language` (e.g. "sowpods", "enable2k"). Native builds
+/// (server and desktop) already have every known dictionary compiled in —
+/// nothing to fetch. The wasm/web build deliberately doesn't embed any of
+/// them (see `rules_shared::dictionary`'s doc comments), so this is a real
+/// network round-trip there, resolving to `None` if it fails or the
+/// language is unrecognized (the preview just stays absent, same as while
+/// nothing's staged yet — never a hard error).
 #[cfg(not(target_arch = "wasm32"))]
-async fn load_client_dictionary(_server_url: &str) -> Option<&'static rules_shared::SowpodsDictionary> {
-    Some(&*rules_shared::SOWPODS)
+async fn load_client_dictionary(
+    _server_url: &str,
+    language: &str,
+) -> Option<&'static rules_shared::WordListDictionary> {
+    rules_shared::dictionary_by_name(language)
 }
 
 #[cfg(target_arch = "wasm32")]
-async fn load_client_dictionary(server_url: &str) -> Option<&'static rules_shared::SowpodsDictionary> {
-    let text = get_text(&format!("{server_url}/dictionaries/sowpods"))
+async fn load_client_dictionary(
+    server_url: &str,
+    language: &str,
+) -> Option<&'static rules_shared::WordListDictionary> {
+    let text = get_text(&format!("{server_url}/dictionaries/{language}"))
         .await
         .ok()?;
     Some(Box::leak(Box::new(
-        rules_shared::SowpodsDictionary::from_word_list(text),
+        rules_shared::WordListDictionary::from_word_list(text),
     )))
 }
 
@@ -1930,7 +1988,7 @@ fn compute_client_preview(
     game: &GameStateDto,
     staged: &[StagedPlacementView],
     direction_hint: DirectionDto,
-    dictionary: &rules_shared::SowpodsDictionary,
+    dictionary: &rules_shared::WordListDictionary,
 ) -> Option<MovePreviewView> {
     let request = match build_manual_move_request(game, staged, direction_hint) {
         Ok(r) => r,
@@ -1948,22 +2006,21 @@ fn compute_client_preview(
         _ => return None,
     };
 
-    // Only variant this app ever creates a game with — see `GameStateDto`'s
-    // fields, always "official"/"sowpods"/"official" server-side. Falls
-    // back to no preview (rather than a wrong one) if that ever changes.
-    if game.variant != "official" || game.language != "sowpods" || game.board_layout != "official"
-    {
+    // `language`/`board_layout` are vestigial display fields derived from
+    // `variant` server-side (see `VariantRules` — an edition bundles all
+    // three under one name), so `variant` alone determines which ruleset
+    // this game actually uses. Falls back to no preview (rather than a
+    // wrong one) for an edition this client doesn't recognize.
+    let Some(rules) = rules_shared::VariantRules::by_name(&game.variant) else {
         return None;
-    }
-
-    let rules = rules_shared::VariantRules::official();
-    let board_state = crate::client_rules::to_rules_board_state(&game.board);
+    };
+    let board_state = crate::client_rules::to_rules_board_state(&game.board, &rules.alphabet);
     let state = rules_shared::GameState::from_board(board_state, &rules, dictionary);
     let rack = game
         .racks
         .get(request.seat_number as usize)
         .map(crate::client_rules::to_rules_rack);
-    let candidate = crate::client_rules::to_rules_candidate(&candidate_dto);
+    let candidate = crate::client_rules::to_rules_candidate(&candidate_dto, &rules.alphabet);
 
     let engine = rules_shared::RulesEngine {
         rules: &rules,
@@ -2147,6 +2204,50 @@ fn find_next_placeable_cell(
     }
 }
 
+/// Like `step_index`, but wraps around to the other side of the row/column
+/// instead of stopping at the board edge.
+fn step_index_wrapping(index: usize, direction: DirectionDto, forward: bool) -> usize {
+    let x = index % BOARD_WIDTH;
+    let y = index / BOARD_WIDTH;
+    match (direction, forward) {
+        (DirectionDto::Horizontal, true) => y * BOARD_WIDTH + (x + 1) % BOARD_WIDTH,
+        (DirectionDto::Horizontal, false) => y * BOARD_WIDTH + (x + BOARD_WIDTH - 1) % BOARD_WIDTH,
+        (DirectionDto::Vertical, true) => ((y + 1) % BOARD_HEIGHT) * BOARD_WIDTH + x,
+        (DirectionDto::Vertical, false) => ((y + BOARD_HEIGHT - 1) % BOARD_HEIGHT) * BOARD_WIDTH + x,
+    }
+}
+
+/// Arrow-key navigation's counterpart to `find_next_placeable_cell`: wraps
+/// around the edge of the row/column instead of stopping there, since
+/// moving the cursor by hand should cycle rather than get stuck — unlike
+/// advancing through a word being typed, which should stop at the edge
+/// (see `find_next_placeable_cell`'s own doc comment). Still skips over
+/// occupied cells the same way, and is bounded to one full lap of the
+/// row/column, so a completely full line returns `None` (meaning: don't
+/// move) instead of spinning forever.
+fn find_next_placeable_cell_wrapping(
+    game: &GameStateDto,
+    staged: &[StagedPlacementView],
+    from_index: usize,
+    direction: DirectionDto,
+    forward: bool,
+) -> Option<usize> {
+    let line_length = match direction {
+        DirectionDto::Horizontal => BOARD_WIDTH,
+        DirectionDto::Vertical => BOARD_HEIGHT,
+    };
+    let mut current = from_index;
+    for _ in 0..line_length.saturating_sub(1) {
+        current = step_index_wrapping(current, direction, forward);
+        let is_permanent = game.board.get(current).is_some_and(board_cell_has_letter);
+        let is_staged = staged.iter().any(|p| p.board_index == current);
+        if !is_permanent && !is_staged {
+            return Some(current);
+        }
+    }
+    None
+}
+
 /// Walks backward from `from_index`, skipping only permanently-played
 /// letters (not staged ones — unlike `find_next_placeable_cell`), and
 /// returns the first cell that isn't a permanent letter. That's the cell
@@ -2174,7 +2275,10 @@ fn find_previous_editable_cell(
 
 /// Moves `selected_cell` to the next placeable cell after `from_index`,
 /// following the direction this turn's placements are currently reading
-/// in. Clears the selection at the edge of the board rather than wrapping.
+/// in. Falls back to reselecting `from_index` (the cell just played) at the
+/// edge of the board, rather than clearing the selection or wrapping — so
+/// typing a word that runs off the edge leaves the cursor on the last tile
+/// placed instead of dropping it entirely.
 fn advance_selection(
     game: &GameStateDto,
     staged_placements: Signal<Vec<StagedPlacementView>>,
@@ -2184,7 +2288,8 @@ fn advance_selection(
 ) {
     let staged = staged_placements();
     let direction = infer_typing_direction(game, &staged, Some(from_index), direction_override);
-    selected_cell.set(find_next_placeable_cell(game, &staged, from_index, direction, true));
+    let next = find_next_placeable_cell(game, &staged, from_index, direction, true);
+    selected_cell.set(next.or(Some(from_index)));
 }
 
 /// Flips the effective typing direction (space bar / direction button).
@@ -2221,17 +2326,15 @@ fn toggle_direction_override(
 fn stage_tile_at_cell(
     board_index: usize,
     tile: &RackTileView,
-    resolved_letter: Option<char>,
+    resolved_letter: Option<String>,
 ) -> StagedPlacementView {
     let (tile_for_board, display_for_board) = match (&tile.tile, resolved_letter) {
-        (TileDto::Blank { .. }, Some(letter)) => (
-            TileDto::Blank {
-                acting_as: Some(letter),
-            },
-            letter.to_ascii_lowercase(),
-        ),
-        (TileDto::Blank { .. }, None) => (TileDto::Blank { acting_as: None }, '?'),
-        (other, _) => (other.clone(), tile.display),
+        (TileDto::Blank { .. }, Some(letter)) => {
+            let display = letter.to_lowercase();
+            (TileDto::Blank { acting_as: Some(letter) }, display)
+        }
+        (TileDto::Blank { .. }, None) => (TileDto::Blank { acting_as: None }, "?".to_string()),
+        (other, _) => (other.clone(), tile.display.clone()),
     };
     StagedPlacementView {
         board_index,
@@ -2246,7 +2349,7 @@ fn stage_tile_at_cell(
 /// loaded, an action submitted, a turn started).
 fn reset_composer_state(
     mut dragging_tile_id: Signal<Option<usize>>,
-    mut selected_blank_letter: Signal<Option<char>>,
+    mut selected_blank_letter: Signal<Option<String>>,
     mut staged_placements: Signal<Vec<StagedPlacementView>>,
     mut selected_cell: Signal<Option<usize>>,
     mut exchange_mode: Signal<bool>,
@@ -2311,6 +2414,8 @@ fn rack_tiles_for_seat(
         return Vec::new();
     };
 
+    let rules = rules_shared::VariantRules::by_name(&game.variant)
+        .unwrap_or_else(rules_shared::VariantRules::official);
     let used_ids: std::collections::HashSet<usize> = staged
         .iter()
         .map(|placement| placement.rack_tile_id)
@@ -2319,12 +2424,17 @@ fn rack_tiles_for_seat(
     let mut tiles = Vec::new();
 
     for (index, count) in rack.counts.iter().enumerate() {
+        let Some(grapheme) = rules.alphabet.to_grapheme(rules_shared::Letter::from(index as u8))
+        else {
+            continue;
+        };
+        let letter_text = grapheme.to_string();
         for _ in 0..*count {
             tiles.push(RackTileView {
                 id: next_id,
-                display: (b'A' + index as u8) as char,
+                display: letter_text.clone(),
                 tile: TileDto::Letter {
-                    letter: (b'A' + index as u8) as char,
+                    letter: letter_text.clone(),
                 },
                 is_used: used_ids.contains(&next_id),
             });
@@ -2335,7 +2445,7 @@ fn rack_tiles_for_seat(
     for _ in 0..rack.blanks {
         tiles.push(RackTileView {
             id: next_id,
-            display: '*',
+            display: "*".to_string(),
             tile: TileDto::Blank { acting_as: None },
             is_used: used_ids.contains(&next_id),
         });
@@ -2402,8 +2512,10 @@ mod tests {
     fn sample_tile(id: usize, letter: char) -> RackTileView {
         RackTileView {
             id,
-            display: letter,
-            tile: TileDto::Letter { letter },
+            display: letter.to_string(),
+            tile: TileDto::Letter {
+                letter: letter.to_string(),
+            },
             is_used: false,
         }
     }
@@ -2412,16 +2524,16 @@ mod tests {
     fn apply_rack_order_reorders_tiles_to_match() {
         let tiles = vec![sample_tile(0, 'A'), sample_tile(1, 'B'), sample_tile(2, 'C')];
         let reordered = apply_rack_order(&tiles, &[2, 0, 1]);
-        let letters: Vec<char> = reordered.iter().map(|t| t.display).collect();
-        assert_eq!(letters, vec!['C', 'A', 'B']);
+        let letters: Vec<String> = reordered.iter().map(|t| t.display.clone()).collect();
+        assert_eq!(letters, vec!["C", "A", "B"]);
     }
 
     #[test]
     fn apply_rack_order_drops_out_of_range_indices_defensively() {
         let tiles = vec![sample_tile(0, 'A'), sample_tile(1, 'B')];
         let reordered = apply_rack_order(&tiles, &[1, 5, 0]);
-        let letters: Vec<char> = reordered.iter().map(|t| t.display).collect();
-        assert_eq!(letters, vec!['B', 'A']);
+        let letters: Vec<String> = reordered.iter().map(|t| t.display.clone()).collect();
+        assert_eq!(letters, vec!["B", "A"]);
     }
 
     #[test]
@@ -2527,8 +2639,10 @@ mod tests {
         StagedPlacementView {
             board_index,
             rack_tile_id,
-            display: letter,
-            tile: TileDto::Letter { letter },
+            display: letter.to_string(),
+            tile: TileDto::Letter {
+                letter: letter.to_string(),
+            },
         }
     }
 
@@ -2547,7 +2661,7 @@ mod tests {
     #[test]
     fn find_next_placeable_cell_skips_permanent_and_staged_tiles() {
         let mut board = empty_board();
-        board[12].letter = Some('A');
+        board[12].letter = Some("A".to_string());
         let game = test_game(board);
         let staged = vec![letter_placement(11, 0, 'B')];
 
@@ -2569,6 +2683,73 @@ mod tests {
     }
 
     #[test]
+    fn step_index_wrapping_cycles_to_the_other_side_of_the_row_or_column() {
+        assert_eq!(
+            step_index_wrapping(BOARD_WIDTH - 1, DirectionDto::Horizontal, true),
+            0
+        );
+        assert_eq!(
+            step_index_wrapping(0, DirectionDto::Horizontal, false),
+            BOARD_WIDTH - 1
+        );
+        let last_row_start = (BOARD_HEIGHT - 1) * BOARD_WIDTH;
+        assert_eq!(
+            step_index_wrapping(last_row_start, DirectionDto::Vertical, true),
+            0
+        );
+        assert_eq!(
+            step_index_wrapping(0, DirectionDto::Vertical, false),
+            last_row_start
+        );
+    }
+
+    #[test]
+    fn find_next_placeable_cell_wrapping_cycles_around_the_board_edge() {
+        // Arrow-key navigation (unlike advancing through a typed word)
+        // should wrap rather than stop at the edge.
+        let game = test_game(empty_board());
+        assert_eq!(
+            find_next_placeable_cell_wrapping(
+                &game,
+                &[],
+                BOARD_WIDTH - 1,
+                DirectionDto::Horizontal,
+                true
+            ),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn find_next_placeable_cell_wrapping_skips_occupied_cells_on_the_way_around() {
+        let mut board = empty_board();
+        // Fill the whole row except index 5.
+        for x in 0..BOARD_WIDTH {
+            if x != 5 {
+                board[x].letter = Some("A".to_string());
+            }
+        }
+        let game = test_game(board);
+        assert_eq!(
+            find_next_placeable_cell_wrapping(&game, &[], 4, DirectionDto::Horizontal, true),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn find_next_placeable_cell_wrapping_returns_none_when_the_whole_line_is_full() {
+        let mut board = empty_board();
+        for x in 0..BOARD_WIDTH {
+            board[x].letter = Some("A".to_string());
+        }
+        let game = test_game(board);
+        assert_eq!(
+            find_next_placeable_cell_wrapping(&game, &[], 4, DirectionDto::Horizontal, true),
+            None
+        );
+    }
+
+    #[test]
     fn find_previous_editable_cell_lands_on_the_immediately_preceding_staged_tile() {
         // Regression test: backspace used to skip straight past the last
         // staged tile (landing one cell further back than intended) because
@@ -2584,8 +2765,8 @@ mod tests {
     #[test]
     fn find_previous_editable_cell_skips_over_permanent_letters_only() {
         let mut board = empty_board();
-        board[11].letter = Some('A');
-        board[10].letter = Some('B');
+        board[11].letter = Some("A".to_string());
+        board[10].letter = Some("B".to_string());
         let game = test_game(board);
 
         // From 12 going left: 11 and 10 are permanent, so backspace should
@@ -2625,7 +2806,7 @@ mod tests {
         let staged = vec![letter_placement(112, 0, 'A')];
 
         let mut board_with_left_neighbor = empty_board();
-        board_with_left_neighbor[111].letter = Some('C');
+        board_with_left_neighbor[111].letter = Some("C".to_string());
         let game = test_game(board_with_left_neighbor);
         assert_eq!(
             infer_typing_direction(&game, &staged, None, None),
@@ -2633,7 +2814,7 @@ mod tests {
         );
 
         let mut board_with_top_neighbor = empty_board();
-        board_with_top_neighbor[112 - BOARD_WIDTH].letter = Some('C');
+        board_with_top_neighbor[112 - BOARD_WIDTH].letter = Some("C".to_string());
         let game = test_game(board_with_top_neighbor);
         assert_eq!(
             infer_typing_direction(&game, &staged, None, None),
@@ -2737,40 +2918,72 @@ mod tests {
     fn stage_tile_at_cell_keeps_letter_tiles_unchanged() {
         let tile = RackTileView {
             id: 5,
-            display: 'Q',
-            tile: TileDto::Letter { letter: 'Q' },
+            display: "Q".to_string(),
+            tile: TileDto::Letter {
+                letter: "Q".to_string(),
+            },
             is_used: false,
         };
         let placement = stage_tile_at_cell(42, &tile, None);
         assert_eq!(placement.board_index, 42);
         assert_eq!(placement.rack_tile_id, 5);
-        assert_eq!(placement.display, 'Q');
-        assert_eq!(placement.tile, TileDto::Letter { letter: 'Q' });
+        assert_eq!(placement.display, "Q");
+        assert_eq!(
+            placement.tile,
+            TileDto::Letter {
+                letter: "Q".to_string()
+            }
+        );
     }
 
     #[test]
     fn stage_tile_at_cell_resolves_a_typed_blank_and_lowercases_its_display() {
         let tile = RackTileView {
             id: 6,
-            display: '*',
+            display: "*".to_string(),
             tile: TileDto::Blank { acting_as: None },
             is_used: false,
         };
-        let placement = stage_tile_at_cell(7, &tile, Some('Z'));
-        assert_eq!(placement.display, 'z');
-        assert_eq!(placement.tile, TileDto::Blank { acting_as: Some('Z') });
+        let placement = stage_tile_at_cell(7, &tile, Some("Z".to_string()));
+        assert_eq!(placement.display, "z");
+        assert_eq!(
+            placement.tile,
+            TileDto::Blank {
+                acting_as: Some("Z".to_string())
+            }
+        );
+    }
+
+    /// A digraph tile's assigned blank (e.g. Spanish's RR) lowercases as
+    /// a whole grapheme, not truncated to one character.
+    #[test]
+    fn stage_tile_at_cell_lowercases_a_digraph_blank_assignment() {
+        let tile = RackTileView {
+            id: 6,
+            display: "*".to_string(),
+            tile: TileDto::Blank { acting_as: None },
+            is_used: false,
+        };
+        let placement = stage_tile_at_cell(7, &tile, Some("RR".to_string()));
+        assert_eq!(placement.display, "rr");
+        assert_eq!(
+            placement.tile,
+            TileDto::Blank {
+                acting_as: Some("RR".to_string())
+            }
+        );
     }
 
     #[test]
     fn stage_tile_at_cell_leaves_an_unresolved_blank_for_the_mouse_path() {
         let tile = RackTileView {
             id: 6,
-            display: '*',
+            display: "*".to_string(),
             tile: TileDto::Blank { acting_as: None },
             is_used: false,
         };
         let placement = stage_tile_at_cell(7, &tile, None);
-        assert_eq!(placement.display, '?');
+        assert_eq!(placement.display, "?");
         assert_eq!(placement.tile, TileDto::Blank { acting_as: None });
     }
 
@@ -2786,7 +2999,13 @@ mod tests {
     }
 
     fn game_with_participants(participants: Vec<ParticipantDto>, current_seat: u8) -> GameStateDto {
-        let racks = participants.iter().map(|_| RackDto { counts: [0; 26], blanks: 0 }).collect();
+        let racks = participants
+            .iter()
+            .map(|_| RackDto {
+                counts: Vec::new(),
+                blanks: 0,
+            })
+            .collect();
         GameStateDto {
             participants,
             racks,

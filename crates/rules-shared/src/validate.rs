@@ -187,7 +187,7 @@ impl<D: Dictionary> RulesEngine<'_, D> {
         loop {
             match state.board.get(current) {
                 Some(BoardCell::Filled(cell)) => {
-                    word.push(self.rules.letter_char(cell.letter));
+                    word.extend(self.rules.letter_grapheme(cell.letter).chars());
                     if !cell.is_blank {
                         main_word_score +=
                             self.rules.letter_values[cell.letter.as_usize()] as Score;
@@ -217,7 +217,7 @@ impl<D: Dictionary> RulesEngine<'_, D> {
                     }
 
                     saw_placement = true;
-                    word.push(self.rules.letter_char(letter));
+                    word.extend(self.rules.letter_grapheme(letter).chars());
                     let tile_score = if matches!(placement.tile, crate::model::Tile::Blank { .. }) {
                         0
                     } else {
@@ -507,15 +507,15 @@ fn build_cross_word(
 
     let mut word = String::with_capacity(8);
     for letter in before.iter().rev() {
-        word.push(rules.letter_char(*letter));
+        word.extend(rules.letter_grapheme(*letter).chars());
     }
-    word.push(rules.letter_char(placed_letter));
+    word.extend(rules.letter_grapheme(placed_letter).chars());
 
     current = pos;
     while let Some(next) = current.try_step_forward(perpendicular, rules.width, rules.height) {
         match board.filled_letter(next) {
             Some((letter, _)) => {
-                word.push(rules.letter_char(letter));
+                word.extend(rules.letter_grapheme(letter).chars());
                 current = next;
             }
             None => break,
@@ -529,7 +529,7 @@ mod tests {
     use super::{GameState, RulesEngine, RulesPosition};
     use crate::board::{BoardCell, BoardState, EmptyCell, FilledCell};
     use crate::cache::RuleCache;
-    use crate::dictionary::SowpodsDictionary;
+    use crate::dictionary::WordListDictionary;
     use crate::model::{
         Direction, Letter, MoveCandidate, MoveError, Position, Premium, Rack, Tile,
         TilePlacement, VariantRules,
@@ -542,7 +542,7 @@ mod tests {
     #[test]
     fn preview_validates_simple_anchor_play() {
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let engine = RulesEngine {
             rules: &rules,
             dictionary: &dictionary,
@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn preview_rejects_disallowed_cross_letter() {
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let engine = RulesEngine {
             rules: &rules,
             dictionary: &dictionary,
@@ -638,7 +638,7 @@ mod tests {
     #[test]
     fn validate_move_names_every_simultaneously_invalid_word_not_just_the_first() {
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let engine = RulesEngine {
             rules: &rules,
             dictionary: &dictionary,
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn validate_move_names_the_main_word_when_it_is_the_only_problem() {
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let engine = RulesEngine {
             rules: &rules,
             dictionary: &dictionary,
@@ -730,7 +730,7 @@ mod tests {
     #[test]
     fn preview_rejects_tiles_not_in_rack() {
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let engine = RulesEngine {
             rules: &rules,
             dictionary: &dictionary,
@@ -761,7 +761,7 @@ mod tests {
     #[test]
     fn preview_awards_bingo_bonus_when_using_full_rack() {
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let engine = RulesEngine {
             rules: &rules,
             dictionary: &dictionary,
@@ -824,7 +824,7 @@ mod tests {
     #[test]
     fn apply_move_updates_board_and_cache() {
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let engine = RulesEngine {
             rules: &rules,
             dictionary: &dictionary,
@@ -877,7 +877,7 @@ mod tests {
     #[test]
     fn game_state_initializes_cache_and_applies_move() {
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let engine = RulesEngine {
             rules: &rules,
             dictionary: &dictionary,
@@ -923,7 +923,7 @@ mod tests {
     #[test]
     fn preview_rejects_gap_without_existing_bridge() {
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let engine = RulesEngine {
             rules: &rules,
             dictionary: &dictionary,

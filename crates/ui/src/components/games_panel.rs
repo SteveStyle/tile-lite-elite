@@ -1,3 +1,4 @@
+use crate::edition_label::edition_label;
 use crate::time_format::format_relative_time;
 use api::{
     CreateSeatRequest, GameRelationship, GameStateDto, GameStatus, GameSummaryDto, MoveRecordDto,
@@ -10,7 +11,9 @@ const DEFAULT_TIME_LIMIT_HOURS: u32 = 72;
 
 /// One-click starting shapes for the draft table below — each seeds
 /// `include_creator`/`additional_seats` with a starting roster that's still
-/// fully editable before you click Invite (see `preset_draft`).
+/// fully editable before you click Invite (see `preset_draft`), including
+/// the edition picker — every preset just prepopulates a starting point,
+/// it doesn't restrict what the draft can become.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NewGameKind {
     VsEngine,
@@ -26,6 +29,10 @@ enum NewGameKind {
 pub struct CustomGameSubmission {
     pub seats: Vec<CreateSeatRequest>,
     pub move_time_limit_seconds: Option<u64>,
+    /// The edition to create the game under (e.g. "official", "wordfeud",
+    /// "north_american") — `None` lets the server fall back to its own
+    /// default ("official").
+    pub variant: Option<String>,
     /// True when every seat is already resolved (no invitation left to wait
     /// on) — the roster the "Start" label (as opposed to "Invite") promised.
     /// The caller should immediately call the start endpoint too, rather
@@ -95,11 +102,13 @@ fn start_draft(
     mut additional_seats: Signal<Vec<AdditionalSeatDraft>>,
     mut time_limit_hours: Signal<u32>,
     mut drafting: Signal<bool>,
+    mut variant: Signal<String>,
 ) {
     let (creator, seats) = preset_draft(kind);
     include_creator.set(creator);
     additional_seats.set(seats);
     time_limit_hours.set(DEFAULT_TIME_LIMIT_HOURS);
+    variant.set("official".to_string());
     drafting.set(true);
 }
 
@@ -179,6 +188,7 @@ pub fn GamesPanel(
     let mut include_creator = use_signal(|| true);
     let mut additional_seats = use_signal(Vec::<AdditionalSeatDraft>::new);
     let mut time_limit_hours = use_signal(|| DEFAULT_TIME_LIMIT_HOURS);
+    let mut variant = use_signal(|| "official".to_string());
 
     let can_create = my_display_name.is_some();
 
@@ -186,9 +196,15 @@ pub fn GamesPanel(
         .iter()
         .cloned()
         .partition(|s| s.relationship == GameRelationship::YourTurn);
-    let (participant, rest): (Vec<_>, Vec<_>) = rest
-        .into_iter()
-        .partition(|s| s.relationship == GameRelationship::Participant);
+    // A `Creator` game (e.g. Engine vs Engine, where you hold no seat) is
+    // grouped alongside seated participant games — same section, since both
+    // mean "yours to watch/manage," just with or without a rack.
+    let (participant, rest): (Vec<_>, Vec<_>) = rest.into_iter().partition(|s| {
+        matches!(
+            s.relationship,
+            GameRelationship::Participant | GameRelationship::Creator
+        )
+    });
     let (invited_named, invited_open): (Vec<_>, Vec<_>) = rest
         .into_iter()
         .partition(|s| s.relationship == GameRelationship::InvitedByName);
@@ -295,25 +311,25 @@ pub fn GamesPanel(
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::VsEngine, include_creator, additional_seats, time_limit_hours, drafting),
+                        onclick: move |_| start_draft(NewGameKind::VsEngine, include_creator, additional_seats, time_limit_hours, drafting, variant),
                         "vs Engine"
                     }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting),
+                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting, variant),
                         "vs Human"
                     }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::EngineVsEngine, include_creator, additional_seats, time_limit_hours, drafting),
+                        onclick: move |_| start_draft(NewGameKind::EngineVsEngine, include_creator, additional_seats, time_limit_hours, drafting, variant),
                         "Engine vs Engine"
                     }
                     button {
                         class: "toggle-button toggle-button-muted",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting),
+                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting, variant),
                         "Custom game..."
                     }
                 }
@@ -378,6 +394,16 @@ pub fn GamesPanel(
                                 "+ Engine"
                             }
                         }
+                        div { class: "game-builder-variant",
+                            label { "Edition: " }
+                            select {
+                                value: "{variant()}",
+                                onchange: move |event| variant.set(event.value()),
+                                for name in rules_shared::VariantRules::EDITION_NAMES {
+                                    option { value: "{name}", "{edition_label(name)}" }
+                                }
+                            }
+                        }
                         div { class: "game-builder-time-limit",
                             label { "Time per move (hours): " }
                             input {
@@ -403,6 +429,7 @@ pub fn GamesPanel(
                                     on_custom_new_game.call(CustomGameSubmission {
                                         seats,
                                         move_time_limit_seconds: Some(time_limit_hours() as u64 * 3600),
+                                        variant: Some(variant()),
                                         start_immediately: !needs_invitations,
                                     });
                                     drafting.set(false);
@@ -496,10 +523,11 @@ fn game_row(
                     span { class: "game-row-time", "{relative_time}" }
                 }
                 p { class: "game-row-participants", "{participants_label}" }
+                p { class: "game-row-variant", "{edition_label(&summary.variant)}" }
             }
             if is_selected {
                 div { class: "games-panel-detail",
-                    {player_table(&participants, &moves, viewer_player_id)}
+                    {player_table(&participants, &moves, viewer_player_id, &summary.variant)}
                     if summary.status == GameStatus::Waiting {
                         div { class: "game-builder-add-row",
                             button {
@@ -543,7 +571,23 @@ fn game_row(
     }
 }
 
-fn player_table(participants: &[ParticipantDto], moves: &[MoveRecordDto], viewer_player_id: Option<&str>) -> Element {
+/// Collins is an English dictionary — linking to it for a German or
+/// Spanish word would send the reader to a lookup for a language it
+/// doesn't cover. Both English editions' word lists (SOWPODS for
+/// official/Wordfeud, ENABLE2K for North American) are genuinely English;
+/// everything else isn't.
+fn is_english_dictionary(variant: &str) -> bool {
+    rules_shared::VariantRules::by_name(variant)
+        .is_some_and(|rules| matches!(rules.language.as_str(), "sowpods" | "enable2k"))
+}
+
+fn player_table(
+    participants: &[ParticipantDto],
+    moves: &[MoveRecordDto],
+    viewer_player_id: Option<&str>,
+    variant: &str,
+) -> Element {
+    let link_words = is_english_dictionary(variant);
     let rows = participants.iter().map(|participant| {
         let is_you = viewer_player_id.is_some() && participant.player_id.as_deref() == viewer_player_id;
         let row_class = if is_you { "player-table-you" } else { "" };
@@ -558,7 +602,7 @@ fn player_table(participants: &[ParticipantDto], moves: &[MoveRecordDto], viewer
                 }
                 td { "{seat_kind_label(&participant.kind)}" }
                 td { class: "player-table-score", "{participant.score}" }
-                td { {render_last_move(&cell)} }
+                td { {render_last_move(&cell, link_words)} }
             }
         }
     });
@@ -595,7 +639,7 @@ fn last_move_cell(moves: &[MoveRecordDto], seat_number: u8) -> LastMoveCell {
     }
 }
 
-fn render_last_move(cell: &LastMoveCell) -> Element {
+fn render_last_move(cell: &LastMoveCell, link_words: bool) -> Element {
     match cell {
         LastMoveCell::None => rsx! {
             span { class: "player-table-last-move-empty", "—" }
@@ -604,20 +648,27 @@ fn render_last_move(cell: &LastMoveCell) -> Element {
             span { class: "player-table-last-move-note", "{note}" }
         },
         LastMoveCell::Word { word, score_delta } => {
-            let url = format!(
-                "https://www.collinsdictionary.com/dictionary/english/{}",
-                word.to_lowercase()
-            );
             let delta = *score_delta;
-            rsx! {
-                a {
-                    class: "player-table-last-move-word",
-                    href: "{url}",
-                    target: "_blank",
-                    rel: "noopener noreferrer",
-                    "{word}"
+            if link_words {
+                let url = format!(
+                    "https://www.collinsdictionary.com/dictionary/english/{}",
+                    word.to_lowercase()
+                );
+                rsx! {
+                    a {
+                        class: "player-table-last-move-word",
+                        href: "{url}",
+                        target: "_blank",
+                        rel: "noopener noreferrer",
+                        "{word}"
+                    }
+                    span { class: "player-table-last-move-score", " +{delta}" }
                 }
-                span { class: "player-table-last-move-score", " +{delta}" }
+            } else {
+                rsx! {
+                    span { class: "player-table-last-move-word", "{word}" }
+                    span { class: "player-table-last-move-score", " +{delta}" }
+                }
             }
         }
     }
@@ -794,6 +845,16 @@ mod tests {
     #[test]
     fn last_move_cell_is_none_when_seat_has_no_moves() {
         assert_eq!(last_move_cell(&[], 0), LastMoveCell::None);
+    }
+
+    #[test]
+    fn only_english_editions_link_to_an_english_dictionary() {
+        assert!(is_english_dictionary("official"));
+        assert!(is_english_dictionary("wordfeud"));
+        assert!(is_english_dictionary("north_american"));
+        assert!(!is_english_dictionary("german"));
+        assert!(!is_english_dictionary("spanish"));
+        assert!(!is_english_dictionary("not-a-real-edition"));
     }
 
     fn participant(kind: SeatKind, player_id: Option<&str>) -> ParticipantDto {

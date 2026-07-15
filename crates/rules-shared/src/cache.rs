@@ -296,11 +296,11 @@ pub fn compute_cross_check<D: Dictionary>(
     for letter in rules.letters() {
         let mut word = String::with_capacity(before.len() + 1 + after.len());
         for existing in before.iter().rev() {
-            word.push(rules.letter_char(*existing));
+            word.extend(rules.letter_grapheme(*existing).chars());
         }
-        word.push(rules.letter_char(letter));
+        word.extend(rules.letter_grapheme(letter).chars());
         for existing in &after {
-            word.push(rules.letter_char(*existing));
+            word.extend(rules.letter_grapheme(*existing).chars());
         }
 
         if dictionary.is_word(&word) {
@@ -322,7 +322,7 @@ pub fn compute_cross_check<D: Dictionary>(
 mod tests {
     use super::{compute_cross_check, CrossCheck, RuleCache};
     use crate::board::{BoardCell, BoardState, EmptyCell, FilledCell};
-    use crate::dictionary::SowpodsDictionary;
+    use crate::dictionary::WordListDictionary;
     use crate::model::{Direction, Letter, Position, Premium, VariantRules};
 
     fn sample_rules() -> VariantRules {
@@ -333,7 +333,7 @@ mod tests {
     fn unconstrained_when_no_perpendicular_neighbors() {
         let board = BoardState::default();
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let pos = Position::new(7, 7);
 
         let cross_check =
@@ -346,7 +346,7 @@ mod tests {
     fn constrained_when_perpendicular_word_must_be_valid() {
         let mut board = BoardState::default();
         let rules = sample_rules();
-        let dictionary = SowpodsDictionary::new();
+        let dictionary = WordListDictionary::new();
         let pos = Position::new(7, 7);
 
         board.set(

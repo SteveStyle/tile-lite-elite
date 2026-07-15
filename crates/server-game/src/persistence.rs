@@ -4,7 +4,7 @@ use sqlx::{Pool, Row, Sqlite, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOp
 use std::str::FromStr;
 
 use crate::game_state::{GameSession, MoveRecord, ParticipantState, board_from_dto};
-use rules_shared::{Alphabet, GameState, Premium, SOWPODS, Score, Tile, VariantRules};
+use rules_shared::{Alphabet, GameState, Premium, Score, Tile, VariantRules};
 
 /// Mirrors `rules_shared::VariantRules` field-for-field, but as its own type
 /// rather than deriving `Serialize`/`Deserialize` directly on the internal
@@ -13,12 +13,23 @@ use rules_shared::{Alphabet, GameState, Premium, SOWPODS, Score, Tile, VariantRu
 /// schema straight to it would turn each of those changes into a data
 /// migration. This struct is the DB's problem to keep stable; `VariantRules`
 /// is free to change shape as long as the conversions below keep up.
+///
+/// `letter_values`/`tile_distribution` are `Vec<u8>` (not a fixed-size
+/// array) specifically so a game persisted before the alphabet widened
+/// beyond 26 letters (every game up to and including north_american/
+/// wordfeud) still deserializes as-is — same reasoning, and the same
+/// zero-pad-on-load technique, as `rules_shared::Rack.counts`'s existing
+/// `deserialize_letter_array`. `alphabet` is `#[serde(default)]`'d to
+/// `Alphabet::latin26()` for the same reason: every game persisted before
+/// this field existed was implicitly that alphabet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedVariantRules {
     name: String,
     language: String,
-    letter_values: [u8; 26],
-    tile_distribution: [u8; 26],
+    letter_values: Vec<u8>,
+    tile_distribution: Vec<u8>,
+    #[serde(default = "default_latin26_alphabet")]
+    alphabet: Alphabet,
     blank_tiles: u8,
     rack_size: u8,
     width: u8,
@@ -27,21 +38,18 @@ struct PersistedVariantRules {
     premiums: Vec<Premium>,
 }
 
+fn default_latin26_alphabet() -> Alphabet {
+    Alphabet::latin26()
+}
+
 impl From<&VariantRules> for PersistedVariantRules {
     fn from(rules: &VariantRules) -> Self {
-        // The persisted format stays 26-wide for now (see
-        // rules_shared::MAX_ALPHABET_SIZE's doc comment) — every edition in
-        // production today is Alphabet::latin26(), so only the first 26 of
-        // the internal (wider) arrays ever hold anything real.
-        let mut letter_values = [0u8; 26];
-        letter_values.copy_from_slice(&rules.letter_values[..26]);
-        let mut tile_distribution = [0u8; 26];
-        tile_distribution.copy_from_slice(&rules.tile_distribution[..26]);
         Self {
             name: rules.name.clone(),
             language: rules.language.clone(),
-            letter_values,
-            tile_distribution,
+            letter_values: rules.letter_values.to_vec(),
+            tile_distribution: rules.tile_distribution.to_vec(),
+            alphabet: rules.alphabet.clone(),
             blank_tiles: rules.blank_tiles,
             rack_size: rules.rack_size,
             width: rules.width,
@@ -60,16 +68,19 @@ impl TryFrom<PersistedVariantRules> for VariantRules {
             .premiums
             .try_into()
             .map_err(|_| "persisted premiums length did not match the board size".to_string())?;
+        if persisted.letter_values.len() > rules_shared::MAX_ALPHABET_SIZE
+            || persisted.tile_distribution.len() > rules_shared::MAX_ALPHABET_SIZE
+        {
+            return Err("persisted letter table longer than MAX_ALPHABET_SIZE".to_string());
+        }
         let mut letter_values = [0u8; rules_shared::MAX_ALPHABET_SIZE];
-        letter_values[..26].copy_from_slice(&persisted.letter_values);
+        letter_values[..persisted.letter_values.len()].copy_from_slice(&persisted.letter_values);
         let mut tile_distribution = [0u8; rules_shared::MAX_ALPHABET_SIZE];
-        tile_distribution[..26].copy_from_slice(&persisted.tile_distribution);
+        tile_distribution[..persisted.tile_distribution.len()]
+            .copy_from_slice(&persisted.tile_distribution);
         Ok(VariantRules {
             name: persisted.name,
-            // Every persisted game to date is the standard Latin alphabet —
-            // this will need to actually vary once a non-Latin edition can
-            // be persisted (Phase 5), presumably keyed off `language`.
-            alphabet: Alphabet::latin26(),
+            alphabet: persisted.alphabet,
             language: persisted.language,
             letter_values,
             tile_distribution,
@@ -106,6 +117,10 @@ struct PersistedGame {
     final_bonus_seat: Option<u8>,
     #[serde(default)]
     final_bonus_points: Option<i32>,
+    // Missing on any game persisted before this field existed — `None` for
+    // those, same as `GameSession.creator_player_id`.
+    #[serde(default)]
+    creator_player_id: Option<String>,
     random_seed: u64,
     board: Vec<BoardCellDto>,
     bag: Vec<Tile>,
@@ -283,6 +298,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         winner_seat: session.winner_seat,
         final_bonus_seat: session.final_bonus_seat,
         final_bonus_points: session.final_bonus_points,
+        creator_player_id: session.creator_player_id.clone(),
         random_seed: session.random_seed,
         board: session.to_dto().board,
         bag: session.bag.clone(),
@@ -401,8 +417,11 @@ pub async fn load_game(pool: &Pool<Sqlite>, id: &str) -> Result<Option<GameSessi
             serde_json::from_str::<PersistedGame>(&json).expect("persisted game should parse");
         let rules = VariantRules::try_from(persisted.rules)
             .expect("persisted variant rules should be valid");
-        let board = board_from_dto(&persisted.board).expect("persisted board should be valid");
-        let state = GameState::from_board(board, &rules, &*SOWPODS);
+        let board = board_from_dto(&persisted.board, &rules.alphabet)
+            .expect("persisted board should be valid");
+        let dictionary = rules_shared::dictionary_by_name(&rules.language)
+            .expect("persisted rules should reference a known dictionary");
+        let state = GameState::from_board(board, &rules, dictionary);
         GameSession {
             id: persisted.id,
             status: persisted.status,
@@ -414,6 +433,7 @@ pub async fn load_game(pool: &Pool<Sqlite>, id: &str) -> Result<Option<GameSessi
             winner_seat: persisted.winner_seat,
             final_bonus_seat: persisted.final_bonus_seat,
             final_bonus_points: persisted.final_bonus_points,
+            creator_player_id: persisted.creator_player_id,
             random_seed: persisted.random_seed,
             rules,
             state,

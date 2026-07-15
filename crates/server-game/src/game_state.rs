@@ -10,8 +10,8 @@ use engine_core::{EngineAction, EngineMetadata, EngineRequest, GreedyEngine, Scr
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rules_shared::{
-    BoardCell, BoardState, Direction, FilledCell, GameState, Letter, MoveCandidate, Rack,
-    RulesEngine, SOWPODS, Tile, TilePlacement, VariantRules, format_move_error,
+    Alphabet, BoardCell, BoardState, Direction, FilledCell, GameState, Letter, MoveCandidate, Rack,
+    RulesEngine, Tile, TilePlacement, VariantRules, format_move_error,
 };
 use serde::{Deserialize, Serialize};
 
@@ -98,6 +98,12 @@ pub struct GameSession {
     /// transfer, so these stay `None` for those.
     pub final_bonus_seat: Option<u8>,
     pub final_bonus_points: Option<i32>,
+    /// Who created this game — distinct from `participants`, since a
+    /// creator isn't necessarily seated in it (e.g. Engine vs Engine).
+    /// Lets `list_games` show a game to the person who set it up even when
+    /// they hold no seat at all. `None` only for games persisted before
+    /// this field existed.
+    pub creator_player_id: Option<String>,
     pub random_seed: u64,
     pub rules: VariantRules,
     pub state: GameState,
@@ -116,11 +122,14 @@ impl GameSession {
     pub fn new(
         id: String,
         participants: Vec<ParticipantState>,
+        creator_player_id: Option<String>,
         random_seed: u64,
         rules: VariantRules,
         move_time_limit_seconds: u64,
     ) -> Self {
-        let state = GameState::new(&rules, &*SOWPODS);
+        let dictionary = rules_shared::dictionary_by_name(&rules.language)
+            .expect("game rules should reference a known dictionary");
+        let state = GameState::new(&rules, dictionary);
         let mut bag = build_bag(&rules);
         shuffle_bag(&mut bag, random_seed);
 
@@ -138,6 +147,7 @@ impl GameSession {
             winner_seat: None,
             final_bonus_seat: None,
             final_bonus_points: None,
+            creator_player_id,
             random_seed,
             rules,
             state,
@@ -216,6 +226,7 @@ impl GameSession {
         api::GameSummaryDto {
             id: self.id.clone(),
             status: self.status.clone(),
+            variant: self.variant.clone(),
             current_seat: self.current_seat,
             participants: self
                 .participants
@@ -267,19 +278,12 @@ impl GameSession {
                     score: participant.score,
                 })
                 .collect(),
-            board: board_to_dto(&self.state.board),
+            board: board_to_dto(&self.state.board, &self.rules.alphabet),
             racks: self
                 .participants
                 .iter()
                 .map(|participant| RackDto {
-                    // The wire format stays 26-wide for now — nothing
-                    // client-facing needs more than the standard Latin
-                    // alphabet yet (see rules_shared::MAX_ALPHABET_SIZE's
-                    // doc comment), so only the first 26 of the internal
-                    // Rack's slots ever carry anything for editions today.
-                    counts: participant.rack.counts[..26]
-                        .try_into()
-                        .expect("first 26 rack slots always fit the wire RackDto"),
+                    counts: participant.rack.counts.to_vec(),
                     blanks: participant.rack.blanks,
                 })
                 .collect(),
@@ -307,7 +311,8 @@ impl GameSession {
         ensure_active_turn(self, seat_number)?;
         let rules_engine = RulesEngine {
             rules: &self.rules,
-            dictionary: &*SOWPODS,
+            dictionary: rules_shared::dictionary_by_name(&self.rules.language)
+                .expect("game rules should reference a known dictionary"),
         };
         let participant = self
             .participants
@@ -691,7 +696,7 @@ fn reset_blank_tile(tile: Tile) -> Tile {
     }
 }
 
-fn board_to_dto(board: &BoardState) -> Vec<BoardCellDto> {
+fn board_to_dto(board: &BoardState, alphabet: &Alphabet) -> Vec<BoardCellDto> {
     board
         .cells
         .iter()
@@ -703,14 +708,14 @@ fn board_to_dto(board: &BoardState) -> Vec<BoardCellDto> {
             },
             BoardCell::Filled(FilledCell { letter, is_blank }) => BoardCellDto {
                 premium: PremiumDto::Blank,
-                letter: Some(letter.as_char()),
+                letter: Some(to_dto_letter(*letter, alphabet)),
                 is_blank: *is_blank,
             },
         })
         .collect()
 }
 
-pub fn board_from_dto(cells: &[BoardCellDto]) -> Result<BoardState, String> {
+pub fn board_from_dto(cells: &[BoardCellDto], alphabet: &Alphabet) -> Result<BoardState, String> {
     if cells.len() != BoardState::WIDTH * BoardState::HEIGHT {
         return Err(format!(
             "Expected {} board cells, got {}",
@@ -724,9 +729,9 @@ pub fn board_from_dto(cells: &[BoardCellDto]) -> Result<BoardState, String> {
         let x = (index % BoardState::WIDTH) as u8;
         let y = (index / BoardState::WIDTH) as u8;
         let pos = rules_shared::Position::new(x, y);
-        let board_cell = match cell.letter {
+        let board_cell = match &cell.letter {
             Some(letter) => BoardCell::Filled(FilledCell {
-                letter: Letter::from(letter),
+                letter: to_rules_letter(letter, alphabet),
                 is_blank: cell.is_blank,
             }),
             None => BoardCell::Empty(rules_shared::EmptyCell {
@@ -759,7 +764,7 @@ fn premium_from_dto(premium: PremiumDto) -> rules_shared::Premium {
     }
 }
 
-pub fn move_candidate_from_dto(candidate: MoveCandidateDto) -> MoveCandidate {
+pub fn move_candidate_from_dto(candidate: MoveCandidateDto, alphabet: &Alphabet) -> MoveCandidate {
     MoveCandidate {
         start: PositionDtoToRules::convert(candidate.start),
         direction: match candidate.direction {
@@ -771,13 +776,13 @@ pub fn move_candidate_from_dto(candidate: MoveCandidateDto) -> MoveCandidate {
             .into_iter()
             .map(|placement| TilePlacement {
                 offset: placement.offset,
-                tile: tile_from_dto(placement.tile),
+                tile: tile_from_dto(placement.tile, alphabet),
             })
             .collect(),
     }
 }
 
-pub fn move_candidate_to_dto(candidate: &MoveCandidate) -> MoveCandidateDto {
+pub fn move_candidate_to_dto(candidate: &MoveCandidate, alphabet: &Alphabet) -> MoveCandidateDto {
     MoveCandidateDto {
         start: PositionDto {
             x: candidate.start.x,
@@ -792,28 +797,48 @@ pub fn move_candidate_to_dto(candidate: &MoveCandidate) -> MoveCandidateDto {
             .iter()
             .map(|placement| TilePlacementDto {
                 offset: placement.offset,
-                tile: tile_to_dto(placement.tile),
+                tile: tile_to_dto(placement.tile, alphabet),
             })
             .collect(),
     }
 }
 
-pub fn tile_from_dto(tile: TileDto) -> Tile {
+/// `rules_shared::Letter::from(char)`/`Letter::as_char()` are raw
+/// ASCII-offset arithmetic — only correct for the standard Latin alphabet,
+/// wrong for Ä/Ö/Ü (or any letter past index 25), and can't represent a
+/// digraph tile (Spanish's CH/LL/RR) at all, since it's two characters.
+/// Every tile/board letter crossing this boundary belongs to the game's
+/// own `VariantRules.alphabet`, so this is a genuine internal invariant,
+/// not defensive-for-user-input.
+fn to_rules_letter(s: &str, alphabet: &Alphabet) -> Letter {
+    alphabet
+        .to_letter(s)
+        .expect("tile letter should belong to the game's alphabet")
+}
+
+fn to_dto_letter(letter: Letter, alphabet: &Alphabet) -> String {
+    alphabet
+        .to_grapheme(letter)
+        .expect("tile letter should belong to the game's alphabet")
+        .to_string()
+}
+
+pub fn tile_from_dto(tile: TileDto, alphabet: &Alphabet) -> Tile {
     match tile {
-        TileDto::Letter { letter } => Tile::Letter(Letter::from(letter)),
+        TileDto::Letter { letter } => Tile::Letter(to_rules_letter(&letter, alphabet)),
         TileDto::Blank { acting_as } => Tile::Blank {
-            acting_as: acting_as.map(Letter::from),
+            acting_as: acting_as.map(|letter| to_rules_letter(&letter, alphabet)),
         },
     }
 }
 
-pub fn tile_to_dto(tile: Tile) -> TileDto {
+pub fn tile_to_dto(tile: Tile, alphabet: &Alphabet) -> TileDto {
     match tile {
         Tile::Letter(letter) => TileDto::Letter {
-            letter: letter.as_char(),
+            letter: to_dto_letter(letter, alphabet),
         },
         Tile::Blank { acting_as } => TileDto::Blank {
-            acting_as: acting_as.map(|letter| letter.as_char()),
+            acting_as: acting_as.map(|letter| to_dto_letter(letter, alphabet)),
         },
     }
 }
