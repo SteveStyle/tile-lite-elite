@@ -250,6 +250,20 @@ pub struct MoveRecordDto {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatMessageDto {
+    pub id: String,
+    pub player_id: String,
+    pub display_name: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PostChatMessageRequest {
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameStateDto {
     pub id: String,
     pub status: GameStatus,
@@ -273,8 +287,16 @@ pub struct GameStateDto {
     pub turn_started_at: String,
     pub participants: Vec<ParticipantDto>,
     pub board: Vec<BoardCellDto>,
+    /// Redacted per-viewer at the API boundary (see `resolve_viewer_access`/
+    /// `redact_game_state` in `server-game`) — a caller only ever receives
+    /// their own seat's rack, everyone else's entries are zeroed. Never
+    /// trust this field's *absence* of data as proof a seat has no tiles;
+    /// it just means you're not allowed to see them.
     pub racks: Vec<RackDto>,
     pub moves: Vec<MoveRecordDto>,
+    /// Empty unless the caller is a seated participant — see
+    /// `resolve_viewer_access` in `server-game`.
+    pub messages: Vec<ChatMessageDto>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

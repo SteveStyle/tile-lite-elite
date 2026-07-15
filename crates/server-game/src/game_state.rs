@@ -2,9 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use api::{
-    BoardCellDto, DirectionDto, EngineProfileDto, GameStateDto, GameStatus, MoveCandidateDto,
-    MoveRecordDto, ParticipantDto, PositionDto, PremiumDto, RackDto, SeatKind, TileDto,
-    TilePlacementDto,
+    BoardCellDto, ChatMessageDto, DirectionDto, EngineProfileDto, GameStateDto, GameStatus,
+    MoveCandidateDto, MoveRecordDto, ParticipantDto, PositionDto, PremiumDto, RackDto, SeatKind,
+    TileDto, TilePlacementDto,
 };
 use engine_core::{EngineAction, EngineMetadata, EngineRequest, GreedyEngine, ScrabbleEngine};
 use rand::rngs::StdRng;
@@ -59,6 +59,96 @@ pub struct MoveRecord {
     pub positions: Vec<PositionDto>,
 }
 
+/// A single chat message posted to a game. `player_id`/`display_name` are
+/// denormalized snapshots at send time (matching `ParticipantState.display_name`'s
+/// own precedent of not joining back to `players`), not a live lookup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMessageRecord {
+    pub id: String,
+    pub player_id: String,
+    pub display_name: String,
+    pub body: String,
+    pub created_at: String,
+}
+
+/// Cap on a single chat message's length — plain hygiene, not intended to be
+/// user-configurable.
+const MAX_CHAT_MESSAGE_LEN: usize = 1000;
+
+/// What a specific caller (identified by `player_id`, or `None` if not
+/// logged in) is allowed to see of a game's full state. Distinct from
+/// `GameSummaryDto`'s visibility (creator/participant/invited, used by
+/// `list_games`), which is unaffected by any of this — a `Waiting` game
+/// with an open or named invitation has nothing to redact yet (empty
+/// board, no moves, zero scores), so an invitee who hasn't accepted only
+/// ever needs the summary, never the full `GameStateDto` this gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerAccess {
+    /// Not logged in, or logged in but neither the creator nor a seated
+    /// participant of this specific game. Callers must reject outright
+    /// (401/403) rather than return a redacted-to-nothing payload.
+    Rejected,
+    /// Created this game but holds no seat in it (e.g. watching a Bot
+    /// Showdown they set up). Sees board/moves/participants, never any
+    /// rack, never chat.
+    Creator,
+    /// Holds a seat. Sees everything the creator sees, plus chat, plus
+    /// their own rack (other seats' racks stay redacted).
+    Participant { seat_number: u8 },
+}
+
+/// The single shared authorization check for a game's full state — used
+/// identically by every HTTP handler that returns a `GameStateDto` and by
+/// the `game_events` WebSocket, so the rule can't drift between them.
+pub fn resolve_viewer_access(session: &GameSession, player_id: Option<&str>) -> ViewerAccess {
+    let Some(player_id) = player_id else {
+        return ViewerAccess::Rejected;
+    };
+    // Participant checked first: a creator who also claimed a seat (e.g.
+    // the "vs Engine"/"Play Friend" presets) must resolve to the strictly
+    // more-permissive `Participant` tier, not `Creator`.
+    if let Some(participant) = session
+        .participants
+        .iter()
+        .find(|participant| participant.player_id.as_deref() == Some(player_id))
+    {
+        return ViewerAccess::Participant {
+            seat_number: participant.seat_number,
+        };
+    }
+    if session.creator_player_id.as_deref() == Some(player_id) {
+        return ViewerAccess::Creator;
+    }
+    ViewerAccess::Rejected
+}
+
+/// Redacts a fully-built `GameStateDto` down to what `access` is allowed to
+/// see. Deliberately a separate step from `to_dto()` itself — `to_dto()` is
+/// also used internally for persistence and as the canonical broadcast
+/// payload, both of which need full fidelity; redaction only happens at the
+/// point a `GameStateDto` actually leaves the server to a specific caller.
+/// Callers must have already turned `ViewerAccess::Rejected` into a 401/403
+/// before reaching here — this function has no rejected case to handle.
+pub fn redact_game_state(mut dto: GameStateDto, access: &ViewerAccess) -> GameStateDto {
+    let visible_seat = match access {
+        ViewerAccess::Rejected => None,
+        ViewerAccess::Creator => None,
+        ViewerAccess::Participant { seat_number } => Some(*seat_number),
+    };
+    for (seat_number, rack) in dto.racks.iter_mut().enumerate() {
+        if visible_seat != Some(seat_number as u8) {
+            *rack = RackDto {
+                counts: Vec::new(),
+                blanks: 0,
+            };
+        }
+    }
+    if !matches!(access, ViewerAccess::Participant { .. }) {
+        dto.messages.clear();
+    }
+    dto
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ParticipantState {
     pub seat_number: u8,
@@ -110,6 +200,7 @@ pub struct GameSession {
     pub bag: Vec<Tile>,
     pub participants: Vec<ParticipantState>,
     pub moves: Vec<MoveRecord>,
+    pub messages: Vec<ChatMessageRecord>,
     pub consecutive_scoreless_turns: u8,
     pub move_time_limit_seconds: u64,
     /// Unix seconds (as a string, matching the rest of the codebase's
@@ -154,6 +245,7 @@ impl GameSession {
             bag,
             participants,
             moves: Vec::new(),
+            messages: Vec::new(),
             consecutive_scoreless_turns: 0,
             move_time_limit_seconds,
             turn_started_at: now_unix_seconds().to_string(),
@@ -300,7 +392,54 @@ impl GameSession {
                     description: record.description.clone(),
                 })
                 .collect(),
+            messages: self
+                .messages
+                .iter()
+                .map(|record| ChatMessageDto {
+                    id: record.id.clone(),
+                    player_id: record.player_id.clone(),
+                    display_name: record.display_name.clone(),
+                    body: record.body.clone(),
+                    created_at: record.created_at.clone(),
+                })
+                .collect(),
         }
+    }
+
+    /// Rejects unless `player_id` currently holds a seat — the same
+    /// `resolve_viewer_access` rule used for chat *viewing* governs
+    /// *posting* too, so the two can't drift apart. Not gated on game
+    /// status: players can still chat after a game finishes, and for the
+    /// week until it's auto-expired.
+    pub fn post_chat_message(
+        &mut self,
+        player_id: &str,
+        display_name: &str,
+        body: String,
+    ) -> Result<(), String> {
+        if !matches!(
+            resolve_viewer_access(self, Some(player_id)),
+            ViewerAccess::Participant { .. }
+        ) {
+            return Err("Only seated players can chat in this game".to_string());
+        }
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            return Err("Chat message cannot be empty".to_string());
+        }
+        if body.chars().count() > MAX_CHAT_MESSAGE_LEN {
+            return Err(format!(
+                "Chat message cannot exceed {MAX_CHAT_MESSAGE_LEN} characters"
+            ));
+        }
+        self.messages.push(ChatMessageRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            player_id: player_id.to_string(),
+            display_name: display_name.to_string(),
+            body,
+            created_at: now_unix_seconds().to_string(),
+        });
+        Ok(())
     }
 
     pub fn apply_place_move(
@@ -861,5 +1000,162 @@ struct PositionDtoToRules;
 impl PositionDtoToRules {
     fn convert(position: PositionDto) -> rules_shared::Position {
         rules_shared::Position::new(position.x, position.y)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn participant(seat_number: u8, kind: SeatKind, player_id: Option<&str>) -> ParticipantState {
+        ParticipantState {
+            seat_number,
+            kind,
+            display_name: format!("Seat {seat_number}"),
+            player_id: player_id.map(str::to_string),
+            engine_id: None,
+            score: 0,
+            rack: Rack::default(),
+            resigned: false,
+        }
+    }
+
+    fn two_human_game(creator_player_id: Option<&str>) -> GameSession {
+        GameSession::new(
+            "game-1".to_string(),
+            vec![
+                participant(0, SeatKind::Human, Some("alice")),
+                participant(1, SeatKind::Human, Some("bob")),
+            ],
+            creator_player_id.map(str::to_string),
+            42,
+            VariantRules::official(),
+            3600,
+        )
+    }
+
+    #[test]
+    fn resolve_viewer_access_prefers_participant_over_creator() {
+        // Alice both created the game and claimed seat 0 (the common "vs
+        // Engine"/"Play Friend" preset case) — must resolve to the
+        // strictly more-permissive `Participant`, not `Creator`.
+        let game = two_human_game(Some("alice"));
+        assert_eq!(
+            resolve_viewer_access(&game, Some("alice")),
+            ViewerAccess::Participant { seat_number: 0 }
+        );
+    }
+
+    #[test]
+    fn resolve_viewer_access_recognizes_an_unseated_creator() {
+        let game = two_human_game(Some("carol"));
+        assert_eq!(
+            resolve_viewer_access(&game, Some("carol")),
+            ViewerAccess::Creator
+        );
+    }
+
+    #[test]
+    fn resolve_viewer_access_recognizes_a_seated_non_creator() {
+        let game = two_human_game(Some("carol"));
+        assert_eq!(
+            resolve_viewer_access(&game, Some("bob")),
+            ViewerAccess::Participant { seat_number: 1 }
+        );
+    }
+
+    #[test]
+    fn resolve_viewer_access_rejects_an_unrelated_logged_in_player() {
+        let game = two_human_game(Some("carol"));
+        assert_eq!(
+            resolve_viewer_access(&game, Some("mallory")),
+            ViewerAccess::Rejected
+        );
+    }
+
+    #[test]
+    fn resolve_viewer_access_rejects_anyone_not_logged_in() {
+        let game = two_human_game(Some("carol"));
+        assert_eq!(resolve_viewer_access(&game, None), ViewerAccess::Rejected);
+    }
+
+    #[test]
+    fn redact_game_state_creator_tier_hides_every_rack_and_all_chat() {
+        let mut game = two_human_game(Some("carol"));
+        game.participants[0].rack.counts[0] = 3;
+        game.messages.push(ChatMessageRecord {
+            id: "m1".to_string(),
+            player_id: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            body: "hi".to_string(),
+            created_at: "0".to_string(),
+        });
+        let dto = redact_game_state(game.to_dto(), &ViewerAccess::Creator);
+        assert!(dto.racks.iter().all(|rack| rack.counts.is_empty()));
+        assert!(dto.messages.is_empty());
+    }
+
+    #[test]
+    fn redact_game_state_participant_tier_keeps_only_their_own_rack() {
+        let mut game = two_human_game(Some("carol"));
+        game.participants[0].rack.counts[0] = 3;
+        game.participants[1].rack.counts[1] = 5;
+        game.messages.push(ChatMessageRecord {
+            id: "m1".to_string(),
+            player_id: "alice".to_string(),
+            display_name: "Alice".to_string(),
+            body: "hi".to_string(),
+            created_at: "0".to_string(),
+        });
+        let dto = redact_game_state(game.to_dto(), &ViewerAccess::Participant { seat_number: 0 });
+        // Seat 0 (this viewer) keeps their own rack contents...
+        assert_eq!(dto.racks[0].counts[0], 3);
+        // ...but seat 1's rack — the opponent's tiles — is redacted, not
+        // leaked. This is the direct regression test for the original
+        // finding: every seat's rack used to travel unconditionally.
+        assert!(dto.racks[1].counts.is_empty());
+        assert_eq!(dto.messages.len(), 1);
+    }
+
+    #[test]
+    fn post_chat_message_rejects_a_non_seated_player() {
+        let mut game = two_human_game(Some("carol"));
+        let result = game.post_chat_message("mallory", "Mallory", "hi".to_string());
+        assert!(result.is_err());
+        assert!(game.messages.is_empty());
+    }
+
+    #[test]
+    fn post_chat_message_rejects_an_unseated_creator() {
+        let mut game = two_human_game(Some("carol"));
+        let result = game.post_chat_message("carol", "Carol", "hi".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn post_chat_message_rejects_an_empty_body() {
+        let mut game = two_human_game(Some("alice"));
+        let result = game.post_chat_message("alice", "Alice", "   ".to_string());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn post_chat_message_rejects_an_over_length_body() {
+        let mut game = two_human_game(Some("alice"));
+        let body = "x".repeat(MAX_CHAT_MESSAGE_LEN + 1);
+        let result = game.post_chat_message("alice", "Alice", body);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn post_chat_message_appends_for_a_seated_player() {
+        let mut game = two_human_game(Some("alice"));
+        game.post_chat_message("bob", "Bob", "  gg  ".to_string())
+            .expect("bob is seated and should be able to chat");
+        assert_eq!(game.messages.len(), 1);
+        assert_eq!(game.messages[0].player_id, "bob");
+        assert_eq!(game.messages[0].display_name, "Bob");
+        // Trimmed, matching `post_chat_message`'s own doc comment.
+        assert_eq!(game.messages[0].body, "gg");
     }
 }

@@ -265,6 +265,7 @@ pub fn RootApp() -> Element {
             let game_id = current_game.id.clone();
             websocket_game_id.set(Some(game_id.clone()));
             let server_url = server_url.clone();
+            let token = session().map(|current| current.session_token.clone());
             spawn(async move {
                 // Keep retrying for as long as this is still the selected
                 // game — a dropped connection (network blip, server
@@ -273,7 +274,9 @@ pub fn RootApp() -> Element {
                 // `IS_ONLINE` on connect/disconnect (see `mark_online` /
                 // `mark_offline`); this loop just keeps trying.
                 while websocket_game_id().as_deref() == Some(game_id.as_str()) {
-                    let _ = subscribe_to_game_events(&server_url, &game_id, game).await;
+                    let _ =
+                        subscribe_to_game_events(&server_url, &game_id, token.as_deref(), game)
+                            .await;
                     if websocket_game_id().as_deref() != Some(game_id.as_str()) {
                         break;
                     }
@@ -326,6 +329,16 @@ pub fn RootApp() -> Element {
     // after the fact.
     let viewer_rack_seat = viewer_rack_seat(&game_for_view, viewer_player_id.as_deref());
     let can_view_rack = viewer_rack_seat.is_some();
+    // Mirrors the server's `resolve_viewer_access` `Participant` tier
+    // exactly — a genuinely claimed seat, not `viewer_rack_seat`'s looser
+    // "unclaimed seat is open to anyone" allowance. A creator watching
+    // their own game (e.g. Bot Showdown) or a spectator never gets chat.
+    let can_chat = viewer_player_id.as_deref().is_some_and(|viewer_id| {
+        game_for_view
+            .participants
+            .iter()
+            .any(|participant| participant.player_id.as_deref() == Some(viewer_id))
+    });
     let unordered_rack_tiles =
         rack_tiles_for_seat(&game_for_view, viewer_rack_seat, &staged_placements());
     if rack_order().len() != unordered_rack_tiles.len() {
@@ -367,6 +380,7 @@ pub fn RootApp() -> Element {
     let server_url_for_start = server_url.clone();
     let server_url_for_exchange = server_url.clone();
     let server_url_for_pass = server_url.clone();
+    let server_url_for_chat = server_url.clone();
     let server_url_for_resign = server_url.clone();
     let server_url_for_manual = server_url.clone();
     let game_for_home = game_for_view.clone();
@@ -505,10 +519,11 @@ pub fn RootApp() -> Element {
                     },
                     on_select: move |game_id: String| {
                         let server_url = server_url_for_select.clone();
+                        let token = session().map(|current| current.session_token.clone());
                         spawn(async move {
                             is_loading.set(true);
                             error_message.set(None);
-                            match load_game_by_id(&server_url, &game_id).await {
+                            match load_game_by_id(&server_url, &game_id, token.as_deref()).await {
                                 Ok(loaded) => {
                                     info_message.set(None);
                                     reset_composer_state(
@@ -1027,6 +1042,23 @@ pub fn RootApp() -> Element {
                             });
                         }
                     },
+                    can_chat,
+                    on_send_chat: move |body: String| {
+                        let server_url = server_url_for_chat.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                error_message.set(None);
+                                match submit_chat_message(&server_url, &current_game, body, token.as_deref())
+                                    .await
+                                {
+                                    Ok(updated) => game.set(Some(updated)),
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                            });
+                        }
+                    },
                     can_resign: can_submit_human_action && !exchange_mode(),
                     on_resign: move |_| {
                         let server_url = server_url_for_resign.clone();
@@ -1217,6 +1249,7 @@ fn empty_live_game() -> GameStateDto {
             blanks: 0,
         }],
         moves: vec![],
+        messages: vec![],
     }
 }
 
@@ -1321,8 +1354,12 @@ async fn validate_session(server_url: &str, session_token: &str) -> Result<api::
     post_json(&format!("{server_url}/auth/validate"), None, &request).await
 }
 
-async fn load_game_by_id(server_url: &str, game_id: &str) -> Result<GameStateDto, String> {
-    get_json::<GameStateDto>(&format!("{server_url}/games/{game_id}")).await
+async fn load_game_by_id(
+    server_url: &str,
+    game_id: &str,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    get_json_auth::<GameStateDto>(&format!("{server_url}/games/{game_id}"), token).await
 }
 
 /// A bare reachability probe — unlike `get_json`, doesn't care about the
@@ -1423,7 +1460,7 @@ async fn load_summaries_and_game(
             let target_id = preferred_game_id.or_else(|| summaries.first().map(|s| s.id.clone()));
             game_summaries.set(summaries);
             match target_id {
-                Some(game_id) => match load_game_by_id(server_url, &game_id).await {
+                Some(game_id) => match load_game_by_id(server_url, &game_id, Some(token)).await {
                     Ok(loaded) => {
                         info_message.set(None);
                         reset_composer_state(
@@ -1495,6 +1532,23 @@ async fn submit_pass(
         action: api::PlayerActionDto::Pass,
     };
     post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
+}
+
+/// Not routed through `submit_pass`/`submit_resign`'s `GameActionRequest`
+/// shape — chat has its own endpoint, not gated by turn ownership (see the
+/// matching note on the server's `post_chat_message` handler).
+async fn submit_chat_message(
+    server_url: &str,
+    game: &GameStateDto,
+    body: String,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    post_json(
+        &format!("{server_url}/games/{}/chat", game.id),
+        token,
+        &api::PostChatMessageRequest { body },
+    )
+    .await
 }
 
 async fn submit_resign(
@@ -1788,18 +1842,20 @@ where
 async fn subscribe_to_game_events(
     server_url: &str,
     game_id: &str,
+    token: Option<&str>,
     game_signal: Signal<Option<GameStateDto>>,
 ) -> Result<(), String> {
-    subscribe_to_game_events_impl(server_url, game_id, game_signal).await
+    subscribe_to_game_events_impl(server_url, game_id, token, game_signal).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn subscribe_to_game_events_impl(
     server_url: &str,
     game_id: &str,
+    token: Option<&str>,
     mut game_signal: Signal<Option<GameStateDto>>,
 ) -> Result<(), String> {
-    let ws_url = websocket_url(server_url, game_id)?;
+    let ws_url = websocket_url(server_url, game_id, token)?;
     let (stream, _) = connect_async(ws_url).await.map_err(|_| mark_offline())?;
     mark_online();
     let (_, mut read) = stream.split();
@@ -1829,9 +1885,10 @@ async fn subscribe_to_game_events_impl(
 async fn subscribe_to_game_events_impl(
     server_url: &str,
     game_id: &str,
+    token: Option<&str>,
     mut game_signal: Signal<Option<GameStateDto>>,
 ) -> Result<(), String> {
-    let ws_url = websocket_url(server_url, game_id)?;
+    let ws_url = websocket_url(server_url, game_id, token)?;
     let mut read = WebSocket::open(&ws_url).map_err(|_| mark_offline())?;
     mark_online();
 
@@ -1856,12 +1913,16 @@ async fn subscribe_to_game_events_impl(
     Ok(())
 }
 
-fn websocket_url(server_url: &str, game_id: &str) -> Result<String, String> {
+/// `token` travels as a query parameter, not the `Authorization` header
+/// every other request uses — browsers' native `WebSocket` API can't set
+/// custom headers on the handshake. Session tokens are plain UUIDs (hex
+/// digits and hyphens only), so no percent-encoding is needed here.
+fn websocket_url(server_url: &str, game_id: &str, token: Option<&str>) -> Result<String, String> {
     if let Some(url) = server_url.strip_prefix("http://") {
-        return Ok(format!("ws://{url}/games/{game_id}/events"));
+        return Ok(with_token_query(format!("ws://{url}/games/{game_id}/events"), token));
     }
     if let Some(url) = server_url.strip_prefix("https://") {
-        return Ok(format!("wss://{url}/games/{game_id}/events"));
+        return Ok(with_token_query(format!("wss://{url}/games/{game_id}/events"), token));
     }
     // An empty `server_url` means "same origin as the page" (see
     // `default_server_url` — used when a reverse proxy serves both the
@@ -1869,13 +1930,20 @@ fn websocket_url(server_url: &str, game_id: &str) -> Result<String, String> {
     // deployment). There's no explicit scheme/host to rewrite in that case,
     // so it's derived from the browser's own location instead.
     if server_url.is_empty() {
-        return same_origin_websocket_url(game_id);
+        return same_origin_websocket_url(game_id, token);
     }
     Err(format!("Unsupported server url: {server_url}"))
 }
 
+fn with_token_query(url: String, token: Option<&str>) -> String {
+    match token {
+        Some(token) => format!("{url}?token={token}"),
+        None => url,
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
-fn same_origin_websocket_url(game_id: &str) -> Result<String, String> {
+fn same_origin_websocket_url(game_id: &str, token: Option<&str>) -> Result<String, String> {
     let location = web_sys::window()
         .ok_or_else(|| "No browser window available".to_string())?
         .location();
@@ -1886,14 +1954,17 @@ fn same_origin_websocket_url(game_id: &str) -> Result<String, String> {
         .host()
         .map_err(|_| "Could not read page host".to_string())?;
     let ws_scheme = if protocol == "https:" { "wss" } else { "ws" };
-    Ok(format!("{ws_scheme}://{host}/games/{game_id}/events"))
+    Ok(with_token_query(
+        format!("{ws_scheme}://{host}/games/{game_id}/events"),
+        token,
+    ))
 }
 
 /// The desktop build never runs with a same-origin (empty) `server_url` — it
 /// always talks to an explicit configured server — so this is unreachable
 /// in practice; it exists only so `websocket_url` compiles for both targets.
 #[cfg(not(target_arch = "wasm32"))]
-fn same_origin_websocket_url(_game_id: &str) -> Result<String, String> {
+fn same_origin_websocket_url(_game_id: &str, _token: Option<&str>) -> Result<String, String> {
     Err("Same-origin server URLs are only supported on the web build".to_string())
 }
 
@@ -2578,18 +2649,26 @@ mod tests {
     #[test]
     fn websocket_url_rewrites_http_and_https_schemes() {
         assert_eq!(
-            websocket_url("http://example.com:3000", "game-1"),
+            websocket_url("http://example.com:3000", "game-1", None),
             Ok("ws://example.com:3000/games/game-1/events".to_string())
         );
         assert_eq!(
-            websocket_url("https://example.com", "game-1"),
+            websocket_url("https://example.com", "game-1", None),
             Ok("wss://example.com/games/game-1/events".to_string())
         );
     }
 
     #[test]
+    fn websocket_url_appends_a_token_query_parameter_when_present() {
+        assert_eq!(
+            websocket_url("http://example.com:3000", "game-1", Some("tok-123")),
+            Ok("ws://example.com:3000/games/game-1/events?token=tok-123".to_string())
+        );
+    }
+
+    #[test]
     fn websocket_url_rejects_an_unrecognized_scheme() {
-        assert!(websocket_url("ftp://example.com", "game-1").is_err());
+        assert!(websocket_url("ftp://example.com", "game-1", None).is_err());
     }
 
     #[test]
@@ -2599,7 +2678,7 @@ mod tests {
         // server_url (it always talks to an explicit configured server),
         // so this just confirms the fallback doesn't panic — same-origin
         // resolution itself is only meaningful in a browser.
-        assert!(websocket_url("", "game-1").is_err());
+        assert!(websocket_url("", "game-1", None).is_err());
     }
 
     #[test]

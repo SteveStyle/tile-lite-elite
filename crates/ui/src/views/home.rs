@@ -2,6 +2,7 @@ use crate::{
     app::{MovePreviewView, RackTileView, StagedPlacementView},
     components::{board_view::BoardView, rack_view::RackView},
     edition_label::edition_label,
+    time_format::format_relative_time,
 };
 use api::{DirectionDto, GameStateDto, GameStatus, TileDto};
 use dioxus::prelude::*;
@@ -44,6 +45,8 @@ pub fn Home(
     is_your_turn: bool,
     can_pass: bool,
     on_pass: EventHandler<()>,
+    can_chat: bool,
+    on_send_chat: EventHandler<String>,
     can_resign: bool,
     on_resign: EventHandler<()>,
     can_submit_manual: bool,
@@ -107,6 +110,7 @@ pub fn Home(
     // Resigning ends the game outright, so it's gated behind an explicit
     // confirmation rather than firing straight off the button click.
     let mut confirming_resign = use_signal(|| false);
+    let mut chat_draft = use_signal(String::new);
     // Cloned for the `move` keydown closure below — `rules` itself is
     // still needed afterward (passed into `BoardView`/`RackView`).
     let rules_for_keydown = rules.clone();
@@ -352,6 +356,54 @@ pub fn Home(
                             }
                         }
                     }
+
+                    if can_chat {
+                        div { class: "chat-panel",
+                            div { class: "chat-messages",
+                                if game.messages.is_empty() {
+                                    p { class: "chat-empty", "No messages yet" }
+                                }
+                                for message in game.messages.iter() {
+                                    div { key: "{message.id}", class: "chat-message",
+                                        span { class: "chat-message-sender", "{message.display_name}" }
+                                        span { class: "chat-message-body", "{message.body}" }
+                                        span { class: "chat-message-time", "{format_relative_time(&message.created_at)}" }
+                                    }
+                                }
+                            }
+                            div { class: "chat-composer",
+                                input {
+                                    class: "chat-input",
+                                    r#type: "text",
+                                    placeholder: "Say something...",
+                                    value: "{chat_draft}",
+                                    oninput: move |event| chat_draft.set(event.value()),
+                                    onkeydown: move |event| {
+                                        if event.key() == Key::Enter {
+                                            event.prevent_default();
+                                            let body = chat_draft().trim().to_string();
+                                            if !body.is_empty() {
+                                                chat_draft.set(String::new());
+                                                on_send_chat.call(body);
+                                            }
+                                        }
+                                    },
+                                }
+                                button {
+                                    class: "toggle-button",
+                                    disabled: chat_draft().trim().is_empty(),
+                                    onclick: move |_| {
+                                        let body = chat_draft().trim().to_string();
+                                        if !body.is_empty() {
+                                            chat_draft.set(String::new());
+                                            on_send_chat.call(body);
+                                        }
+                                    },
+                                    "Send"
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -532,6 +584,7 @@ mod tests {
             board: Vec::new(),
             racks: Vec::new(),
             moves: Vec::new(),
+            messages: Vec::new(),
         }
     }
 

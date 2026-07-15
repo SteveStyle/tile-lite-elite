@@ -8,7 +8,8 @@ use api::{
     AdminGameSummaryDto, AdminResetPasswordRequest, ApiError, ChangePasswordRequest,
     CreateGameRequest, GameActionRequest, GameEventDto, GameInvitationDto, InvitationStatus,
     InvitePlayerRequest, LoginPlayerRequest, PlayerActionDto, PlayerDto, PlayerSessionDto,
-    PreviewMoveRequest, RegisterPlayerRequest, StartGameRequest, ValidateSessionRequest,
+    PostChatMessageRequest, PreviewMoveRequest, RegisterPlayerRequest, StartGameRequest,
+    ValidateSessionRequest,
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Path, Query, Request, State, WebSocketUpgrade};
@@ -24,7 +25,8 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::game_state::{
-    EngineRegistry, GameSession, ParticipantState, move_candidate_from_dto, tile_from_dto,
+    EngineRegistry, GameSession, ParticipantState, ViewerAccess, move_candidate_from_dto,
+    redact_game_state, resolve_viewer_access, tile_from_dto,
 };
 use crate::persistence;
 use rules_shared::format_move_error;
@@ -93,6 +95,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/games/{game_id}", get(get_game))
         .route("/games/{game_id}/start", post(start_game))
         .route("/games/{game_id}/actions", post(submit_action))
+        .route("/games/{game_id}/chat", post(post_chat_message))
         .route("/games/{game_id}/preview", post(preview_move))
         .route("/games/{game_id}/suggest", post(suggest_move))
         .route("/games/{game_id}/events", get(game_events))
@@ -168,6 +171,7 @@ async fn list_games(
         .ok_or_else(|| ApiProblem::unauthorized("Sign in to see your games"))?;
 
     expire_overdue_turns(&state).await;
+    expire_old_finished_games(&state).await;
 
     let last_activity = persistence::last_activity_by_game(&state.db)
         .await
@@ -336,7 +340,8 @@ async fn create_game(
         rules,
         move_time_limit_seconds,
     );
-    let dto = game.to_dto();
+    let access = resolve_viewer_access(&game, Some(&creator_player_id));
+    let dto = redact_game_state(game.to_dto(), &access);
 
     persistence::save_game(&state.db, &game)
         .await
@@ -378,14 +383,23 @@ async fn create_game(
 async fn get_game(
     Path(game_id): Path<String>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers).await;
+
     expire_overdue_turn(&state, &game_id).await;
 
     let games = state.games.read().await;
     let game = games
         .get(&game_id)
         .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
-    Ok(Json(game.to_dto()))
+    let access = resolve_viewer_access(game, caller_player_id.as_deref());
+    if access == ViewerAccess::Rejected {
+        return Err(ApiProblem::unauthorized(
+            "Sign in and be part of this game to view it",
+        ));
+    }
+    Ok(Json(redact_game_state(game.to_dto(), &access)))
 }
 
 async fn start_game(
@@ -396,7 +410,7 @@ async fn start_game(
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
     let caller_player_id = authenticated_player_id(&state, &headers).await;
 
-    let dto = {
+    let (dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -438,15 +452,27 @@ async fn start_game(
         persistence::save_game(&state.db, game)
             .await
             .map_err(ApiProblem::from_sqlx)?;
-        dto
+        // For an all-engine game, `caller_player_id` may belong to nobody
+        // tied to this game at all (any signed-in user may start it, per
+        // the check above) — `resolve_viewer_access` correctly resolves
+        // that case to `Rejected`, and `redact_game_state` already treats
+        // `Rejected` the same as `Creator` (no racks, no chat) rather than
+        // panicking, so this is safe to call unconditionally here.
+        let access = resolve_viewer_access(game, caller_player_id.as_deref());
+        (dto, access)
     };
 
     tracing::info!(game_id = %dto.id, status = ?dto.status, "game started");
 
+    // Broadcast the *unredacted* dto — each connected socket redacts it to
+    // its own viewer's tier in `stream_events`, right before sending. A
+    // pre-redacted broadcast would mean every other connection's own
+    // redaction step operates on already-stripped data (e.g. losing their
+    // own rack because *this* caller's tier didn't include it).
     let _ = state
         .events
         .send(GameEventDto::GameStarted { game: dto.clone() });
-    Ok(Json(dto))
+    Ok(Json(redact_game_state(dto, &access)))
 }
 
 async fn submit_action(
@@ -459,7 +485,7 @@ async fn submit_action(
 
     expire_overdue_turn(&state, &game_id).await;
 
-    let dto = {
+    let (dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -513,9 +539,12 @@ async fn submit_action(
         persistence::save_game(&state.db, game)
             .await
             .map_err(ApiProblem::from_sqlx)?;
-        dto
+        let access = resolve_viewer_access(game, caller_player_id.as_deref());
+        (dto, access)
     };
 
+    // Broadcast the unredacted dto — per-connection redaction happens in
+    // `stream_events`, not here (see the identical note in `start_game`).
     let event = if dto.status == api::GameStatus::Finished {
         tracing::info!(game_id = %dto.id, winner_seat = ?dto.winner_seat, "game finished");
         GameEventDto::GameFinished { game: dto.clone() }
@@ -524,7 +553,52 @@ async fn submit_action(
     };
     let _ = state.events.send(event);
 
-    Ok(Json(dto))
+    Ok(Json(redact_game_state(dto, &access)))
+}
+
+/// Not routed through `submit_action`/`PlayerActionDto` — that pipeline
+/// enforces turn ownership (`seat_number` must match `current_seat`), and
+/// chat must work regardless of whose turn it is, or even after the game
+/// has finished. Not gated on game status for the same reason — players can
+/// still chat during the week between a game finishing and its auto-expiry.
+async fn post_chat_message(
+    Path(game_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PostChatMessageRequest>,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to chat"))?;
+
+    let (dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+        let display_name = game
+            .participants
+            .iter()
+            .find(|participant| participant.player_id.as_deref() == Some(caller_player_id.as_str()))
+            .map(|participant| participant.display_name.clone())
+            .ok_or_else(|| ApiProblem::unauthorized("Only seated players can chat in this game"))?;
+
+        game.post_chat_message(&caller_player_id, &display_name, request.body)
+            .map_err(ApiProblem::bad_request)?;
+
+        let dto = game.to_dto();
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        let access = resolve_viewer_access(game, Some(&caller_player_id));
+        (dto, access)
+    };
+
+    // Broadcast the unredacted dto — per-connection redaction happens in
+    // `stream_events`, not here (see the identical note in `start_game`).
+    let _ = state.events.send(GameEventDto::StateUpdated { game: dto.clone() });
+    Ok(Json(redact_game_state(dto, &access)))
 }
 
 async fn preview_move(
@@ -619,7 +693,7 @@ async fn suggest_move(
 
     expire_overdue_turn(&state, &game_id).await;
 
-    let dto = {
+    let (dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -676,9 +750,12 @@ async fn suggest_move(
         persistence::save_game(&state.db, game)
             .await
             .map_err(ApiProblem::from_sqlx)?;
-        dto
+        let access = resolve_viewer_access(game, caller_player_id.as_deref());
+        (dto, access)
     };
 
+    // Broadcast the unredacted dto — per-connection redaction happens in
+    // `stream_events`, not here (see the identical note in `start_game`).
     let event = if dto.status == api::GameStatus::Finished {
         tracing::info!(game_id = %dto.id, winner_seat = ?dto.winner_seat, "game finished");
         GameEventDto::GameFinished { game: dto.clone() }
@@ -687,25 +764,60 @@ async fn suggest_move(
     };
     let _ = state.events.send(event);
 
-    Ok(Json(dto))
+    Ok(Json(redact_game_state(dto, &access)))
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct EventsQuery {
+    token: Option<String>,
+}
+
+/// Browsers' native `WebSocket` API can't set custom headers on the
+/// handshake, so unlike every other endpoint the session token travels as
+/// a query parameter here instead of `Authorization: Bearer` — see
+/// `player_id_for_token`. Previously this endpoint had no auth check at
+/// all: anyone who knew or guessed a `game_id`, logged in or not, could
+/// connect and receive that game's full state, including every seat's
+/// rack. Now it's gated by the same `resolve_viewer_access` rule as every
+/// other game-state endpoint, and `stream_events` redacts each outgoing
+/// event to this specific connection's resolved tier.
 async fn game_events(
     Path(game_id): Path<String>,
     State(state): State<AppState>,
+    Query(query): Query<EventsQuery>,
     websocket: WebSocketUpgrade,
-) -> impl IntoResponse {
-    websocket.on_upgrade(move |socket| stream_events(socket, game_id, state.events.subscribe()))
+) -> Response {
+    let player_id = match query.token {
+        Some(token) => player_id_for_token(&state, &token).await,
+        None => None,
+    };
+
+    let access = {
+        let games = state.games.read().await;
+        let Some(game) = games.get(&game_id) else {
+            return (StatusCode::NOT_FOUND, "Game not found").into_response();
+        };
+        resolve_viewer_access(game, player_id.as_deref())
+    };
+    if access == ViewerAccess::Rejected {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "Sign in and be part of this game to watch it live",
+        )
+            .into_response();
+    }
+
+    websocket
+        .on_upgrade(move |socket| stream_events(socket, game_id, access, state.events.subscribe()))
 }
 
 /// `state.events` is a single broadcast channel shared by every game on the
 /// server, not one per game — every subscriber sees every game's events
 /// unless it filters, which this previously didn't do at all (the path's
 /// `game_id` was captured but never used). That meant a socket opened for
-/// one game silently received full state — including every seat's rack —
-/// for every other game in progress too. The client already discarded
-/// non-matching events, so this was invisible in normal play, but the
-/// leak was real on the wire.
+/// one game silently received full state for every other game in progress
+/// too. The client already discarded non-matching events, so this was
+/// invisible in normal play, but the leak was real on the wire.
 fn event_belongs_to_game(event: &GameEventDto, game_id: &str) -> bool {
     let game = match event {
         GameEventDto::StateUpdated { game }
@@ -715,11 +827,38 @@ fn event_belongs_to_game(event: &GameEventDto, game_id: &str) -> bool {
     game.id == game_id
 }
 
-async fn stream_events(mut socket: WebSocket, game_id: String, mut rx: broadcast::Receiver<GameEventDto>) {
+/// Redacts an event's embedded `GameStateDto` to `access`'s tier before
+/// forwarding it to this specific connection. The broadcast itself always
+/// carries the full, unredacted state (every HTTP handler broadcasts that
+/// way too — see the "broadcast the unredacted dto" notes throughout this
+/// file); redaction only ever happens at the point data actually leaves the
+/// server to a specific caller, which for a WebSocket is here, per message,
+/// not once at connection time.
+fn redact_event(event: GameEventDto, access: &ViewerAccess) -> GameEventDto {
+    match event {
+        GameEventDto::StateUpdated { game } => GameEventDto::StateUpdated {
+            game: redact_game_state(game, access),
+        },
+        GameEventDto::GameStarted { game } => GameEventDto::GameStarted {
+            game: redact_game_state(game, access),
+        },
+        GameEventDto::GameFinished { game } => GameEventDto::GameFinished {
+            game: redact_game_state(game, access),
+        },
+    }
+}
+
+async fn stream_events(
+    mut socket: WebSocket,
+    game_id: String,
+    access: ViewerAccess,
+    mut rx: broadcast::Receiver<GameEventDto>,
+) {
     while let Ok(event) = rx.recv().await {
         if !event_belongs_to_game(&event, &game_id) {
             continue;
         }
+        let event = redact_event(event, &access);
 
         let message = match serde_json::to_string(&event) {
             Ok(message) => message,
@@ -1069,7 +1208,7 @@ async fn accept_invitation(
             }
         })?;
 
-    let dto = {
+    let (dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&record.game_id)
@@ -1085,7 +1224,8 @@ async fn accept_invitation(
         persistence::save_game(&state.db, game)
             .await
             .map_err(ApiProblem::from_sqlx)?;
-        dto
+        let access = resolve_viewer_access(game, Some(&caller_player_id));
+        (dto, access)
     };
 
     tracing::info!(
@@ -1096,8 +1236,10 @@ async fn accept_invitation(
         "invitation accepted; seat claimed"
     );
 
+    // Broadcast the unredacted dto — per-connection redaction happens in
+    // `stream_events`, not here (see the identical note in `start_game`).
     let _ = state.events.send(GameEventDto::StateUpdated { game: dto.clone() });
-    Ok(Json(dto))
+    Ok(Json(redact_game_state(dto, &access)))
 }
 
 async fn reject_invitation(
@@ -1184,7 +1326,15 @@ async fn authenticated_player_id(state: &AppState, headers: &HeaderMap) -> Optio
         .to_str()
         .ok()?
         .strip_prefix("Bearer ")?;
+    player_id_for_token(state, token).await
+}
 
+/// Shared by `authenticated_player_id` (reads the token from the
+/// `Authorization` header, used by every REST call) and `game_events`
+/// (reads it from a query parameter instead — browsers' native `WebSocket`
+/// API can't set custom headers on the handshake, so the token has to
+/// travel some other way for that one endpoint).
+async fn player_id_for_token(state: &AppState, token: &str) -> Option<String> {
     let session = persistence::get_session_by_token_hash(&state.db, &hash_token(token))
         .await
         .ok()??;
@@ -1261,6 +1411,49 @@ async fn expire_overdue_turns(state: &AppState) {
     }
     for dto in finished {
         let _ = state.events.send(GameEventDto::GameFinished { game: dto });
+    }
+}
+
+/// Permanently deletes any game finished more than 7 days ago — chat,
+/// moves, participants, and invitations all go with it (`persistence::delete_game`
+/// is the same cascading delete admin's "delete game" uses). No background
+/// scheduler: called lazily from `list_games`, same as `expire_overdue_turns`.
+///
+/// Concurrency: two callers racing into this (e.g. two participants both
+/// hitting `GET /games` at once) can't corrupt anything or double-fire a
+/// broadcast — (1) the write lock is held across the *entire* sweep,
+/// including the awaited deletes, exactly like `expire_overdue_turns`
+/// already does, so a second concurrent caller simply waits for the first
+/// sweep to finish rather than running alongside it; (2) every step is
+/// independently idempotent as a second line of defense regardless of
+/// locking — a SQL `delete ... where id = ?` on an already-gone row affects
+/// zero rows, and removing an already-removed key from the map is a no-op.
+async fn expire_old_finished_games(state: &AppState) {
+    let now: u64 = now_iso().parse().unwrap_or(0);
+    let cutoff = now.saturating_sub(7 * 24 * 60 * 60).to_string();
+    let stale_ids = match persistence::list_finished_game_ids_older_than(&state.db, &cutoff).await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::error!(%error, "failed to query finished games for expiry");
+            return;
+        }
+    };
+    if stale_ids.is_empty() {
+        return;
+    }
+
+    let mut games = state.games.write().await;
+    for game_id in stale_ids {
+        match persistence::delete_game(&state.db, &game_id).await {
+            Ok(_) => {
+                games.remove(&game_id);
+                tracing::info!(game_id, "finished game auto-deleted after 7 days");
+            }
+            Err(error) => {
+                tracing::error!(game_id, %error, "failed to auto-delete expired game");
+            }
+        }
     }
 }
 
@@ -1813,8 +2006,13 @@ mod tests {
             summary.last_activity_at
         );
 
-        let fetched_response =
-            send_empty(app, Method::GET, &format!("/games/{}", created.id)).await;
+        let fetched_response = send_empty_auth(
+            app,
+            Method::GET,
+            &format!("/games/{}", created.id),
+            Some(&alice.session_token),
+        )
+        .await;
         assert_eq!(fetched_response.status(), StatusCode::OK);
         let fetched: GameStateDto = read_json(fetched_response).await;
         assert_eq!(fetched.id, created.id);
@@ -3228,7 +3426,13 @@ mod tests {
 
         // Turn should not have advanced after a rejected move.
         let fetched: GameStateDto = read_json(
-            send_empty(app, Method::GET, &format!("/games/{}", started.game.id)).await,
+            send_empty_auth(
+                app,
+                Method::GET,
+                &format!("/games/{}", started.game.id),
+                Some(&started.alice.session_token),
+            )
+            .await,
         )
         .await;
         assert_eq!(fetched.current_seat, 0);
@@ -3605,6 +3809,241 @@ mod tests {
         assert!(!event_belongs_to_game(&event_for_b, "game-a"));
     }
 
+    // `game_events`'s auth (query-token lookup, `resolve_viewer_access`,
+    // rejecting before `.on_upgrade()`) isn't covered by an HTTP-level test
+    // here — axum's `WebSocketUpgrade` extractor needs a real hyper
+    // connection's upgrade machinery (an `OnUpgrade` future stashed in
+    // request extensions during actual socket I/O) that a `oneshot`-driven
+    // fake `Request` can't provide, regardless of headers; every attempt
+    // came back `426 Upgrade Required` from the extractor itself, before
+    // reaching this handler's own logic at all. The authorization logic
+    // itself (`resolve_viewer_access`, `redact_game_state`/`redact_event`)
+    // is fully covered by unit tests in `game_state.rs`; the HTTP wiring
+    // (query-token parsing, the pre-upgrade rejection, per-connection
+    // redaction) was verified live in the browser instead.
+
+    #[tokio::test]
+    async fn seated_participant_can_chat_and_it_persists() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+        let started = create_two_human_game(app.clone()).await;
+
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/chat", started.game.id),
+            Some(&started.alice.session_token),
+            &PostChatMessageRequest {
+                body: "  good luck!  ".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let dto: GameStateDto = read_json(response).await;
+        assert_eq!(dto.messages.len(), 1);
+        assert_eq!(dto.messages[0].display_name, "Alice");
+        // Trimmed, per `post_chat_message`'s own contract.
+        assert_eq!(dto.messages[0].body, "good luck!");
+
+        // Shows up for the other seated participant too, via a plain fetch.
+        let fetched: GameStateDto = read_json(
+            send_empty_auth(
+                app,
+                Method::GET,
+                &format!("/games/{}", started.game.id),
+                Some(&started.bob.session_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(fetched.messages.len(), 1);
+        assert_eq!(fetched.messages[0].body, "good luck!");
+    }
+
+    #[tokio::test]
+    async fn a_non_participant_cannot_chat() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+        let started = create_two_human_game(app.clone()).await;
+        let mallory = register_player(app.clone(), "Mallory").await;
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/chat", started.game.id),
+            Some(&mallory.session_token),
+            &PostChatMessageRequest {
+                body: "let me in".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_game_rejects_unauthenticated_and_unrelated_callers() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+        let started = create_two_human_game(app.clone()).await;
+        let mallory = register_player(app.clone(), "Mallory").await;
+
+        let unauthenticated =
+            send_empty(app.clone(), Method::GET, &format!("/games/{}", started.game.id)).await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let unrelated = send_empty_auth(
+            app,
+            Method::GET,
+            &format!("/games/{}", started.game.id),
+            Some(&mallory.session_token),
+        )
+        .await;
+        assert_eq!(unrelated.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn get_game_redacts_racks_and_chat_by_viewer_tier() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+        let started = create_two_human_game(app.clone()).await;
+
+        send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/chat", started.game.id),
+            Some(&started.alice.session_token),
+            &PostChatMessageRequest {
+                body: "hi".to_string(),
+            },
+        )
+        .await;
+
+        // Alice (seat 0) sees her own rack and the chat.
+        let as_alice: GameStateDto = read_json(
+            send_empty_auth(
+                app.clone(),
+                Method::GET,
+                &format!("/games/{}", started.game.id),
+                Some(&started.alice.session_token),
+            )
+            .await,
+        )
+        .await;
+        assert!(!as_alice.racks[0].counts.is_empty());
+        assert!(as_alice.racks[1].counts.is_empty(), "opponent's rack must stay redacted");
+        assert_eq!(as_alice.messages.len(), 1);
+    }
+
+    /// A minimal single-player-vs-engine game, started immediately (no
+    /// invitation dance needed) — for tests that just need *some* game to
+    /// exist in `state.games`/the database and don't care about real
+    /// gameplay. Takes an explicit `creator_name` since a display name can
+    /// only be registered once per test's shared state.
+    async fn create_and_start_engine_game(app: Router, creator_name: &str) -> GameStateDto {
+        let creator = register_player(app.clone(), creator_name).await;
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&creator.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: creator_name.to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                    ],
+                    seed: Some(1),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        read_json(
+            send_json_auth(
+                app,
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                Some(&creator.session_token),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn expire_old_finished_games_deletes_stale_games_but_not_recent_ones() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let old = create_and_start_engine_game(app.clone(), "ExpireOld").await;
+        let recent = create_and_start_engine_game(app.clone(), "ExpireRecent").await;
+
+        // `ended_at` is only ever set in SQL, by `save_game`, based on
+        // `status == Finished` at save time — bypass the normal flow and
+        // write it directly so the test controls the exact age.
+        let now: u64 = now_iso().parse().unwrap_or(0);
+        let eight_days_ago = (now - 8 * 24 * 60 * 60).to_string();
+        let one_day_ago = (now - 24 * 60 * 60).to_string();
+        sqlx::query("update games set status = 'finished', ended_at = ?1 where id = ?2")
+            .bind(&eight_days_ago)
+            .bind(&old.id)
+            .execute(&state.db)
+            .await
+            .expect("update should succeed");
+        sqlx::query("update games set status = 'finished', ended_at = ?1 where id = ?2")
+            .bind(&one_day_ago)
+            .bind(&recent.id)
+            .execute(&state.db)
+            .await
+            .expect("update should succeed");
+        {
+            let mut games = state.games.write().await;
+            for id in [&old.id, &recent.id] {
+                let game = games.get_mut(id).expect("game should exist");
+                game.status = api::GameStatus::Finished;
+            }
+        }
+
+        expire_old_finished_games(&state).await;
+
+        let games = state.games.read().await;
+        assert!(
+            !games.contains_key(&old.id),
+            "a game finished 8 days ago should have been deleted"
+        );
+        assert!(
+            games.contains_key(&recent.id),
+            "a game finished 1 day ago should still be here"
+        );
+        let remaining_ids = persistence::list_game_ids(&state.db)
+            .await
+            .expect("list should succeed");
+        assert!(
+            !remaining_ids.contains(&old.id),
+            "the stale game's row should be gone from the database too"
+        );
+    }
+
     fn empty_live_game_for_test(id: &str) -> GameStateDto {
         GameStateDto {
             id: id.to_string(),
@@ -3624,6 +4063,7 @@ mod tests {
             board: Vec::new(),
             racks: Vec::new(),
             moves: Vec::new(),
+            messages: Vec::new(),
         }
     }
 
@@ -3862,7 +4302,7 @@ mod tests {
     async fn admin_deleting_a_user_unclaims_their_seat_but_keeps_the_game() {
         let database_url = test_database_url();
         let state = create_test_state(&database_url).await;
-        let app = build_router(state);
+        let app = build_router(state.clone());
 
         let alice: PlayerSessionDto = read_json(
             send_json(
@@ -3922,9 +4362,16 @@ mod tests {
         .await;
         assert_eq!(delete_response.status(), StatusCode::NO_CONTENT);
 
-        let fetched: GameStateDto =
-            read_json(send_empty(app, Method::GET, &format!("/games/{}", created.id)).await).await;
-        assert_eq!(fetched.id, created.id, "the game itself should survive");
+        // Alice's session was deleted along with her account, and nobody
+        // else is tied to this game (the seat is now unclaimed, and admin
+        // deletion doesn't touch `creator_player_id` — see its own doc
+        // comment), so there's no longer a legitimate caller who could
+        // fetch it through the normal player-facing endpoint. Assert
+        // directly on the in-memory state instead, which is also a more
+        // direct check of what this test actually cares about.
+        let games = state.games.read().await;
+        let fetched = games.get(&created.id).expect("the game itself should survive");
+        assert_eq!(fetched.id, created.id);
         assert_eq!(
             fetched.participants[0].player_id, None,
             "the seat should be unclaimed, not still pointing at a deleted player"
@@ -4077,7 +4524,13 @@ mod tests {
         assert_eq!(ended.status, api::GameStatus::Finished);
 
         let fetched: GameStateDto = read_json(
-            send_empty(app, Method::GET, &format!("/games/{}", started.game.id)).await,
+            send_empty_auth(
+                app,
+                Method::GET,
+                &format!("/games/{}", started.game.id),
+                Some(&started.alice.session_token),
+            )
+            .await,
         )
         .await;
         assert_eq!(fetched.status, api::GameStatus::Finished);
@@ -4389,8 +4842,16 @@ mod tests {
         .await;
         assert_eq!(reject_response.status(), StatusCode::OK);
 
-        let fetched: GameStateDto =
-            read_json(send_empty(app, Method::GET, &format!("/games/{}", created.id)).await).await;
+        let fetched: GameStateDto = read_json(
+            send_empty_auth(
+                app,
+                Method::GET,
+                &format!("/games/{}", created.id),
+                Some(&alice.session_token),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(fetched.participants[1].player_id, None);
     }
 
@@ -4478,8 +4939,16 @@ mod tests {
             game.turn_started_at = "0".to_string();
         }
 
-        let fetched: GameStateDto =
-            read_json(send_empty(app, Method::GET, &format!("/games/{}", created.id)).await).await;
+        let fetched: GameStateDto = read_json(
+            send_empty_auth(
+                app,
+                Method::GET,
+                &format!("/games/{}", created.id),
+                Some(&alice.session_token),
+            )
+            .await,
+        )
+        .await;
         assert_eq!(fetched.status, api::GameStatus::Finished);
         assert_eq!(fetched.winner_seat, Some(1));
         let last_move = fetched.moves.last().expect("a timeout move should be recorded");

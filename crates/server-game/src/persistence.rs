@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Pool, Row, Sqlite, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
 use std::str::FromStr;
 
-use crate::game_state::{GameSession, MoveRecord, ParticipantState, board_from_dto};
+use crate::game_state::{ChatMessageRecord, GameSession, MoveRecord, ParticipantState, board_from_dto};
 use rules_shared::{Alphabet, GameState, Premium, Score, Tile, VariantRules};
 
 /// Mirrors `rules_shared::VariantRules` field-for-field, but as its own type
@@ -126,6 +126,10 @@ struct PersistedGame {
     bag: Vec<Tile>,
     participants: Vec<ParticipantState>,
     moves: Vec<MoveRecord>,
+    // Missing on any game persisted before chat existed — `Vec::new()` for
+    // those, same pattern as `creator_player_id`.
+    #[serde(default)]
+    messages: Vec<ChatMessageRecord>,
     #[serde(default)]
     consecutive_scoreless_turns: u8,
     #[serde(default = "default_move_time_limit_seconds")]
@@ -253,6 +257,19 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     .await?;
 
     sqlx::query(
+        "create table if not exists game_messages (
+            id text primary key,
+            game_id text not null,
+            player_id text not null,
+            display_name text not null,
+            body text not null,
+            created_at text not null
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         "create table if not exists sessions (
             id text primary key,
             player_id text not null,
@@ -304,6 +321,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         bag: session.bag.clone(),
         participants: session.participants.clone(),
         moves: session.moves.clone(),
+        messages: session.messages.clone(),
         consecutive_scoreless_turns: session.consecutive_scoreless_turns,
         move_time_limit_seconds: session.move_time_limit_seconds,
         turn_started_at: session.turn_started_at.clone(),
@@ -403,6 +421,27 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         .await?;
     }
 
+    sqlx::query("delete from game_messages where game_id = ?1")
+        .bind(&session.id)
+        .execute(pool)
+        .await?;
+
+    for record in &session.messages {
+        sqlx::query(
+            "insert into game_messages (
+                id, game_id, player_id, display_name, body, created_at
+            ) values (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&record.id)
+        .bind(&session.id)
+        .bind(&record.player_id)
+        .bind(&record.display_name)
+        .bind(&record.body)
+        .bind(&record.created_at)
+        .execute(pool)
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -440,6 +479,7 @@ pub async fn load_game(pool: &Pool<Sqlite>, id: &str) -> Result<Option<GameSessi
             bag: persisted.bag,
             participants: persisted.participants,
             moves: persisted.moves,
+            messages: persisted.messages,
             consecutive_scoreless_turns: persisted.consecutive_scoreless_turns,
             move_time_limit_seconds: persisted.move_time_limit_seconds,
             turn_started_at: persisted.turn_started_at,
@@ -449,6 +489,24 @@ pub async fn load_game(pool: &Pool<Sqlite>, id: &str) -> Result<Option<GameSessi
 
 pub async fn list_game_ids(pool: &Pool<Sqlite>) -> Result<Vec<String>, sqlx::Error> {
     let rows = sqlx::query("select id from games order by created_at desc")
+        .fetch_all(pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<String, _>(0))
+        .collect())
+}
+
+/// Games finished more than `cutoff` ago — `ended_at` is set once, in
+/// `save_game`, the moment a game's status becomes `Finished`; it's only
+/// ever tracked here in SQL, never on `GameSession` itself, since nothing
+/// else needs to read it back.
+pub async fn list_finished_game_ids_older_than(
+    pool: &Pool<Sqlite>,
+    cutoff: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let rows = sqlx::query("select id from games where status = 'finished' and ended_at < ?1")
+        .bind(cutoff)
         .fetch_all(pool)
         .await?;
     Ok(rows
@@ -581,12 +639,16 @@ pub async fn delete_player(pool: &Pool<Sqlite>, player_id: &str) -> Result<bool,
 }
 
 /// Deletes a game and everything that belongs to it (participants, moves,
-/// invitations). Doesn't touch player accounts. Caller is responsible for
-/// also dropping it from the in-memory `AppState.games` map — this only
+/// chat, invitations). Doesn't touch player accounts. Caller is responsible
+/// for also dropping it from the in-memory `AppState.games` map — this only
 /// handles the database side.
 pub async fn delete_game(pool: &Pool<Sqlite>, game_id: &str) -> Result<bool, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query("delete from game_moves where game_id = ?1")
+        .bind(game_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("delete from game_messages where game_id = ?1")
         .bind(game_id)
         .execute(&mut *tx)
         .await?;

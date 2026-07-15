@@ -24,8 +24,19 @@
 	# directives in the order written instead, so the API check happens
 	# first and the SPA fallback only applies to what's left.
 	route {
-		@api path /health /engines /auth/* /games /games/* /players/* /invitations/*
+		@api path /health /engines /auth/* /games /games/* /players/* /invitations/* /dictionaries/*
 		reverse_proxy @api server:3000
+
+		# dx's web build fingerprints every file under /assets with a
+		# content hash (see index.html's script/wasm src attributes) — a
+		# new build always means a new filename, so this exact URL's
+		# bytes can never change. Safe to tell browsers to skip
+		# revalidation entirely instead of a conditional GET on every
+		# load. index.html itself is deliberately left uncached (no
+		# matcher below covers it) since it's what points at the
+		# current hash.
+		@assets path /assets/*
+		header @assets Cache-Control "public, max-age=31536000, immutable"
 
 		root * /srv
 		try_files {path} /index.html

@@ -17,6 +17,7 @@ const DEFAULT_TIME_LIMIT_HOURS: u32 = 72;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NewGameKind {
     VsEngine,
+    VsFriend,
     VsHuman,
     EngineVsEngine,
 }
@@ -65,6 +66,13 @@ fn preset_draft(kind: NewGameKind) -> (bool, Vec<AdditionalSeatDraft>) {
             true,
             vec![AdditionalSeatDraft {
                 kind: AdditionalSeatKind::Engine,
+                name: String::new(),
+            }],
+        ),
+        NewGameKind::VsFriend => (
+            true,
+            vec![AdditionalSeatDraft {
+                kind: AdditionalSeatKind::Named,
                 name: String::new(),
             }],
         ),
@@ -307,30 +315,35 @@ pub fn GamesPanel(
             }
             if can_create {
                 div { class: "games-panel-new-game",
-                    span { class: "games-panel-new-game-label", "New game:" }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::VsEngine, include_creator, additional_seats, time_limit_hours, drafting, variant),
-                        "vs Engine"
+                        onclick: move |_| start_draft(NewGameKind::VsFriend, include_creator, additional_seats, time_limit_hours, drafting, variant),
+                        "Play Friend"
                     }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
                         onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting, variant),
-                        "vs Human"
+                        "Play Stranger"
+                    }
+                    button {
+                        class: "toggle-button",
+                        disabled: is_loading,
+                        onclick: move |_| start_draft(NewGameKind::VsEngine, include_creator, additional_seats, time_limit_hours, drafting, variant),
+                        "Play Greedy Bot"
                     }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
                         onclick: move |_| start_draft(NewGameKind::EngineVsEngine, include_creator, additional_seats, time_limit_hours, drafting, variant),
-                        "Engine vs Engine"
+                        "Bot Showdown!"
                     }
                     button {
                         class: "toggle-button toggle-button-muted",
                         disabled: is_loading,
                         onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting, variant),
-                        "Custom game..."
+                        "New Custom Game..."
                     }
                 }
 
@@ -761,6 +774,15 @@ mod tests {
         assert_eq!(seats[0].display_name, "Alice");
         assert_eq!(seats[1].kind, SeatKind::Engine);
         assert!(seats[1].engine_id.is_some());
+    }
+
+    #[test]
+    fn vs_friend_seat_is_a_named_invitation_waiting_for_a_name() {
+        let (include_creator, additional) = preset_draft(NewGameKind::VsFriend);
+        assert!(include_creator);
+        assert_eq!(additional.len(), 1);
+        assert_eq!(additional[0].kind, AdditionalSeatKind::Named);
+        assert!(additional[0].name.is_empty());
     }
 
     #[test]

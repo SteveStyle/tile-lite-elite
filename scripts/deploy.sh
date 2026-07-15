@@ -56,4 +56,11 @@ ssh "${SSH_OPTS[@]}" "$REMOTE" "
     docker image prune -f > /dev/null
 "
 
+echo "==> Ensuring the 'sa' alias for scrabble-admin is set up on the VM"
+ssh "${SSH_OPTS[@]}" "$REMOTE" "
+    grep -qF 'alias sa=' ~/.bashrc 2>/dev/null || \
+        echo \"alias sa='docker compose -f ~/$DEPLOY_REMOTE_DIR/docker-compose.yml exec server scrabble-admin'\" >> ~/.bashrc \
+        || echo \"    (warning: could not set up the 'sa' alias for scrabble-admin)\"
+"
+
 echo "==> Done — https://$DEPLOY_HOST.sslip.io (or your configured hostname)"

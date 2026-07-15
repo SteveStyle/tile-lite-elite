@@ -210,10 +210,11 @@ The admin CLI — crate `crates/admin-cli`, binary/command name `scrabble-admin`
 
 `scripts/admin.sh` builds `admin-cli` in **release** mode and runs that binary — a plain `cargo run -p admin-cli` builds and runs a *debug* binary instead, which still works but is worth avoiding out of habit now that a script exists to do the right thing by default.
 
-**The Oracle VM's (or any container deployment's) server**: `scripts/admin.sh` can't reach it — it always targets `127.0.0.1`, and that's a different loopback than the VM's, by design (see above; pointing `--server`/`SCRABBLE_PX_API_BASE_URL` at the VM's public address from your own machine just gets a 403, it isn't a workaround). Run it *inside* the server container instead, where `127.0.0.1` genuinely is that container:
+**The Oracle VM's (or any container deployment's) server**: `scripts/admin.sh` can't reach it — it always targets `127.0.0.1`, and that's a different loopback than the VM's, by design (see above; pointing `--server`/`SCRABBLE_PX_API_BASE_URL` at the VM's public address from your own machine just gets a 403, it isn't a workaround). Run it *inside* the server container instead, where `127.0.0.1` genuinely is that container.  An alias 'sa' has been created which allows it to be called from any directory.
 
 ```bash
 ssh -i ~/.ssh/oracle_scrabble ubuntu@129.151.69.246
+sa games list
 cd ~/scrabble-px
 docker compose exec server scrabble-admin games list
 ```
@@ -371,6 +372,31 @@ The live VM has 1GB RAM — not enough to compile the Rust/wasm workspace — so
 This builds both images locally, `docker save`s and gzips them, `scp`s them plus `docker-compose.yml` to the VM, `docker load`s them there, and runs `docker compose up -d`. Takes a few minutes, almost all of it the local build. Configurable via env vars (`DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`, `DEPLOY_REMOTE_DIR`) if the target ever changes — see the script header.
 
 There's no CI and no registry involved — this is a manual, on-demand push from a developer machine, appropriate for a hobby project's actual deploy frequency. Worth revisiting (e.g. push to a registry, `docker compose pull` on the VM instead of scp/load) if that ever changes.
+
+If the change involves schema changes then the database should be backed up and then removed.  It will be recreated when the updated server starts to run.
+
+```bash
+ssh scrabble-px
+cd ~/scrabble-px
+
+# 1. Stop services — leaves the named volumes (scrabble-data, caddy-data,
+#    caddy-config) untouched, just stops the containers so nothing's
+#    writing to the DB while you back it up.
+docker compose down
+
+# 2. Full backup of the data volume (this is docs/operations.md's own
+#    documented backup command) — portable, pull it off the VM if you want
+#    a copy elsewhere.
+docker run --rm -v scrabble-px_scrabble-data:/data -v "$PWD":/backup debian \
+  tar czf /backup/scrabble-data-$(date +%Y%m%d).tgz -C /data .
+
+# 3. Clear the old DB from the volume so the new server starts fresh
+#    (create_if_missing(true) recreates it with the new schema on next
+#    start). Renaming aside instead of deleting, if you'd rather keep a
+#    copy in place as well as the tarball:
+docker run --rm -v scrabble-px_scrabble-data:/data debian \
+  sh -c 'rm -f /data/scrabble-px.sqlite3 /data/scrabble-px.sqlite3-wal /data/scrabble-px.sqlite3-shm'
+```
 
 ### Oracle Cloud VM setup
 
