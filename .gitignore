@@ -39,3 +39,10 @@ node_modules/
 
 # Windows build directory (created by our script)
 ../scrabble-windows-build/
+
+# Claude Code local settings/session state
+.claude/
+
+# PID files written by scripts/services.sh
+.pid.server
+.pid.web
