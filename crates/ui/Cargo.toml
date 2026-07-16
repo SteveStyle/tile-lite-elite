@@ -1,5 +1,5 @@
 [package]
-name = "scrabble-ui"
+name = "tile-lite-elite-ui"
 version = "0.1.0"
 authors = ["Stephen Morris"]
 edition.workspace=true

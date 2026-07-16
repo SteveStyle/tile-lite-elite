@@ -1,13 +1,20 @@
+# Pinned explicitly rather than left to derive from the containing
+# directory's basename — that basename also determines the image tags
+# `docker compose build` produces (`<name>-server`, `<name>-web`), which
+# `scripts/deploy.sh` references by their exact tag, so an unpinned name
+# would silently break `docker save` the moment the directory's renamed.
+name: tile-lite-elite
+
 services:
   server:
     build:
       context: .
       target: runtime-server
     environment:
-      SCRABBLE_PX_BIND: 0.0.0.0:3000
-      SCRABBLE_PX_DATABASE_URL: sqlite:///data/scrabble-px.sqlite3
+      TILE_LITE_ELITE_BIND: 0.0.0.0:3000
+      TILE_LITE_ELITE_DATABASE_URL: sqlite:///data/tile-lite-elite.sqlite3
     volumes:
-      - scrabble-data:/data
+      - tile-lite-elite-data:/data
     restart: unless-stopped
     # Deliberately no `ports:` — only reachable from the `web` container
     # over the compose network, and via `docker compose exec server ...`
@@ -35,8 +42,17 @@ services:
 
 volumes:
   # Named volume rather than a bind mount, so it isn't tied to a specific
-  # host path — back it up with `docker run --rm -v scrabble-px_scrabble-data:/data
-  # -v "$PWD":/backup debian tar czf /backup/scrabble-data.tgz -C /data .`
-  scrabble-data:
+  # host path — back it up with `docker run --rm -v tile-lite-elite-data:/data
+  # -v "$PWD":/backup debian tar czf /backup/tile-lite-elite-data.tgz -C /data .`
+  #
+  # Explicit `name:` on every volume below, rather than letting Compose
+  # derive one from the containing directory's basename — that basename is
+  # otherwise the *actual* volume name (e.g. `scrabble-px_scrabble-data`),
+  # so renaming the project directory would silently start a fresh, empty
+  # volume on next deploy instead of reattaching to the existing one.
+  tile-lite-elite-data:
+    name: tile-lite-elite-data
   caddy-data:
+    name: tile-lite-elite-caddy-data
   caddy-config:
+    name: tile-lite-elite-caddy-config

@@ -95,7 +95,7 @@ pub fn RootApp() -> Element {
     // local dev, where `dx serve`'s web client and the backend run as two
     // separate origins) falls back to the explicit dev address.
     #[cfg(target_arch = "wasm32")]
-    let server_url = option_env!("SCRABBLE_PX_API_BASE_URL")
+    let server_url = option_env!("TILE_LITE_ELITE_API_BASE_URL")
         .map(str::to_string)
         .unwrap_or_else(|| "http://127.0.0.1:3000".to_string());
 
@@ -450,7 +450,7 @@ pub fn RootApp() -> Element {
 
         div { class: "app-shell",
             header { class: "topbar",
-                p { class: "topbar-kicker", "Scrabble PX" }
+                p { class: "topbar-kicker", "Tile Lite Elite" }
                 if !IS_ONLINE() {
                     span { class: "offline-indicator", "Can't reach the server — reconnecting..." }
                 }

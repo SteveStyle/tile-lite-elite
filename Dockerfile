@@ -53,7 +53,7 @@ RUN cargo build --release -p server-game -p admin-cli
 # `RootApp`'s `server_url` in crates/ui/src/app.rs), which is what lets one
 # wasm build work behind the Caddy reverse proxy regardless of the host's
 # actual IP or domain, with no rebuild needed if that changes.
-RUN cd crates/ui && CARGO_INCREMENTAL=0 SCRABBLE_PX_API_BASE_URL="" dx build --platform web --release
+RUN cd crates/ui && CARGO_INCREMENTAL=0 TILE_LITE_ELITE_API_BASE_URL="" dx build --platform web --release
 
 # ---------------------------------------------------------------------------
 
@@ -63,11 +63,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && mkdir -p /data
 
 COPY --from=builder /workspace/target/release/server-game /usr/local/bin/server-game
-COPY --from=builder /workspace/target/release/scrabble-admin /usr/local/bin/scrabble-admin
+COPY --from=builder /workspace/target/release/tile-lite-elite-admin /usr/local/bin/tile-lite-elite-admin
 
 # Not published by docker-compose.yml — reachable only from the `web`
-# (Caddy) container over the compose network. `scrabble-admin` is run via
-# `docker compose exec server scrabble-admin ...`, which is a genuinely
+# (Caddy) container over the compose network. `tile-lite-elite-admin` is run via
+# `docker compose exec server tile-lite-elite-admin ...`, which is a genuinely
 # loopback connection from inside this container, satisfying the server's
 # existing loopback-only guard on /admin/* without weakening it.
 EXPOSE 3000
@@ -76,6 +76,6 @@ ENTRYPOINT ["/usr/local/bin/server-game"]
 # ---------------------------------------------------------------------------
 
 FROM caddy:2-alpine AS runtime-web
-COPY --from=builder /workspace/target/dx/scrabble-ui/release/web/public /srv
+COPY --from=builder /workspace/target/dx/tile-lite-elite-ui/release/web/public /srv
 COPY Caddyfile /etc/caddy/Caddyfile
 EXPOSE 80

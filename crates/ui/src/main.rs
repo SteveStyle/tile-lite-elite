@@ -24,7 +24,7 @@ fn main() {
             vec![Box::new(
                 Config::new().with_window(
                     WindowBuilder::new()
-                        .with_title(format!("Scrabble Desktop v{}", app_version()))
+                        .with_title(format!("Tile Lite Elite Desktop v{}", app_version()))
                         .with_resizable(true)
                         .with_min_inner_size(dioxus_desktop::tao::dpi::LogicalSize::new(800, 600))
                         // The board is a 15x15 grid sized off the window's
@@ -53,7 +53,7 @@ fn App() -> Element {
 
 /// The `Major.Minor.Patch` release version from Cargo.toml, plus an
 /// optional build identifier appended as SemVer build metadata (`+<id>`)
-/// when `SCRABBLE_PX_BUILD_ID` is set at compile time — e.g. a git short
+/// when `TILE_LITE_ELITE_BUILD_ID` is set at compile time — e.g. a git short
 /// SHA or CI run number, for telling internal/test builds apart. A
 /// production release simply doesn't set that var, so it shows only the
 /// three numbers. Distinct from `api::API_VERSION`: this is the build
@@ -61,7 +61,7 @@ fn App() -> Element {
 /// connect (see `app.rs`'s `check_api_version`).
 #[allow(dead_code)]
 fn app_version() -> String {
-    format_app_version(env!("CARGO_PKG_VERSION"), option_env!("SCRABBLE_PX_BUILD_ID"))
+    format_app_version(env!("CARGO_PKG_VERSION"), option_env!("TILE_LITE_ELITE_BUILD_ID"))
 }
 
 #[allow(dead_code)]

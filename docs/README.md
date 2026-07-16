@@ -1,4 +1,4 @@
-# Scrabble PX Docs
+# Tile Lite Elite Docs
 
 This folder collects the project plan and architecture notes for the final version of the Scrabble project.
 

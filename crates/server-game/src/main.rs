@@ -15,9 +15,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let database_url = std::env::var("SCRABBLE_PX_DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://data/scrabble-px.sqlite3".to_string());
-    let bind = std::env::var("SCRABBLE_PX_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let database_url = std::env::var("TILE_LITE_ELITE_DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite://data/tile-lite-elite.sqlite3".to_string());
+    let bind = std::env::var("TILE_LITE_ELITE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     let state = AppState::new(&database_url).await?;
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind.parse::<SocketAddr>()?).await?;
@@ -40,13 +40,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// The `Major.Minor.Patch` release version from Cargo.toml, plus an
 /// optional build identifier appended as SemVer build metadata (`+<id>`)
-/// when `SCRABBLE_PX_BUILD_ID` is set at compile time — e.g. a git short
+/// when `TILE_LITE_ELITE_BUILD_ID` is set at compile time — e.g. a git short
 /// SHA or CI run number, for telling internal/test builds apart. A
 /// production release simply doesn't set that var, so it shows only the
 /// three numbers. Distinct from `api::API_VERSION`: this is the build
 /// identity, not the wire-contract version clients check on connect.
 fn app_version() -> String {
-    format_app_version(env!("CARGO_PKG_VERSION"), option_env!("SCRABBLE_PX_BUILD_ID"))
+    format_app_version(env!("CARGO_PKG_VERSION"), option_env!("TILE_LITE_ELITE_BUILD_ID"))
 }
 
 fn format_app_version(pkg_version: &str, build_id: Option<&str>) -> String {

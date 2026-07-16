@@ -51,7 +51,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 - **Purpose**: Web and desktop presentation layers (Dioxus framework)
 - **Status**: ✅ Implemented
 - **Contents**:
-  - `app.rs` - RootApp component, three-column layout composition (Games / board+rack / Seats+Recent Moves), game state management, event handlers, auth session state, connection-status tracking (`static IS_ONLINE: GlobalSignal<bool>`) and the background reconnect/reload loop. `server_url` resolves to the page's own origin when built with an empty `SCRABBLE_PX_API_BASE_URL` (used by the container deployment, where a reverse proxy serves both the client and API from one origin) instead of only supporting an explicit configured host.
+  - `app.rs` - RootApp component, three-column layout composition (Games / board+rack / Seats+Recent Moves), game state management, event handlers, auth session state, connection-status tracking (`static IS_ONLINE: GlobalSignal<bool>`) and the background reconnect/reload loop. `server_url` resolves to the page's own origin when built with an empty `TILE_LITE_ELITE_API_BASE_URL` (used by the container deployment, where a reverse proxy serves both the client and API from one origin) instead of only supporting an explicit configured host.
   - `main.rs` - Application entry point (desktop window: 1400×1300 default, 800×600 minimum — tuned so the rack panel and its turn-action buttons aren't cut off below the visible window on launch)
   - `local_storage.rs` - Cross-platform persistence for "remember me" / "stay logged in" (browser localStorage on web, a plain JSON config file on desktop — not encrypted either way)
   - `time_format.rs` - Relative-time formatting for the games list ("3m ago") and a move-deadline countdown ("2h left" / "overdue")
@@ -62,8 +62,8 @@ The project has successfully implemented the core MVP architecture: a server-aut
 #### `crates/admin-cli/`
 - **Purpose**: Operator tooling for a running server — list/delete users, reset passwords, list/delete/force-end games
 - **Status**: ✅ Implemented
-- **Contents**: `main.rs` — a `clap`-based CLI (`scrabble-admin`) that's a thin HTTP client against `server-game`'s `/admin/*` endpoints; no business logic of its own (cascading deletes and password hashing stay server-side, so the CLI can't drift from what the server actually does)
-- **Notes**: Not authenticated by account/token — the server's admin routes only accept loopback connections (see `require_loopback` in `server-game/app.rs`), regardless of what `SCRABBLE_PX_BIND` is set to. Running the CLI *is* the access control: it only works from the server's own terminal — including in the container deployment, where it's reachable via `docker compose exec server scrabble-admin ...` (a genuinely loopback connection from inside that container).
+- **Contents**: `main.rs` — a `clap`-based CLI (`tile-lite-elite-admin`) that's a thin HTTP client against `server-game`'s `/admin/*` endpoints; no business logic of its own (cascading deletes and password hashing stay server-side, so the CLI can't drift from what the server actually does)
+- **Notes**: Not authenticated by account/token — the server's admin routes only accept loopback connections (see `require_loopback` in `server-game/app.rs`), regardless of what `TILE_LITE_ELITE_BIND` is set to. Running the CLI *is* the access control: it only works from the server's own terminal — including in the container deployment, where it's reachable via `docker compose exec server tile-lite-elite-admin ...` (a genuinely loopback connection from inside that container).
 
 #### Deployment (new — not part of the original crate boundaries, but now a real part of the architecture)
 - **Purpose**: Run the app somewhere other than a developer's own machine
@@ -125,7 +125,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 - [x] Deterministic tests for move legality and scoring
   - rules-shared: 26 unit tests
   - server-game: 38 integration tests against the real Axum router
-  - scrabble-ui: 24 unit tests
+  - tile-lite-elite-ui: 24 unit tests
   - engine-core: 1 test
   - **89 tests total** (excluding `old-crates/{first-try,second-try}`, two early prototypes kept for design-precedent reference but not counted here), all passing as of the last full run
 
@@ -142,7 +142,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
   - Verified live: killed the server under an active desktop client, confirmed no crash/busy-loop, restarted it, confirmed reconnection
 
 - [x] Admin tooling
-  - `scrabble-admin` CLI (`crates/admin-cli`): list/delete users, reset a password, list/delete/force-end games
+  - `tile-lite-elite-admin` CLI (`crates/admin-cli`): list/delete users, reset a password, list/delete/force-end games
   - Backed by `/admin/*` endpoints, loopback-gated regardless of environment (including inside the container deployment)
 
 - [x] Game invitations (named and open/stranger), fully wired to seat-claiming
@@ -164,7 +164,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 - [x] Desktop client
   - Dioxus desktop target
   - Native GTK application
-  - Runs with `cargo run -p scrabble-ui --features desktop` (or `./scripts/desktop.sh`)
+  - Runs with `cargo run -p tile-lite-elite-ui --features desktop` (or `./scripts/desktop.sh`)
 
 - [x] Same codebase for both
   - Dual-target via Dioxus features (web/desktop)
@@ -174,8 +174,8 @@ The project has successfully implemented the core MVP architecture: a server-aut
 ### ✅ Persistence
 
 - [x] SQLite database per environment
-  - Default: ./data/scrabble-px.sqlite3
-  - SCRABBLE_PX_DATABASE_URL env var configurable (in the container deployment, a named Docker volume mounted at `/data`)
+  - Default: ./data/tile-lite-elite.sqlite3
+  - TILE_LITE_ELITE_DATABASE_URL env var configurable (in the container deployment, a named Docker volume mounted at `/data`)
 
 - [x] Migrations create schema
   - tables: schema_migrations, players, engine_profiles, games, game_participants, game_moves, sessions, game_invitations
@@ -191,7 +191,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 ### ✅ Server Infrastructure
 
 - [x] Axum HTTP server
-  - Listening on 127.0.0.1:3000 by default (configurable via SCRABBLE_PX_BIND — set to 0.0.0.0 for LAN play or behind the container's reverse proxy)
+  - Listening on 127.0.0.1:3000 by default (configurable via TILE_LITE_ELITE_BIND — set to 0.0.0.0 for LAN play or behind the container's reverse proxy)
   - Full route list is in the `crates/server-game/` notes above
   - CORS enabled (CorsLayer::permissive()) for local dev; the container deployment sidesteps CORS entirely by serving client + API same-origin through Caddy
 
@@ -227,11 +227,11 @@ The project has successfully implemented the core MVP architecture: a server-aut
 | Save/load game state | Partial | Save works; load requires manual game ID (no UI) |
 | CLI client | Not built | Architecture supports it; Dioxus CLI would compile it |
 | Mobile client | Not built | Architecture supports Dioxus mobile target |
-| Admin tooling | Implemented | `scrabble-admin` CLI + `/admin/*` endpoints |
+| Admin tooling | Implemented | `tile-lite-elite-admin` CLI + `/admin/*` endpoints |
 | Client resilience to outages | Implemented | Connection-status tracking, background reconnect/reload, self-healing WebSocket |
 | Container deployment | Implemented and live | See the "Deployment" entry in Architecture Alignment above |
 | Structured logging | Implemented | `tracing` + `tracing-subscriber`, configurable via `RUST_LOG` (see `docs/operations.md`'s "Logging" section). App-level events (auth, game lifecycle, invitations, admin actions, move-time-limit retirement) at `info`/`warn`; per-HTTP-request spans via `tower-http`'s `TraceLayer` at `debug`. Engine-decision diagnostics (why an engine chose a move) still don't exist — only that it timed out |
-| Client API versioning | Implemented | `api::API_VERSION` (`Major.Minor`) checked against `/health` on first connect, in the shared bootstrap path (both web and desktop) — major mismatch blocks with an update message, minor mismatch is a soft notice (see `docs/operations.md`'s "Versioning" section). Separate `Major.Minor.Patch[+build]` app version (from `Cargo.toml` + optional `SCRABBLE_PX_BUILD_ID`) is for display/logging only, not compatibility — server logs it at startup, desktop client shows it in the window title |
+| Client API versioning | Implemented | `api::API_VERSION` (`Major.Minor`) checked against `/health` on first connect, in the shared bootstrap path (both web and desktop) — major mismatch blocks with an update message, minor mismatch is a soft notice (see `docs/operations.md`'s "Versioning" section). Separate `Major.Minor.Patch[+build]` app version (from `Cargo.toml` + optional `TILE_LITE_ELITE_BUILD_ID`) is for display/logging only, not compatibility — server logs it at startup, desktop client shows it in the window title |
 
 ### ⚠️ Partially Implemented
 
@@ -317,7 +317,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
 
 ## Verification
 
-Both clients (web via `dx serve`, desktop via `cargo run -p scrabble-ui --features desktop`) connect to the backend and support the full game loop: create a game (choosing the seat mix — creator/named-invite/open-invite/engine — via presets or the seat-builder form), discover and accept invitations, place tiles (drag-and-drop or click/keyboard), pass, exchange, resign, play against the greedy engine, and log in/register/change password with a persisted session. `cargo test --workspace` runs all 89 tests (101 including the two prototype `old-crates`); see `docs/operations.md` for exact commands.
+Both clients (web via `dx serve`, desktop via `cargo run -p tile-lite-elite-ui --features desktop`) connect to the backend and support the full game loop: create a game (choosing the seat mix — creator/named-invite/open-invite/engine — via presets or the seat-builder form), discover and accept invitations, place tiles (drag-and-drop or click/keyboard), pass, exchange, resign, play against the greedy engine, and log in/register/change password with a persisted session. `cargo test --workspace` runs all 89 tests (101 including the two prototype `old-crates`); see `docs/operations.md` for exact commands.
 
 The invitation flow, the move-time-limit auto-retirement, and the WebSocket event stream were all verified live end-to-end against the real deployed server (not just tests) — including a full production run against the live Oracle Cloud deployment: register → create → discover an open invitation → accept → start → live WebSocket updates over `wss://`, plus confirming SQLite data survives both a container restart and a full `docker compose down`/`up` recreation.
 

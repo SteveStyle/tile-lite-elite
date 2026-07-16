@@ -19,13 +19,13 @@ set -euo pipefail
 #   DEPLOY_HOST      Public IP or hostname of the VM (default: 129.151.69.246)
 #   DEPLOY_USER      SSH user (default: ubuntu)
 #   DEPLOY_SSH_KEY   Private key path (default: ~/.ssh/oracle_scrabble)
-#   DEPLOY_REMOTE_DIR  Directory on the VM holding docker-compose.yml (default: scrabble-px)
+#   DEPLOY_REMOTE_DIR  Directory on the VM holding docker-compose.yml (default: tile-lite-elite)
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DEPLOY_HOST="${DEPLOY_HOST:-129.151.69.246}"
 DEPLOY_USER="${DEPLOY_USER:-ubuntu}"
 DEPLOY_SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/.ssh/oracle_scrabble}"
-DEPLOY_REMOTE_DIR="${DEPLOY_REMOTE_DIR:-scrabble-px}"
+DEPLOY_REMOTE_DIR="${DEPLOY_REMOTE_DIR:-tile-lite-elite}"
 
 SSH_OPTS=(-i "$DEPLOY_SSH_KEY" -o ConnectTimeout=10)
 REMOTE="$DEPLOY_USER@$DEPLOY_HOST"
@@ -36,9 +36,9 @@ echo "==> Building images locally (this is the slow step, ~2-3 min)"
 docker compose build
 
 echo "==> Exporting images"
-TMP_TAR="$(mktemp /tmp/scrabble-px-images-XXXXXX.tar.gz)"
+TMP_TAR="$(mktemp /tmp/tile-lite-elite-images-XXXXXX.tar.gz)"
 trap 'rm -f "$TMP_TAR"' EXIT
-docker save scrabble-px-server:latest scrabble-px-web:latest | gzip > "$TMP_TAR"
+docker save tile-lite-elite-server:latest tile-lite-elite-web:latest | gzip > "$TMP_TAR"
 echo "    $(du -h "$TMP_TAR" | cut -f1) compressed"
 
 echo "==> Transferring to $DEPLOY_HOST"
@@ -56,11 +56,11 @@ ssh "${SSH_OPTS[@]}" "$REMOTE" "
     docker image prune -f > /dev/null
 "
 
-echo "==> Ensuring the 'sa' alias for scrabble-admin is set up on the VM"
+echo "==> Ensuring the 'sa' alias for tile-lite-elite-admin is set up on the VM"
 ssh "${SSH_OPTS[@]}" "$REMOTE" "
     grep -qF 'alias sa=' ~/.bashrc 2>/dev/null || \
-        echo \"alias sa='docker compose -f ~/$DEPLOY_REMOTE_DIR/docker-compose.yml exec server scrabble-admin'\" >> ~/.bashrc \
-        || echo \"    (warning: could not set up the 'sa' alias for scrabble-admin)\"
+        echo \"alias sa='docker compose -f ~/$DEPLOY_REMOTE_DIR/docker-compose.yml exec server tile-lite-elite-admin'\" >> ~/.bashrc \
+        || echo \"    (warning: could not set up the 'sa' alias for tile-lite-elite-admin)\"
 "
 
 echo "==> Done — https://$DEPLOY_HOST.sslip.io (or your configured hostname)"

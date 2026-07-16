@@ -3,7 +3,7 @@
 [web.app]
 
 # HTML title tag content
-title = "scrabble-px"
+title = "Tile Lite Elite"
 
 # include `assets` in web platform
 [web.resource]

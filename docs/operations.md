@@ -1,4 +1,4 @@
-# Scrabble PX - Development and Operating Guide
+# Tile Lite Elite - Development and Operating Guide
 
 ## Quick Start (Scripts)
 
@@ -92,21 +92,21 @@ Where you write code, run tests, and build the images that get deployed. Has the
 
 **Components**: Rust toolchain + workspace crates, Docker Engine (used here only to *build* images and optionally run the stack for local testing — see [Container Deployment](#container-deployment) — not to serve real traffic), the git clone itself (pushed to/pulled from GitHub).
 
-**Directory structure** (repo root, `~/scrabble-px` in this WSL setup):
+**Directory structure** (repo root, `~/tile-lite-elite` in this WSL setup):
 
 ```
-scrabble-px/
+tile-lite-elite/
 ├── crates/                  # the six workspace crates
 │   ├── api/                 # shared request/response DTOs
 │   ├── rules-shared/        # pure rules/scoring/move-generation
 │   ├── engine-core/         # ScrabbleEngine trait + GreedyEngine
 │   ├── server-game/         # Axum backend
 │   ├── ui/                  # Dioxus web/desktop client
-│   └── admin-cli/           # scrabble-admin operator CLI
+│   └── admin-cli/           # tile-lite-elite-admin operator CLI
 ├── old-crates/              # early prototypes, kept for design precedent only
 ├── docs/                    # this file and other design docs
 ├── scripts/                 # admin.sh, deploy.sh, services.sh, setup-dev-environment.sh, desktop.sh
-├── data/                    # local dev SQLite file (SCRABBLE_PX_DATABASE_URL's default)
+├── data/                    # local dev SQLite file (TILE_LITE_ELITE_DATABASE_URL's default)
 ├── target/                  # cargo build output (gitignored)
 ├── .cargo/config.toml       # sccache + wasm rustflags (see Known Build Issues)
 ├── Dockerfile, docker-compose.yml, Caddyfile, .dockerignore
@@ -117,12 +117,12 @@ scrabble-px/
 
 Where the live deployment actually runs. **Does not have the source tree at all** — no git clone, no `crates/`, nothing to build. Just the compose file and whatever Docker itself stores (images, volumes) — `scripts/deploy.sh` builds everything locally and ships only the finished images plus `docker-compose.yml` over.
 
-**Components**: Docker Engine only. Two running containers (`scrabble-px-server-1`, `scrabble-px-web-1`) and three named volumes (`scrabble-px_scrabble-data`, `scrabble-px_caddy-data`, `scrabble-px_caddy-config`) — see [Container Deployment](#container-deployment) for what each holds.
+**Components**: Docker Engine only. Two running containers (`tile-lite-elite-server-1`, `tile-lite-elite-web-1`) and three named volumes (`tile-lite-elite-data`, `tile-lite-elite-caddy-data`, `tile-lite-elite-caddy-config`) — see [Container Deployment](#container-deployment) for what each holds.
 
-**Directory structure** (`~/scrabble-px` on the VM — same path as local, different machine, don't let that imply it's the same *kind* of directory):
+**Directory structure** (`~/tile-lite-elite` on the VM — same path as local, different machine, don't let that imply it's the same *kind* of directory):
 
 ```
-~/scrabble-px/
+~/tile-lite-elite/
 └── docker-compose.yml       # the only file that lives here
 ```
 
@@ -132,9 +132,9 @@ That's genuinely everything on disk outside of Docker's own storage. What's *ins
 server container:
 ├── /usr/local/bin/
 │   ├── server-game          # the release binary actually running
-│   └── scrabble-admin       # copied in but not running — invoked on demand via `docker compose exec`
-└── /data/                   # the scrabble-data volume
-    └── scrabble-px.sqlite3
+│   └── tile-lite-elite-admin       # copied in but not running — invoked on demand via `docker compose exec`
+└── /data/                   # the tile-lite-elite-data volume
+    └── tile-lite-elite.sqlite3
 
 web container:
 ├── /srv/                    # the built web client (index.html, assets/, wasm/) — served as static files
@@ -163,11 +163,11 @@ cargo run -p server-game
 
 Defaults:
 - Bind: `127.0.0.1:3000`
-- Database: `./data/scrabble-px.sqlite3` (auto-created with migrations on first run)
+- Database: `./data/tile-lite-elite.sqlite3` (auto-created with migrations on first run)
 
 Override with environment variables:
 ```bash
-SCRABBLE_PX_BIND=0.0.0.0:3000 SCRABBLE_PX_DATABASE_URL=sqlite://data/scrabble-px.sqlite3 cargo run -p server-game
+TILE_LITE_ELITE_BIND=0.0.0.0:3000 TILE_LITE_ELITE_DATABASE_URL=sqlite://data/tile-lite-elite.sqlite3 cargo run -p server-game
 ```
 
 ### Manual: Web Client
@@ -184,14 +184,14 @@ RUSTC_WRAPPER="" CARGO_INCREMENTAL=0 ~/.cargo/bin/dx serve --platform web --port
 
 From the workspace root:
 ```bash
-SCRABBLE_PX_API_BASE_URL=http://127.0.0.1:3000 cargo run -p scrabble-ui --features desktop
+TILE_LITE_ELITE_API_BASE_URL=http://127.0.0.1:3000 cargo run -p tile-lite-elite-ui --features desktop
 ```
 
 ## Admin CLI
 
-The admin CLI — crate `crates/admin-cli`, binary/command name `scrabble-admin` — is operator tooling for a running server: list/delete users, reset a password, list/delete/force-end games. It's a thin HTTP client against `server-game`'s `/admin/*` endpoints, not a separate implementation, so it can't drift from what the server actually does (cascading deletes, password hashing, etc. all stay server-side).
+The admin CLI — crate `crates/admin-cli`, binary/command name `tile-lite-elite-admin` — is operator tooling for a running server: list/delete users, reset a password, list/delete/force-end games. It's a thin HTTP client against `server-game`'s `/admin/*` endpoints, not a separate implementation, so it can't drift from what the server actually does (cascading deletes, password hashing, etc. all stay server-side).
 
-**There's no admin account or token.** The `/admin/*` endpoints only accept requests whose peer address is loopback (`127.0.0.1`/`::1`), regardless of what `SCRABBLE_PX_BIND` is set to — running the CLI *from the server's own terminal* is the access control. This matters specifically because `SCRABBLE_PX_BIND=0.0.0.0:3000` (see the LAN-play example above) would otherwise expose these endpoints to the whole LAN, not just the machine running the server. It also means where you run `scrabble-admin` *from* isn't a preference, it's the only thing that determines whether it works at all — the two cases below are genuinely different, not interchangeable:
+**There's no admin account or token.** The `/admin/*` endpoints only accept requests whose peer address is loopback (`127.0.0.1`/`::1`), regardless of what `TILE_LITE_ELITE_BIND` is set to — running the CLI *from the server's own terminal* is the access control. This matters specifically because `TILE_LITE_ELITE_BIND=0.0.0.0:3000` (see the LAN-play example above) would otherwise expose these endpoints to the whole LAN, not just the machine running the server. It also means where you run `tile-lite-elite-admin` *from* isn't a preference, it's the only thing that determines whether it works at all — the two cases below are genuinely different, not interchangeable:
 
 **Local dev server** (running directly on this machine, not in a container):
 
@@ -210,13 +210,13 @@ The admin CLI — crate `crates/admin-cli`, binary/command name `scrabble-admin`
 
 `scripts/admin.sh` builds `admin-cli` in **release** mode and runs that binary — a plain `cargo run -p admin-cli` builds and runs a *debug* binary instead, which still works but is worth avoiding out of habit now that a script exists to do the right thing by default.
 
-**The Oracle VM's (or any container deployment's) server**: `scripts/admin.sh` can't reach it — it always targets `127.0.0.1`, and that's a different loopback than the VM's, by design (see above; pointing `--server`/`SCRABBLE_PX_API_BASE_URL` at the VM's public address from your own machine just gets a 403, it isn't a workaround). Run it *inside* the server container instead, where `127.0.0.1` genuinely is that container.  An alias 'sa' has been created which allows it to be called from any directory.
+**The Oracle VM's (or any container deployment's) server**: `scripts/admin.sh` can't reach it — it always targets `127.0.0.1`, and that's a different loopback than the VM's, by design (see above; pointing `--server`/`TILE_LITE_ELITE_API_BASE_URL` at the VM's public address from your own machine just gets a 403, it isn't a workaround). Run it *inside* the server container instead, where `127.0.0.1` genuinely is that container.  An alias 'sa' has been created which allows it to be called from any directory.
 
 ```bash
 ssh -i ~/.ssh/oracle_scrabble ubuntu@129.151.69.246
 sa games list
-cd ~/scrabble-px
-docker compose exec server scrabble-admin games list
+cd ~/tile-lite-elite
+docker compose exec server tile-lite-elite-admin games list
 ```
 
 That binary is the release build baked into the `runtime-server` image by the `Dockerfile` — there's nothing extra to build or configure on the VM itself.
@@ -236,7 +236,7 @@ cd crates/ui
 RUSTC_WRAPPER="" CARGO_INCREMENTAL=0 ~/.cargo/bin/dx build --platform web
 
 # 3. Desktop
-cargo build -p scrabble-ui --features desktop
+cargo build -p tile-lite-elite-ui --features desktop
 ```
 
 ## Running Tests
@@ -249,7 +249,7 @@ Runs every crate's tests, including the `old-crates/*` prototypes (harmless — 
 ```bash
 cargo test -p rules-shared    # rules/scoring/validation unit tests
 cargo test -p server-game     # HTTP-level integration tests against the real Axum router
-cargo test -p scrabble-ui     # move-composer logic, game-creation seat presets
+cargo test -p tile-lite-elite-ui     # move-composer logic, game-creation seat presets
 cargo test -p engine-core     # engine tests
 ```
 
@@ -259,18 +259,18 @@ No test coverage for `admin-cli` (it's a thin HTTP client with no logic of its o
 
 | Environment variable | Default | Description |
 |---|---|---|
-| `SCRABBLE_PX_BIND` | `127.0.0.1:3000` | Server listen address |
-| `SCRABBLE_PX_DATABASE_URL` | `sqlite://data/scrabble-px.sqlite3` | SQLite database path |
-| `SCRABBLE_PX_API_BASE_URL` | `http://127.0.0.1:3000` | Backend URL used by clients. Set at *build* time (`option_env!`), not runtime. An explicit empty string means "same origin as the page" — see [Container Deployment](#container-deployment) |
+| `TILE_LITE_ELITE_BIND` | `127.0.0.1:3000` | Server listen address |
+| `TILE_LITE_ELITE_DATABASE_URL` | `sqlite://data/tile-lite-elite.sqlite3` | SQLite database path |
+| `TILE_LITE_ELITE_API_BASE_URL` | `http://127.0.0.1:3000` | Backend URL used by clients. Set at *build* time (`option_env!`), not runtime. An explicit empty string means "same origin as the page" — see [Container Deployment](#container-deployment) |
 | `SCRABBLE_UI_PORT` | `8080` | Web dev server port |
 | `RUST_LOG` | `server_game=info,tower_http=info,warn` | Log verbosity for `server-game`. See [Logging](#logging) |
-| `SCRABBLE_PX_BUILD_ID` | unset | Optional build identifier baked in at *build* time (`option_env!`), appended as SemVer build metadata to the app version (e.g. `0.1.0+a1c9f02`). Unset (the default, used for production releases) shows only `Major.Minor.Patch`. See [Versioning](#versioning) |
+| `TILE_LITE_ELITE_BUILD_ID` | unset | Optional build identifier baked in at *build* time (`option_env!`), appended as SemVer build metadata to the app version (e.g. `0.1.0+a1c9f02`). Unset (the default, used for production releases) shows only `Major.Minor.Patch`. See [Versioning](#versioning) |
 
 ## Versioning
 
 Two independent version numbers, on purpose — see the doc comments on
 `api::API_VERSION` and each binary's `app_version()` (in `server-game`'s
-and `scrabble-ui`'s `main.rs`) for the full rationale.
+and `tile-lite-elite-ui`'s `main.rs`) for the full rationale.
 
 **API contract version** (`Major.Minor`, e.g. `1.0`) — lives once in the
 shared `api` crate as `api::API_VERSION`, so both the server and any given
@@ -287,13 +287,13 @@ including them would make the check fire on every routine bugfix deploy.
 **App/build version** (`Major.Minor.Patch[+build]`) — `Major.Minor.Patch`
 comes straight from each crate's `Cargo.toml` `version` (currently `0.1.0`
 everywhere). An optional `+<build>` suffix (standard SemVer build
-metadata) is appended when `SCRABBLE_PX_BUILD_ID` is set at compile time —
+metadata) is appended when `TILE_LITE_ELITE_BUILD_ID` is set at compile time —
 e.g. a git short SHA or CI run number, for telling internal/test builds
 apart:
 
 ```bash
 # Internal/test build with a build id
-SCRABBLE_PX_BUILD_ID=$(git rev-parse --short HEAD) cargo build -p server-game --release
+TILE_LITE_ELITE_BUILD_ID=$(git rev-parse --short HEAD) cargo build -p server-game --release
 
 # Production release — no build id set, shows "0.1.0" not "0.1.0+..."
 cargo build -p server-game --release
@@ -327,7 +327,7 @@ Occasionally useful during development — for example, after a schema change th
 
 ```bash
 ./scripts/services.sh stop
-rm -f data/scrabble-px.sqlite3 data/scrabble-px.sqlite3-wal data/scrabble-px.sqlite3-shm
+rm -f data/tile-lite-elite.sqlite3 data/tile-lite-elite.sqlite3-wal data/tile-lite-elite.sqlite3-shm
 ./scripts/services.sh start
 ```
 
@@ -348,18 +348,18 @@ docker compose build
 docker compose up -d
 ```
 
-SQLite lives on a named volume (`scrabble-data`, mounted at `/data` in `server`) — it survives `docker compose down` and rebuilds, but not `docker compose down -v`. Back it up with:
+SQLite lives on a named volume (`tile-lite-elite-data`, mounted at `/data` in `server`) — it survives `docker compose down` and rebuilds, but not `docker compose down -v`. Back it up with:
 
 ```bash
-docker run --rm -v scrabble-px_scrabble-data:/data -v "$PWD":/backup debian \
-  tar czf /backup/scrabble-data.tgz -C /data .
+docker run --rm -v tile-lite-elite-data:/data -v "$PWD":/backup debian \
+  tar czf /backup/tile-lite-elite-data.tgz -C /data .
 ```
 
 Caddy's obtained TLS certificate lives on its own named volumes (`caddy-data`, `caddy-config`) for the same reason — losing them means a fresh certificate request on next start, not a functional problem, just unnecessary churn against Let's Encrypt's rate limits.
 
-**Admin CLI**: `/admin/*` stays loopback-only exactly as it is locally — a request proxied in from the `web` container isn't a loopback connection, so the server rejects it the same as it would over a LAN. See the [Admin CLI](#admin-cli) section above for how to reach it here (`docker compose exec server scrabble-admin ...`) versus against a local dev server — they're not interchangeable.
+**Admin CLI**: `/admin/*` stays loopback-only exactly as it is locally — a request proxied in from the `web` container isn't a loopback connection, so the server rejects it the same as it would over a LAN. See the [Admin CLI](#admin-cli) section above for how to reach it here (`docker compose exec server tile-lite-elite-admin ...`) versus against a local dev server — they're not interchangeable.
 
-**Why one image serves both, same-origin**: the web build is compiled with `SCRABBLE_PX_API_BASE_URL=""` (explicitly empty, not unset — see the Configuration table above), which makes the client derive its API/WebSocket target from whatever origin actually served the page (`crates/ui/src/app.rs`'s `websocket_url`/`same_origin_websocket_url`). That's what lets the same compiled wasm bundle work regardless of the host's IP or domain, with no rebuild needed if either changes — and it sidesteps CORS entirely, since Caddy serves both the static assets and the proxied API from one origin.
+**Why one image serves both, same-origin**: the web build is compiled with `TILE_LITE_ELITE_API_BASE_URL=""` (explicitly empty, not unset — see the Configuration table above), which makes the client derive its API/WebSocket target from whatever origin actually served the page (`crates/ui/src/app.rs`'s `websocket_url`/`same_origin_websocket_url`). That's what lets the same compiled wasm bundle work regardless of the host's IP or domain, with no rebuild needed if either changes — and it sidesteps CORS entirely, since Caddy serves both the static assets and the proxied API from one origin.
 
 ### Redeploying (after a code change)
 
@@ -377,9 +377,9 @@ If the change involves schema changes then the database should be backed up and 
 
 ```bash
 ssh scrabble-px
-cd ~/scrabble-px
+cd ~/tile-lite-elite
 
-# 1. Stop services — leaves the named volumes (scrabble-data, caddy-data,
+# 1. Stop services — leaves the named volumes (tile-lite-elite-data, tile-lite-elite-caddy-data,
 #    caddy-config) untouched, just stops the containers so nothing's
 #    writing to the DB while you back it up.
 docker compose down
@@ -387,15 +387,15 @@ docker compose down
 # 2. Full backup of the data volume (this is docs/operations.md's own
 #    documented backup command) — portable, pull it off the VM if you want
 #    a copy elsewhere.
-docker run --rm -v scrabble-px_scrabble-data:/data -v "$PWD":/backup debian \
-  tar czf /backup/scrabble-data-$(date +%Y%m%d).tgz -C /data .
+docker run --rm -v tile-lite-elite-data:/data -v "$PWD":/backup debian \
+  tar czf /backup/tile-lite-elite-data-$(date +%Y%m%d).tgz -C /data .
 
 # 3. Clear the old DB from the volume so the new server starts fresh
 #    (create_if_missing(true) recreates it with the new schema on next
 #    start). Renaming aside instead of deleting, if you'd rather keep a
 #    copy in place as well as the tarball:
-docker run --rm -v scrabble-px_scrabble-data:/data debian \
-  sh -c 'rm -f /data/scrabble-px.sqlite3 /data/scrabble-px.sqlite3-wal /data/scrabble-px.sqlite3-shm'
+docker run --rm -v tile-lite-elite-data:/data debian \
+  sh -c 'rm -f /data/tile-lite-elite.sqlite3 /data/tile-lite-elite.sqlite3-wal /data/tile-lite-elite.sqlite3-shm'
 ```
 
 ### Oracle Cloud VM setup

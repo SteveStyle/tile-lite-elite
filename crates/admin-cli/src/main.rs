@@ -1,4 +1,4 @@
-//! Operator tooling for a scrabble-px server: list/delete users, reset
+//! Operator tooling for a tile-lite-elite server: list/delete users, reset
 //! passwords, list/delete/force-end games. Talks to the server's `/admin/*`
 //! endpoints over plain HTTP rather than touching the database directly, so
 //! it can't drift from the cascading-delete/password-hashing logic the
@@ -15,13 +15,13 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "scrabble-admin",
-    about = "Administer a scrabble-px server (users, games). Must run on the same machine as the server."
+    name = "tile-lite-elite-admin",
+    about = "Administer a tile-lite-elite server (users, games). Must run on the same machine as the server."
 )]
 struct Cli {
     /// Base URL of the server's HTTP API. Must resolve to loopback from the
     /// server's point of view, or every request will 403.
-    #[arg(long, env = "SCRABBLE_PX_API_BASE_URL", default_value = "http://127.0.0.1:3000")]
+    #[arg(long, env = "TILE_LITE_ELITE_API_BASE_URL", default_value = "http://127.0.0.1:3000")]
     server: String,
 
     #[command(subcommand)]

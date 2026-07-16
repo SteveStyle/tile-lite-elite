@@ -6,14 +6,14 @@ The project should use one primary SQLite database file per environment.
 
 Typical examples:
 
-- local development: `./data/scrabble-px.sqlite3`
-- self-hosted instance: `/var/lib/scrabble-px/scrabble-px.sqlite3`
+- local development: `./data/tile-lite-elite.sqlite3`
+- self-hosted instance: `/var/lib/tile-lite-elite/tile-lite-elite.sqlite3`
 - tests: temporary throwaway database files
 
 SQLite may also create sidecar files when write-ahead logging is enabled:
 
-- `scrabble-px.sqlite3-wal`
-- `scrabble-px.sqlite3-shm`
+- `tile-lite-elite.sqlite3-wal`
+- `tile-lite-elite.sqlite3-shm`
 
 Those files are part of normal SQLite operation and do not represent separate databases.
 

@@ -323,7 +323,7 @@ localStorage.setItem('player_id', player_id);
 
 ### Desktop Client
 
-**As actually implemented**: a plain JSON file under the OS config directory (via the `dirs` crate — e.g. `~/.config/scrabble-px/auth.json` on Linux), holding the remembered display name and, if "Stay logged in" was checked, the raw session token. This is **not** encrypted or OS-keychain-backed — anyone with filesystem access to that account can read a logged-in session token straight out of the file. Fine for a hobby project on a personal machine; revisit before this is ever exposed to a shared or untrusted machine.
+**As actually implemented**: a plain JSON file under the OS config directory (via the `dirs` crate — e.g. `~/.config/tile-lite-elite/auth.json` on Linux), holding the remembered display name and, if "Stay logged in" was checked, the raw session token. This is **not** encrypted or OS-keychain-backed — anyone with filesystem access to that account can read a logged-in session token straight out of the file. Fine for a hobby project on a personal machine; revisit before this is ever exposed to a shared or untrusted machine.
 
 ```rust
 // crates/ui/src/local_storage.rs, roughly:

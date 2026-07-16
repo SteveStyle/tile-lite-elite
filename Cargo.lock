@@ -4546,30 +4546,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "scrabble-ui"
-version = "0.1.0"
-dependencies = [
- "api",
- "dioxus",
- "dioxus-desktop",
- "dioxus-web",
- "dirs 5.0.1",
- "futures-util",
- "gloo-net",
- "gloo-storage",
- "gloo-timers",
- "js-sys",
- "rand 0.8.5",
- "reqwest",
- "rules-shared",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite 0.28.0",
- "web-sys",
-]
-
-[[package]]
 name = "second-try"
 version = "0.1.0"
 dependencies = [
@@ -5467,6 +5443,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tile-lite-elite-ui"
+version = "0.1.0"
+dependencies = [
+ "api",
+ "dioxus",
+ "dioxus-desktop",
+ "dioxus-web",
+ "dirs 5.0.1",
+ "futures-util",
+ "gloo-net",
+ "gloo-storage",
+ "gloo-timers",
+ "js-sys",
+ "rand 0.8.5",
+ "reqwest",
+ "rules-shared",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.28.0",
+ "web-sys",
 ]
 
 [[package]]

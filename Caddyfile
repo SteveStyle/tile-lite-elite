@@ -1,12 +1,12 @@
 # Serves the built web client as static files, and reverse-proxies API
 # (including the /games/{id}/events WebSocket) to the server container —
 # same origin for both, which is what lets crates/ui build with an empty
-# SCRABBLE_PX_API_BASE_URL (see Dockerfile) instead of a baked-in host.
+# TILE_LITE_ELITE_API_BASE_URL (see Dockerfile) instead of a baked-in host.
 #
 # /admin/* is deliberately not listed here: the server only accepts it from
 # loopback callers, and a request proxied in from this container isn't one
 # (see docker-compose.yml). Reach it via
-# `docker compose exec server scrabble-admin ...` instead.
+# `docker compose exec server tile-lite-elite-admin ...` instead.
 #
 # A real hostname (not a bare IP — Let's Encrypt won't certificate one) is
 # all Caddy needs to provision and renew HTTPS automatically: giving it a

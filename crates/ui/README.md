@@ -1,6 +1,6 @@
-# scrabble-ui
+# tile-lite-elite-ui
 
-Dioxus-based client for the Scrabble PX server. Compiles to both a web WASM app and a native desktop app from the same source.
+Dioxus-based client for the Tile Lite Elite server. Compiles to both a web WASM app and a native desktop app from the same source.
 
 See [docs/operations.md](../../docs/operations.md) for full setup instructions.
 
@@ -47,7 +47,7 @@ RUSTC_WRAPPER="" CARGO_INCREMENTAL=0 ~/.cargo/bin/dx serve --platform web --port
 ### 2b. Desktop client (manual)
 
 ```bash
-cargo run -p scrabble-ui --features desktop -- --server-url http://127.0.0.1:3000
+cargo run -p tile-lite-elite-ui --features desktop -- --server-url http://127.0.0.1:3000
 ```
 
 See `src/config.rs` for the compiled-in default environments and the

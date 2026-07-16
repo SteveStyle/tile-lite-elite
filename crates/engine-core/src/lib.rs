@@ -72,7 +72,7 @@ impl GreedyEngine {
                 id: "greedy-v1".to_string(),
                 name: "Greedy".to_string(),
                 version: "1".to_string(),
-                author: Some("scrabble-px".to_string()),
+                author: Some("tile-lite-elite".to_string()),
                 description: Some(
                     "Chooses the highest-scoring legal move from the shared move generator."
                         .to_string(),

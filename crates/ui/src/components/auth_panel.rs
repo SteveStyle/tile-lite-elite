@@ -228,7 +228,7 @@ pub fn AuthPanel(
     rsx! {
         div { class: "modal-backdrop",
         div { class: "auth-panel modal-card",
-            h2 { class: "modal-title", "Welcome to Scrabble PX" }
+            h2 { class: "modal-title", "Welcome to Tile Lite Elite" }
             p { class: "modal-copy", "Log in or register to create and play games." }
             div { class: "auth-panel-tabs",
                 button {

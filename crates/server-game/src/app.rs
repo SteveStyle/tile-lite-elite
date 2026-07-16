@@ -66,7 +66,7 @@ impl AppState {
 pub fn build_router(state: AppState) -> Router {
     // Admin routes are for operating the server, not for players — no
     // token or account, just "you're on the same machine as the server."
-    // The guard below enforces that regardless of what SCRABBLE_PX_BIND is
+    // The guard below enforces that regardless of what TILE_LITE_ELITE_BIND is
     // set to (docs/operations.md documents binding to 0.0.0.0 for LAN
     // play, which would otherwise expose these to the whole LAN too).
     let admin_routes = Router::new()
@@ -1869,7 +1869,7 @@ mod tests {
 
     fn test_database_url() -> String {
         let path = std::env::temp_dir().join(format!(
-            "scrabble-px-server-test-{}.sqlite3",
+            "tile-lite-elite-server-test-{}.sqlite3",
             Uuid::new_v4()
         ));
         std::fs::File::create(&path).expect("test sqlite file should be created");

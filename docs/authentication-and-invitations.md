@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Scrabble PX server provides two complementary systems:
+The Tile Lite Elite server provides two complementary systems:
 
 1. **Authentication** — Player identification and session management
 2. **Game Invitations** — Invite players to join games without needing to know all participants upfront

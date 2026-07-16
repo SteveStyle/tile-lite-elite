@@ -126,7 +126,7 @@ stop_web() {
 }
 
 status() {
-    echo "=== Scrabble PX Services Status ==="
+    echo "=== Tile Lite Elite Services Status ==="
     echo ""
 
     local server_tracked=false web_tracked=false

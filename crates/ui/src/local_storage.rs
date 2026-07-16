@@ -24,7 +24,7 @@ pub struct StoredAuth {
 }
 
 #[cfg(target_arch = "wasm32")]
-const STORAGE_KEY: &str = "scrabble_px_auth";
+const STORAGE_KEY: &str = "tile_lite_elite_auth";
 
 pub fn load() -> StoredAuth {
     load_impl().unwrap_or_default()
@@ -47,7 +47,7 @@ fn save_impl(auth: &StoredAuth) -> Result<(), String> {
 #[cfg(not(target_arch = "wasm32"))]
 fn config_file_path() -> Option<std::path::PathBuf> {
     let mut dir = dirs::config_dir()?;
-    dir.push("scrabble-px");
+    dir.push("tile-lite-elite");
     std::fs::create_dir_all(&dir).ok()?;
     dir.push("auth.json");
     Some(dir)
@@ -76,7 +76,7 @@ pub struct StoredChatWatermarks {
 }
 
 #[cfg(target_arch = "wasm32")]
-const CHAT_STORAGE_KEY: &str = "scrabble_px_chat_seen";
+const CHAT_STORAGE_KEY: &str = "tile_lite_elite_chat_seen";
 
 pub fn load_chat_watermarks() -> StoredChatWatermarks {
     load_chat_watermarks_impl().unwrap_or_default()
@@ -99,7 +99,7 @@ fn save_chat_watermarks_impl(watermarks: &StoredChatWatermarks) -> Result<(), St
 #[cfg(not(target_arch = "wasm32"))]
 fn chat_watermarks_file_path() -> Option<std::path::PathBuf> {
     let mut dir = dirs::config_dir()?;
-    dir.push("scrabble-px");
+    dir.push("tile-lite-elite");
     std::fs::create_dir_all(&dir).ok()?;
     dir.push("chat_watermarks.json");
     Some(dir)
