@@ -84,6 +84,11 @@ pub fn AuthPanel(
     let mut change_password_error = use_signal(|| None::<String>);
     let mut is_changing_password = use_signal(|| false);
 
+    let mut show_forgot_password = use_signal(|| false);
+    let mut forgot_password_email = use_signal(String::new);
+    let mut forgot_password_message = use_signal(|| None::<String>);
+    let mut is_requesting_reset = use_signal(|| false);
+
     if let Some(session) = session {
         return rsx! {
             div { class: "auth-widget",
@@ -224,6 +229,7 @@ pub fn AuthPanel(
     let server_url_for_email_enter = server_url.clone();
     let server_url_for_password_enter = server_url.clone();
     let server_url_for_button = server_url.clone();
+    let server_url_for_forgot_password = server_url.clone();
 
     rsx! {
         div { class: "modal-backdrop",
@@ -342,6 +348,70 @@ pub fn AuthPanel(
 
             if let Some(error) = error_message() {
                 p { class: "error-banner", "{error}" }
+            }
+
+            // Only meaningful once an account exists — Register mode has
+            // nothing to "forget" yet.
+            if mode() == AuthMode::Login {
+                button {
+                    class: "toggle-button toggle-button-muted",
+                    onclick: move |_| {
+                        show_forgot_password.set(!show_forgot_password());
+                        forgot_password_message.set(None);
+                    },
+                    "Forgot password?"
+                }
+            }
+            if show_forgot_password() {
+                div { class: "auth-panel",
+                    input {
+                        class: "auth-input",
+                        placeholder: "Email",
+                        value: "{forgot_password_email}",
+                        oninput: move |event| forgot_password_email.set(event.value()),
+                    }
+                    if let Some(message) = forgot_password_message() {
+                        p { class: "modal-copy", "{message}" }
+                    }
+                    div { class: "auth-panel-actions",
+                        button {
+                            class: "toggle-button toggle-button-muted",
+                            disabled: is_requesting_reset(),
+                            onclick: move |_| {
+                                show_forgot_password.set(false);
+                                forgot_password_email.set(String::new());
+                                forgot_password_message.set(None);
+                            },
+                            "Cancel"
+                        }
+                        button {
+                            class: "toggle-button",
+                            disabled: is_requesting_reset(),
+                            onclick: move |_| {
+                                let server_url = server_url_for_forgot_password.clone();
+                                let email_value = forgot_password_email().trim().to_string();
+                                if email_value.is_empty() {
+                                    forgot_password_message.set(Some("Enter the email you registered with".to_string()));
+                                    return;
+                                }
+                                spawn(async move {
+                                    is_requesting_reset.set(true);
+                                    // Same message whether or not the email is
+                                    // registered — the server's response
+                                    // already doesn't distinguish the two
+                                    // cases (see RequestPasswordResetRequest's
+                                    // doc comment), so neither should this UI.
+                                    let _ = crate::app::request_password_reset(&server_url, &email_value).await;
+                                    forgot_password_message.set(Some(
+                                        "If that email is registered, a reset link is on its way.".to_string(),
+                                    ));
+                                    is_requesting_reset.set(false);
+                                });
+                            },
+                            "Send reset link"
+                        }
+                    }
+                }
             }
 
             div { class: "modal-actions",

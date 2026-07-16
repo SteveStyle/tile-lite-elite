@@ -13,6 +13,9 @@ services:
     environment:
       TILE_LITE_ELITE_BIND: 0.0.0.0:3000
       TILE_LITE_ELITE_DATABASE_URL: sqlite:///data/tile-lite-elite.sqlite3
+      # Only used to build the link inside a password-reset email — see
+      # AppState::public_base_url's doc comment in crates/server-game/src/app.rs.
+      TILE_LITE_ELITE_PUBLIC_BASE_URL: https://tileliteelite.com
     volumes:
       - tile-lite-elite-data:/data
     restart: unless-stopped

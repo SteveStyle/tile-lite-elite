@@ -2,7 +2,7 @@
 
 ## Summary
 
-The project has successfully implemented the core MVP architecture: a server-authoritative Scrabble game system with a shared rules library, an engine plugin interface, multiple client types (web, desktop), a full invitation/matchmaking model, per-game move-time limits, structured logging, and a real production deployment (Docker + Caddy + automatic HTTPS, running on Oracle Cloud). All fundamental boundaries from the architecture doc are in place and working; most of what's left is optional/v1 scope (forgot-password, multiple engines) rather than gaps in the core loop.
+The project has successfully implemented the core MVP architecture: a server-authoritative Scrabble game system with a shared rules library, an engine plugin interface, multiple client types (web, desktop), a full invitation/matchmaking model, per-game move-time limits, structured logging, and a real production deployment (Docker + Caddy + automatic HTTPS, running on Oracle Cloud, at tileliteelite.com). All fundamental boundaries from the architecture doc are in place and working; most of what's left is optional/v1 scope (wiring an email provider into the already-built forgot-password flow, multiple engines) rather than gaps in the core loop.
 
 ## Architecture Alignment
 
@@ -248,12 +248,12 @@ The project has successfully implemented the core MVP architecture: a server-aut
 - **Missing**: sandboxing, diagnostics/explanation output, a test that actually forces the timeout branch
 
 **Authentication**:
-- ✅ Schema: players table, sessions table
-- ✅ POST /auth/register, /auth/login, /auth/validate, /auth/change-password — all fully implemented
+- ✅ Schema: players table, sessions table, password_reset_tokens table
+- ✅ POST /auth/register, /auth/login, /auth/validate, /auth/change-password, /auth/forgot-password, /auth/reset-password — all fully implemented
 - ✅ Bearer-token auth threaded through the client for every action-submitting request
 - ✅ Seat-ownership enforcement on every action-capable endpoint (`submit_action`, `start_game`, `preview_move`, `suggest_move`) — an unclaimed human seat is rejected for everyone, not treated as open
-- ✅ Login/Register/Change-password UI exists in `crates/ui` (web + desktop)
-- ⚠️ Email not verified in MVP (captured for future use); no "forgot password" flow exists (distinct from change-password, which requires being logged in already)
+- ✅ Login/Register/Change-password UI exists in `crates/ui` (web + desktop); Forgot-password/Reset-password UI exists too (a login-form toggle plus a standalone `/reset-password?token=...` landing page)
+- ⚠️ Email not verified in MVP (captured for future use). Forgot-password is mechanics-complete (token issuance/validation/consumption, session invalidation on reset, tested end-to-end) but has no email provider wired up yet — the reset link is logged server-side instead of sent. See `docs/authentication.md`'s status section.
 
 **Game Invitations**:
 - ✅ Schema includes game_invitations table, with `invited_player_id` nullable for open/stranger invitations
@@ -371,4 +371,4 @@ Expected next focus:
 
 ## Conclusion
 
-The architecture plan is **well-executed and now genuinely deployed**, not just running locally. The codebase correctly separates concerns, uses the right technologies (Rust, Axum, Dioxus, SQLite, Caddy), and has the foundation to support all documented features. Both clients work end-to-end today, including a real login/register/change-password flow, seat-ownership protection on every action, and a full invitation-based matchmaking model. The live deployment on Oracle Cloud, behind automatic HTTPS, closes out what was previously a purely local/dev-only project, and structured logging closes out what was previously the last major observability gap. The main remaining items are the part of auth not yet covered (forgot-password, blocked on registering a domain for transactional email), and optional/v1 features (multiple engines, engine benchmarking, a less manual deploy pipeline).
+The architecture plan is **well-executed and now genuinely deployed**, not just running locally. The codebase correctly separates concerns, uses the right technologies (Rust, Axum, Dioxus, SQLite, Caddy), and has the foundation to support all documented features. Both clients work end-to-end today, including a real login/register/change-password/forgot-password flow, seat-ownership protection on every action, and a full invitation-based matchmaking model. The live deployment on Oracle Cloud, behind automatic HTTPS at a real domain (tileliteelite.com), closes out what was previously a purely local/dev-only project, and structured logging closes out what was previously the last major observability gap. The main remaining items are wiring an actual email provider into the already-built forgot-password flow (it currently logs the reset link instead of emailing it), and optional/v1 features (multiple engines, engine benchmarking, a less manual deploy pipeline).

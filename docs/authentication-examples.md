@@ -341,7 +341,7 @@ The web client's equivalent uses real browser `localStorage` (via `gloo-storage`
 - ~~Implement session validation endpoint (`POST /auth/validate`)~~ — done.
 - ~~Integrate authentication UI into web/desktop clients~~ — done (Login/Register tabs, Remember me / Stay logged in checkboxes).
 - Add email verification flow with short codes.
-- Build the "forgot password" flow (`/auth/forgot-password`, `/auth/reset-password`) — currently nothing sends a reset link at all.
+- Wire up an email provider (Resend or similar) so `/auth/forgot-password` actually sends the reset link it already generates, instead of just logging it — see `docs/authentication.md`'s status section for what's built vs. what's left.
 - Implement automatic seat assignment when invitation is accepted (see `authentication-and-invitations.md`).
 - Extend seat-ownership checks beyond `submit_action` to `start_game`, `preview_move`, `suggest_move`, and the WebSocket events endpoint.
 - Add player search / discovery endpoint.

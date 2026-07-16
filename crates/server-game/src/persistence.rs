@@ -300,6 +300,26 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Mirrors `sessions`'s hashed-token/expiry shape rather than
+    // `game_invitations`'s plain-id shape — a reset token is an unguessable
+    // secret (never used as a REST resource id), so only its hash is ever
+    // stored. `consumed_at` is what invitations don't need: a reset token
+    // is single-use, so a token that's expired-but-unconsumed and one
+    // that's already-consumed are both invalid but for reportably different
+    // reasons.
+    sqlx::query(
+        "create table if not exists password_reset_tokens (
+            id text primary key,
+            player_id text not null,
+            token_hash text not null,
+            created_at text not null,
+            expires_at text not null,
+            consumed_at text
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -780,6 +800,40 @@ pub async fn get_player_by_name(
     }))
 }
 
+/// Case-sensitive exact match, same as `get_player_by_name` — email
+/// normalization (trimming, lowercasing) is the caller's job, matching how
+/// `register_player`/`login_player` already treat `display_name`.
+///
+/// `players.email` has no `unique` constraint (unlike `display_name`), so
+/// two accounts can already share an email today; if that ever happens,
+/// `fetch_optional` silently returns whichever row the query planner visits
+/// first and a password-reset request would only ever be able to reach that
+/// one account. Flagging rather than fixing here — deciding whether email
+/// should become unique (and what to do with any pre-existing duplicates)
+/// is a registration-flow decision, not a reset-flow one.
+pub async fn get_player_by_email(
+    pool: &Pool<Sqlite>,
+    email: &str,
+) -> Result<Option<PlayerRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        "select id, display_name, email, password_hash, created_at, updated_at, last_seen_at
+         from players where email = ?1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| PlayerRecord {
+        id: r.get(0),
+        display_name: r.get(1),
+        email: r.get(2),
+        password_hash: r.get(3),
+        created_at: r.get(4),
+        updated_at: r.get(5),
+        last_seen_at: r.get(6),
+    }))
+}
+
 pub async fn get_player_by_id(
     pool: &Pool<Sqlite>,
     id: &str,
@@ -893,6 +947,89 @@ pub async fn update_session_last_seen(pool: &Pool<Sqlite>, id: &str) -> Result<(
     sqlx::query("update sessions set last_seen_at = ?1 where id = ?2")
         .bind(&now)
         .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// ========== Password Reset Functions ==========
+
+#[derive(Debug, Clone)]
+pub struct PasswordResetTokenRecord {
+    pub id: String,
+    pub player_id: String,
+    pub token_hash: String,
+    pub created_at: String,
+    pub expires_at: String,
+    pub consumed_at: Option<String>,
+}
+
+pub async fn create_password_reset_token(
+    pool: &Pool<Sqlite>,
+    id: &str,
+    player_id: &str,
+    token_hash: &str,
+    expires_at: &str,
+) -> Result<(), sqlx::Error> {
+    let now = now_iso();
+    sqlx::query(
+        "insert into password_reset_tokens (id, player_id, token_hash, created_at, expires_at)
+         values (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(id)
+    .bind(player_id)
+    .bind(token_hash)
+    .bind(&now)
+    .bind(expires_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn get_password_reset_token_by_hash(
+    pool: &Pool<Sqlite>,
+    token_hash: &str,
+) -> Result<Option<PasswordResetTokenRecord>, sqlx::Error> {
+    let row = sqlx::query(
+        "select id, player_id, token_hash, created_at, expires_at, consumed_at
+         from password_reset_tokens where token_hash = ?1",
+    )
+    .bind(token_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| PasswordResetTokenRecord {
+        id: r.get(0),
+        player_id: r.get(1),
+        token_hash: r.get(2),
+        created_at: r.get(3),
+        expires_at: r.get(4),
+        consumed_at: r.get(5),
+    }))
+}
+
+pub async fn consume_password_reset_token(pool: &Pool<Sqlite>, id: &str) -> Result<(), sqlx::Error> {
+    let now = now_iso();
+    sqlx::query("update password_reset_tokens set consumed_at = ?1 where id = ?2")
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Called before issuing a fresh token so an account never has more than
+/// one outstanding reset link at a time — otherwise an older, still-valid
+/// link sitting in an inbox would stay just as usable as the newest one.
+/// Deletes rather than marks-consumed: an unconsumed-but-superseded token
+/// isn't "used", it's just moot, and deleting keeps the table from growing
+/// unboundedly for accounts that request a reset repeatedly.
+pub async fn invalidate_password_reset_tokens_for_player(
+    pool: &Pool<Sqlite>,
+    player_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("delete from password_reset_tokens where player_id = ?1 and consumed_at is null")
+        .bind(player_id)
         .execute(pool)
         .await?;
     Ok(())

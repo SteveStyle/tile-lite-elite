@@ -40,7 +40,7 @@ Create a new player account.
 **Notes:**
 - Store the `session_token` on the client — real browser `localStorage` on web, a plain (unencrypted) JSON file under the OS config directory on desktop. Neither is a secure secret store; see `authentication-examples.md` for the caveat.
 - The `password` is hashed with argon2 server-side; use it to log back in on another device.
-- Email is captured for future account recovery; no verification required in MVP, and no "forgot password" flow exists yet.
+- Email is captured for future account recovery; no verification required in MVP. The "forgot password" flow (`/auth/forgot-password`, `/auth/reset-password`) exists and works end-to-end, but has no email provider wired up yet — see `docs/authentication.md`'s status section.
 
 ### Login with Password
 

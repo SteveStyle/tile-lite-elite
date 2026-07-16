@@ -383,6 +383,25 @@ pub struct ValidateSessionRequest {
     pub session_token: String,
 }
 
+/// "Forgot password" — request a reset link by email. The response is the
+/// same (`204 No Content`) whether or not the email is registered, so this
+/// endpoint can't be used to enumerate accounts — same non-enumeration
+/// principle as `LoginPlayerRequest`'s shared error message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequestPasswordResetRequest {
+    pub email: String,
+}
+
+/// The second half of the flow: the caller presents the token from the
+/// emailed link (not the old password — proving control of the email
+/// address stands in for it, which is the whole point of this flow existing
+/// alongside `ChangePasswordRequest`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResetPasswordRequest {
+    pub token: String,
+    pub new_password: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlayerDto {
     pub id: String,

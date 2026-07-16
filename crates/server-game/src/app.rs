@@ -8,8 +8,8 @@ use api::{
     AdminGameSummaryDto, AdminResetPasswordRequest, ApiError, ChangePasswordRequest,
     CreateGameRequest, GameActionRequest, GameEventDto, GameInvitationDto, InvitationStatus,
     InvitePlayerRequest, LoginPlayerRequest, PlayerActionDto, PlayerDto, PlayerSessionDto,
-    PostChatMessageRequest, PreviewMoveRequest, RegisterPlayerRequest, StartGameRequest,
-    SwapSeatsRequest, ValidateSessionRequest,
+    PostChatMessageRequest, PreviewMoveRequest, RegisterPlayerRequest, RequestPasswordResetRequest,
+    ResetPasswordRequest, StartGameRequest, SwapSeatsRequest, ValidateSessionRequest,
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Path, Query, Request, State, WebSocketUpgrade};
@@ -37,10 +37,17 @@ pub struct AppState {
     pub games: Arc<RwLock<HashMap<String, GameSession>>>,
     pub events: broadcast::Sender<GameEventDto>,
     pub engines: EngineRegistry,
+    /// Where the web client is actually served from — needed server-side
+    /// only for building an absolute link into a password-reset email
+    /// (`{public_base_url}/reset-password?token=...`). Everything else the
+    /// server does is host-agnostic (see `TILE_LITE_ELITE_API_BASE_URL`'s
+    /// own doc comment in `docs/operations.md` for why the *client* doesn't
+    /// need this baked in), so this field exists solely for that one link.
+    pub public_base_url: String,
 }
 
 impl AppState {
-    pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
+    pub async fn new(database_url: &str, public_base_url: String) -> Result<Self, sqlx::Error> {
         let db = persistence::connect(database_url).await?;
         let engines = EngineRegistry::default();
         persistence::upsert_engine_profiles(&db, &engines.metadata()).await?;
@@ -59,6 +66,7 @@ impl AppState {
             games: Arc::new(RwLock::new(games)),
             events,
             engines,
+            public_base_url,
         })
     }
 }
@@ -90,6 +98,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/login", post(login_player))
         .route("/auth/validate", post(validate_session))
         .route("/auth/change-password", post(change_password))
+        .route("/auth/forgot-password", post(request_password_reset))
+        .route("/auth/reset-password", post(reset_password))
         // Games
         .route("/games", post(create_game).get(list_games))
         .route("/games/{game_id}", get(get_game))
@@ -1134,6 +1144,122 @@ async fn change_password(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// "Forgot password" step 1: request a reset link by email.
+///
+/// Always returns `204` whether or not the email is registered — same
+/// non-enumeration principle `login_player` already uses for its shared
+/// error message, just with a shared *success* instead, since this endpoint
+/// has no legitimate reason to distinguish the two outcomes to the caller.
+///
+/// No email provider is wired up yet (see `docs/authentication.md`) — the
+/// reset link is logged at `info` instead of sent, so the flow is complete
+/// and testable end-to-end already; swapping the `tracing::info!` below for
+/// a real send is the only change needed once Resend (or similar) is
+/// configured.
+async fn request_password_reset(
+    State(state): State<AppState>,
+    Json(request): Json<RequestPasswordResetRequest>,
+) -> Result<StatusCode, ApiProblem> {
+    let email = request.email.trim().to_string();
+    if email.is_empty() {
+        return Err(ApiProblem::bad_request("An email address is required"));
+    }
+
+    if let Some(player) = persistence::get_player_by_email(&state.db, &email)
+        .await
+        .map_err(ApiProblem::from_sqlx)?
+    {
+        persistence::invalidate_password_reset_tokens_for_player(&state.db, &player.id)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+
+        let token = Uuid::new_v4().to_string();
+        let expires_at = now_iso()
+            .parse::<u64>()
+            .map(|now| (now + PASSWORD_RESET_TOKEN_TTL_SECS).to_string())
+            .unwrap_or_default();
+        persistence::create_password_reset_token(
+            &state.db,
+            &Uuid::new_v4().to_string(),
+            &player.id,
+            &hash_token(&token),
+            &expires_at,
+        )
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+        let reset_url = format!("{}/reset-password?token={}", state.public_base_url, token);
+        tracing::info!(
+            player_id = %player.id,
+            reset_url = %reset_url,
+            "password reset requested; link logged instead of emailed (no mail provider configured yet)"
+        );
+    } else {
+        tracing::info!(email = %email, "password reset requested for unknown email");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// "Forgot password" step 2: consume the token from the emailed link.
+///
+/// Deliberately doesn't distinguish "token doesn't exist" from "token
+/// already consumed" from "token expired" in the *response* (all three are
+/// the same generic `bad_request` a stale/reused browser tab would hit
+/// legitimately) but does distinguish them in the log line, for anyone
+/// debugging a specific report of the flow not working.
+async fn reset_password(
+    State(state): State<AppState>,
+    Json(request): Json<ResetPasswordRequest>,
+) -> Result<StatusCode, ApiProblem> {
+    if request.new_password.is_empty() {
+        return Err(ApiProblem::bad_request("A new password is required"));
+    }
+
+    let invalid = || ApiProblem::bad_request("This reset link is invalid or has expired");
+
+    let record = persistence::get_password_reset_token_by_hash(&state.db, &hash_token(&request.token))
+        .await
+        .map_err(ApiProblem::from_sqlx)?
+        .ok_or_else(|| {
+            tracing::warn!("password reset rejected: unknown token");
+            invalid()
+        })?;
+
+    if record.consumed_at.is_some() {
+        tracing::warn!(player_id = %record.player_id, "password reset rejected: token already used");
+        return Err(invalid());
+    }
+
+    let expiry: u64 = record.expires_at.parse().unwrap_or(0);
+    let now: u64 = now_iso().parse().unwrap_or(u64::MAX);
+    if now > expiry {
+        tracing::warn!(player_id = %record.player_id, "password reset rejected: token expired");
+        return Err(invalid());
+    }
+
+    let new_hash = hash_password(&request.new_password)
+        .map_err(|_| ApiProblem::bad_request("Could not process that password"))?;
+    persistence::update_player_password(&state.db, &record.player_id, &new_hash)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+    persistence::consume_password_reset_token(&state.db, &record.id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+    // Same reasoning as change_password: a password reset should mean
+    // starting fresh, not silently keeping whatever session (if any)
+    // happened to still be around on some other device.
+    persistence::invalidate_sessions_for_player(&state.db, &record.player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+    tracing::info!(player_id = %record.player_id, "password reset via emailed token; all sessions invalidated");
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
 // ========== Game Invitation Handlers ==========
 
 async fn invite_player_to_game(
@@ -1453,6 +1579,11 @@ fn now_iso() -> String {
         .as_secs();
     seconds.to_string()
 }
+
+/// How long a password-reset link stays valid after it's requested. Short
+/// enough that a link sitting unread in an inbox for days can't be used,
+/// long enough that it isn't a race against actually receiving the email.
+const PASSWORD_RESET_TOKEN_TTL_SECS: u64 = 60 * 60;
 
 /// How long an engine gets to choose an action before the seat auto-passes.
 /// Hobby-project default; not yet configurable per engine or per game.
@@ -1859,10 +1990,11 @@ mod tests {
     };
     use serde::Serialize;
     use serde::de::DeserializeOwned;
+    use sqlx::Row;
     use tower::util::ServiceExt;
 
     async fn create_test_state(database_url: &str) -> AppState {
-        AppState::new(database_url)
+        AppState::new(database_url, "http://127.0.0.1:8080".to_string())
             .await
             .expect("test app state should initialize")
     }
@@ -5429,6 +5561,260 @@ mod tests {
             &LoginPlayerRequest {
                 display_name: "Alice".to_string(),
                 password: "a brand new password".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(new_login.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn forgot_password_returns_no_content_whether_or_not_the_email_is_registered() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        register_player(app.clone(), "Alice").await;
+
+        let known = send_json(
+            app.clone(),
+            Method::POST,
+            "/auth/forgot-password",
+            &RequestPasswordResetRequest {
+                email: "alice@example.com".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(known.status(), StatusCode::NO_CONTENT);
+
+        // Same response for an email nobody registered — an attacker
+        // probing this endpoint can't use the response to tell accounts
+        // apart from non-accounts.
+        let unknown = send_json(
+            app,
+            Method::POST,
+            "/auth/forgot-password",
+            &RequestPasswordResetRequest {
+                email: "nobody@example.com".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn forgot_password_issues_exactly_one_live_token_and_retires_earlier_ones() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        register_player(app.clone(), "Alice").await;
+        let alice = persistence::get_player_by_email(&state.db, "alice@example.com")
+            .await
+            .expect("query should succeed")
+            .expect("alice should exist");
+
+        send_json(
+            app.clone(),
+            Method::POST,
+            "/auth/forgot-password",
+            &RequestPasswordResetRequest {
+                email: "alice@example.com".to_string(),
+            },
+        )
+        .await;
+        let first_token_id = {
+            let rows = sqlx::query("select id from password_reset_tokens where player_id = ?1")
+                .bind(&alice.id)
+                .fetch_all(&state.db)
+                .await
+                .expect("query should succeed");
+            assert_eq!(rows.len(), 1, "exactly one token after the first request");
+            rows[0].get::<String, _>(0)
+        };
+
+        // Requesting again retires the first token rather than leaving both
+        // valid — only the newest emailed link should ever work.
+        send_json(
+            app,
+            Method::POST,
+            "/auth/forgot-password",
+            &RequestPasswordResetRequest {
+                email: "alice@example.com".to_string(),
+            },
+        )
+        .await;
+        let rows = sqlx::query("select id from password_reset_tokens where player_id = ?1")
+            .bind(&alice.id)
+            .fetch_all(&state.db)
+            .await
+            .expect("query should succeed");
+        assert_eq!(rows.len(), 1, "still exactly one token after the second request");
+        assert_ne!(
+            rows[0].get::<String, _>(0),
+            first_token_id,
+            "the second request's token should replace, not join, the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn reset_password_rejects_an_unknown_token() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_json(
+            app,
+            Method::POST,
+            "/auth/reset-password",
+            &ResetPasswordRequest {
+                token: "not-a-real-token".to_string(),
+                new_password: "whatever new password".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reset_password_rejects_an_expired_token() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let token = Uuid::new_v4().to_string();
+        persistence::create_password_reset_token(
+            &state.db,
+            &Uuid::new_v4().to_string(),
+            &alice.player_id,
+            &hash_token(&token),
+            "0", // already expired (epoch second 0)
+        )
+        .await
+        .expect("token should be created");
+
+        let response = send_json(
+            app,
+            Method::POST,
+            "/auth/reset-password",
+            &ResetPasswordRequest {
+                token,
+                new_password: "whatever new password".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reset_password_rejects_a_token_already_used_once() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let token = Uuid::new_v4().to_string();
+        let far_future = (now_iso().parse::<u64>().unwrap() + 3600).to_string();
+        persistence::create_password_reset_token(
+            &state.db,
+            &Uuid::new_v4().to_string(),
+            &alice.player_id,
+            &hash_token(&token),
+            &far_future,
+        )
+        .await
+        .expect("token should be created");
+
+        let first = send_json(
+            app.clone(),
+            Method::POST,
+            "/auth/reset-password",
+            &ResetPasswordRequest {
+                token: token.clone(),
+                new_password: "first new password".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+        // Re-presenting the same (now-consumed) token — e.g. a second click
+        // on the same emailed link, or an attacker replaying an
+        // intercepted-but-already-used one — must not work a second time.
+        let second = send_json(
+            app,
+            Method::POST,
+            "/auth/reset-password",
+            &ResetPasswordRequest {
+                token,
+                new_password: "second new password".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reset_password_succeeds_updates_password_and_signs_out_existing_sessions() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let token = Uuid::new_v4().to_string();
+        let far_future = (now_iso().parse::<u64>().unwrap() + 3600).to_string();
+        persistence::create_password_reset_token(
+            &state.db,
+            &Uuid::new_v4().to_string(),
+            &alice.player_id,
+            &hash_token(&token),
+            &far_future,
+        )
+        .await
+        .expect("token should be created");
+
+        let response = send_json(
+            app.clone(),
+            Method::POST,
+            "/auth/reset-password",
+            &ResetPasswordRequest {
+                token,
+                new_password: "reset via emailed token".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The session that existed before the reset (from registering) no
+        // longer works — a reset should mean starting fresh, same as a
+        // self-service change-password.
+        let old_session = send_empty_auth(
+            app.clone(),
+            Method::GET,
+            "/games",
+            Some(&alice.session_token),
+        )
+        .await;
+        assert_eq!(old_session.status(), StatusCode::UNAUTHORIZED);
+
+        let old_login = send_json(
+            app.clone(),
+            Method::POST,
+            "/auth/login",
+            &LoginPlayerRequest {
+                display_name: "Alice".to_string(),
+                password: "correct horse battery staple".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(old_login.status(), StatusCode::BAD_REQUEST);
+
+        let new_login = send_json(
+            app,
+            Method::POST,
+            "/auth/login",
+            &LoginPlayerRequest {
+                display_name: "Alice".to_string(),
+                password: "reset via emailed token".to_string(),
             },
         )
         .await;

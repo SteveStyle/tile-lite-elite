@@ -18,7 +18,7 @@ use tokio_tungstenite::connect_async;
 
 use crate::components::auth_panel::AuthPanel;
 use crate::components::games_panel::GamesPanel;
-use crate::views::Home;
+use crate::views::{Home, ResetPassword};
 
 const MAIN_CSS: Asset = asset!("/assets/styling/main.css");
 pub(crate) const BOARD_WIDTH: usize = 15;
@@ -448,6 +448,9 @@ pub fn RootApp() -> Element {
     rsx! {
         document::Link { rel: "stylesheet", href: MAIN_CSS }
 
+        if let Some(token) = reset_password_token_from_url() {
+            ResetPassword { server_url: server_url.clone(), token }
+        } else {
         div { class: "app-shell",
             header { class: "topbar",
                 p { class: "topbar-kicker", "Tile Lite Elite" }
@@ -1340,6 +1343,7 @@ pub fn RootApp() -> Element {
                 }
             }
         }
+        }
     }
 }
 fn empty_live_game() -> GameStateDto {
@@ -1464,6 +1468,35 @@ pub(crate) async fn change_password(
     post_no_content(
         &format!("{server_url}/auth/change-password"),
         Some(token),
+        &request,
+    )
+    .await
+}
+
+pub(crate) async fn request_password_reset(server_url: &str, email: &str) -> Result<(), String> {
+    let request = api::RequestPasswordResetRequest {
+        email: email.to_string(),
+    };
+    post_no_content(
+        &format!("{server_url}/auth/forgot-password"),
+        None,
+        &request,
+    )
+    .await
+}
+
+pub(crate) async fn reset_password(
+    server_url: &str,
+    token: &str,
+    new_password: &str,
+) -> Result<(), String> {
+    let request = api::ResetPasswordRequest {
+        token: token.to_string(),
+        new_password: new_password.to_string(),
+    };
+    post_no_content(
+        &format!("{server_url}/auth/reset-password"),
+        None,
         &request,
     )
     .await
@@ -2100,6 +2133,32 @@ fn with_token_query(url: String, token: Option<&str>) -> String {
         Some(token) => format!("{url}?token={token}"),
         None => url,
     }
+}
+
+/// The app has no router (see `crates/ui/src/views/reset_password.rs`'s doc
+/// comment for why) — this is the one place a URL path/query is read to
+/// decide what to render. Only meaningful on web: a password-reset link is
+/// always clicked from an email client into a browser, never opened by the
+/// desktop build, which has no URL bar to land a deep link on.
+#[cfg(target_arch = "wasm32")]
+fn reset_password_token_from_url() -> Option<String> {
+    let location = web_sys::window()?.location();
+    if location.pathname().ok()?.trim_end_matches('/') != "/reset-password" {
+        return None;
+    }
+    let search = location.search().ok()?;
+    // Tokens are plain UUIDs (hex digits and hyphens only), so there's
+    // nothing here that could need percent-decoding — a plain split is
+    // enough without pulling in a URL-encoding crate for this one call site.
+    search.strip_prefix('?')?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "token" && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn reset_password_token_from_url() -> Option<String> {
+    None
 }
 
 #[cfg(target_arch = "wasm32")]

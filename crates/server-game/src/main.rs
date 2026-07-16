@@ -18,7 +18,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("TILE_LITE_ELITE_DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://data/tile-lite-elite.sqlite3".to_string());
     let bind = std::env::var("TILE_LITE_ELITE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
-    let state = AppState::new(&database_url).await?;
+    // Only used to build the link inside a password-reset email — see
+    // `AppState::public_base_url`'s doc comment. Defaults to the local web
+    // dev server so the flow works out of the box in dev without this var
+    // set; production sets it explicitly (docker-compose.yml).
+    let public_base_url = std::env::var("TILE_LITE_ELITE_PUBLIC_BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let state = AppState::new(&database_url, public_base_url).await?;
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind.parse::<SocketAddr>()?).await?;
 
