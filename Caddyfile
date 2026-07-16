@@ -12,8 +12,13 @@
 # all Caddy needs to provision and renew HTTPS automatically: giving it a
 # domain here instead of a bare port is the entire config change. Plain
 # :80 requests get redirected to https:// automatically too.
+#
+# Registered tileliteelite.com on 2026-07-16 (A record -> 129.151.69.246,
+# plus GoDaddy's default www CNAME to the root domain) and kept the
+# sslip.io address alongside it as a fallback that needs no DNS at all —
+# Caddy obtains and renews certs for every hostname listed here.
 
-129.151.69.246.sslip.io {
+tileliteelite.com, www.tileliteelite.com, 129.151.69.246.sslip.io {
 	encode zstd gzip
 
 	# Caddy's automatic directive ordering runs try_files/file_server before
