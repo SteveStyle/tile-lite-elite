@@ -102,10 +102,10 @@ cat <<EOF
 
 ==> Tooling setup done. Two manual steps left (see docs/operations.md):
     1. Copy your Oracle deploy SSH key back in:
-         ~/.ssh/oracle_scrabble (private) and .pub — from your Windows backup.
+         ~/.ssh/oracle_tile_lite_elite (private) and .pub — from your Windows backup.
     2. Start a new shell (for the docker group to take effect), then verify:
          cargo test --workspace
          dx --version
          docker compose version
-         ssh -i ~/.ssh/oracle_scrabble ubuntu@129.151.69.246 echo ok
+         ssh -i ~/.ssh/oracle_tile_lite_elite ubuntu@129.151.69.246 echo ok
 EOF

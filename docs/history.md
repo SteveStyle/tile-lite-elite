@@ -31,7 +31,7 @@ The next step was to turn the prototype logic into a server-owned game platform 
 
 This is the point where the project stopped being a single game loop and became a reusable multiplayer system.
 
-**This phase is now substantially built**: an Axum server holds authoritative game state, a shared pure-Rust rules crate handles legality and scoring, a `ScrabbleEngine` trait lets engines plug in (GreedyEngine is the reference implementation), and both a web and a desktop client run against the same API. See `IMPLEMENTATION_STATUS.md` for the detailed, current breakdown of what's done versus what's still open.
+**This phase is now substantially built**: an Axum server holds authoritative game state, a shared pure-Rust rules crate handles legality and scoring, a `GameEngine` trait lets engines plug in (GreedyEngine is the reference implementation), and both a web and a desktop client run against the same API. See `IMPLEMENTATION_STATUS.md` for the detailed, current breakdown of what's done versus what's still open.
 
 ## Phase 4: Player Identity
 

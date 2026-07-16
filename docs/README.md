@@ -1,6 +1,6 @@
 # Tile Lite Elite Docs
 
-This folder collects the project plan and architecture notes for the final version of the Scrabble project.
+This folder collects the project plan and architecture notes for the final version of the Tile Lite Elite project.
 
 ## Documents
 

@@ -18,13 +18,13 @@ set -euo pipefail
 # Configure via environment variables (defaults match the current VM):
 #   DEPLOY_HOST      Public IP or hostname of the VM (default: 129.151.69.246)
 #   DEPLOY_USER      SSH user (default: ubuntu)
-#   DEPLOY_SSH_KEY   Private key path (default: ~/.ssh/oracle_scrabble)
+#   DEPLOY_SSH_KEY   Private key path (default: ~/.ssh/oracle_tile_lite_elite)
 #   DEPLOY_REMOTE_DIR  Directory on the VM holding docker-compose.yml (default: tile-lite-elite)
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DEPLOY_HOST="${DEPLOY_HOST:-129.151.69.246}"
 DEPLOY_USER="${DEPLOY_USER:-ubuntu}"
-DEPLOY_SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/.ssh/oracle_scrabble}"
+DEPLOY_SSH_KEY="${DEPLOY_SSH_KEY:-$HOME/.ssh/oracle_tile_lite_elite}"
 DEPLOY_REMOTE_DIR="${DEPLOY_REMOTE_DIR:-tile-lite-elite}"
 
 SSH_OPTS=(-i "$DEPLOY_SSH_KEY" -o ConnectTimeout=10)

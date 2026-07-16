@@ -6,7 +6,7 @@ use api::{
     MoveCandidateDto, MoveRecordDto, ParticipantDto, PositionDto, PremiumDto, RackDto, SeatKind,
     TileDto, TilePlacementDto,
 };
-use engine_core::{EngineAction, EngineMetadata, EngineRequest, GreedyEngine, ScrabbleEngine};
+use engine_core::{EngineAction, EngineMetadata, EngineRequest, GreedyEngine, GameEngine};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rules_shared::{
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
 pub struct EngineRegistry {
-    pub engines: Vec<Arc<dyn ScrabbleEngine>>,
+    pub engines: Vec<Arc<dyn GameEngine>>,
 }
 
 impl Default for EngineRegistry {
@@ -36,7 +36,7 @@ impl EngineRegistry {
             .collect()
     }
 
-    pub fn find(&self, id: &str) -> Option<Arc<dyn ScrabbleEngine>> {
+    pub fn find(&self, id: &str) -> Option<Arc<dyn GameEngine>> {
         self.engines
             .iter()
             .find(|engine| engine.metadata().id == id)

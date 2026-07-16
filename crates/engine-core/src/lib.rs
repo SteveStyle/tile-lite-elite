@@ -54,7 +54,7 @@ pub struct EngineDiagnostics {
     pub chosen_score: Option<Score>,
 }
 
-pub trait ScrabbleEngine: Send + Sync {
+pub trait GameEngine: Send + Sync {
     fn metadata(&self) -> &EngineMetadata;
 
     fn choose_action(&self, request: EngineRequest<'_>) -> EngineResponse;
@@ -105,7 +105,7 @@ impl Default for GreedyEngine {
     }
 }
 
-impl ScrabbleEngine for GreedyEngine {
+impl GameEngine for GreedyEngine {
     fn metadata(&self) -> &EngineMetadata {
         &self.metadata
     }
@@ -156,7 +156,7 @@ impl ScrabbleEngine for GreedyEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineAction, EngineRequest, GreedyEngine, ScrabbleEngine};
+    use super::{EngineAction, EngineRequest, GreedyEngine, GameEngine};
     use rules_shared::{GameState, Letter, Rack, SOWPODS, VariantRules};
 
     #[test]

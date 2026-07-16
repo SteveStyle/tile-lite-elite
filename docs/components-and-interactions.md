@@ -1,6 +1,6 @@
 # Components And Interactions
 
-This document sketches the first-pass component model and the main interaction flows for the final Scrabble system.
+This document sketches the first-pass component model and the main interaction flows for the final Tile Lite Elite system.
 
 ## Component Diagram
 

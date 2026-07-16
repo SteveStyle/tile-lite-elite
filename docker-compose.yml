@@ -47,8 +47,9 @@ volumes:
   #
   # Explicit `name:` on every volume below, rather than letting Compose
   # derive one from the containing directory's basename — that basename is
-  # otherwise the *actual* volume name (e.g. `scrabble-px_scrabble-data`),
-  # so renaming the project directory would silently start a fresh, empty
+  # otherwise the *actual* volume name (e.g. `tile-lite-elite_scrabble-data`,
+  # or `scrabble-px_scrabble-data` before the 2026-07-16 rename), so
+  # renaming the project directory would silently start a fresh, empty
   # volume on next deploy instead of reattaching to the existing one.
   tile-lite-elite-data:
     name: tile-lite-elite-data

@@ -34,7 +34,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
   - EngineMetadata struct with versioning (id, name, version, author, description, supported_variants)
   - EngineCapabilities (supports_timed_play, supports_analysis, supports_ranking)
   - EngineRequest contract (state, seat_number, rack, time_budget_ms)
-  - ScrabbleEngine trait (abstracts move generation)
+  - GameEngine trait (abstracts move generation)
   - GreedyEngine impl (simple greedy move selection)
 - **Notes**: Properly versioned from the start; GreedyEngine is reference implementation
 
@@ -88,7 +88,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
   - EngineRegistry plugs engines into seats
 
 - [x] One stable engine interface
-  - ScrabbleEngine trait with metadata and versioning
+  - GameEngine trait with metadata and versioning
   - EngineMetadata includes id, version, author, description
   - EngineRequest contract is stable
   - GreedyEngine reference implementation

@@ -43,8 +43,8 @@ View logs while running:
 The dev machine (currently WSL2 Ubuntu, treated as disposable/recreatable — see below) needs: a Rust toolchain, the `wasm32-unknown-unknown` target, `dioxus-cli` and `wasm-bindgen-cli` at versions that match this project exactly (a mismatch fails confusingly rather than cleanly — see "Known Build Issues" below), `sccache`, and Docker Engine (for [Container Deployment](#container-deployment)).
 
 ```bash
-git clone https://github.com/SteveStyle/scrabble-px.git
-cd scrabble-px
+git clone https://github.com/SteveStyle/tile-lite-elite.git
+cd tile-lite-elite
 ./scripts/setup-dev-environment.sh
 ```
 
@@ -52,7 +52,7 @@ The script is idempotent (safe to re-run; every step checks whether it's already
 
 **Two things it deliberately doesn't do**, both manual:
 
-1. **Restore the Oracle deploy SSH key.** It's a secret, not something a setup script should generate or fetch on its own. Copy `~/.ssh/oracle_scrabble` (private) and `.pub` back in from wherever you backed them up (this project's key is also kept on the Windows side, outside WSL, for exactly this recreate-the-VM-is-fine-the-key-survives scenario).
+1. **Restore the Oracle deploy SSH key.** It's a secret, not something a setup script should generate or fetch on its own. Copy `~/.ssh/oracle_tile_lite_elite` (private) and `.pub` back in from wherever you backed them up (this project's key is also kept on the Windows side, outside WSL, for exactly this recreate-the-VM-is-fine-the-key-survives scenario).
 2. **Enable systemd in WSL**, if this is a fresh WSL instance and it's not already on. Docker needs it to manage its service. This is a Windows-side edit, not something a script running inside the distro can safely do to itself:
    ```
    # /etc/wsl.conf
@@ -67,7 +67,7 @@ The script is idempotent (safe to re-run; every step checks whether it's already
 cargo test --workspace
 dx --version                 # should include 0.6.3
 docker compose version
-ssh -i ~/.ssh/oracle_scrabble ubuntu@129.151.69.246 echo ok
+ssh -i ~/.ssh/oracle_tile_lite_elite ubuntu@129.151.69.246 echo ok
 ```
 
 ## Architecture
@@ -99,7 +99,7 @@ tile-lite-elite/
 ├── crates/                  # the six workspace crates
 │   ├── api/                 # shared request/response DTOs
 │   ├── rules-shared/        # pure rules/scoring/move-generation
-│   ├── engine-core/         # ScrabbleEngine trait + GreedyEngine
+│   ├── engine-core/         # GameEngine trait + GreedyEngine
 │   ├── server-game/         # Axum backend
 │   ├── ui/                  # Dioxus web/desktop client
 │   └── admin-cli/           # tile-lite-elite-admin operator CLI
@@ -213,7 +213,7 @@ The admin CLI — crate `crates/admin-cli`, binary/command name `tile-lite-elite
 **The Oracle VM's (or any container deployment's) server**: `scripts/admin.sh` can't reach it — it always targets `127.0.0.1`, and that's a different loopback than the VM's, by design (see above; pointing `--server`/`TILE_LITE_ELITE_API_BASE_URL` at the VM's public address from your own machine just gets a 403, it isn't a workaround). Run it *inside* the server container instead, where `127.0.0.1` genuinely is that container.  An alias 'sa' has been created which allows it to be called from any directory.
 
 ```bash
-ssh -i ~/.ssh/oracle_scrabble ubuntu@129.151.69.246
+ssh -i ~/.ssh/oracle_tile_lite_elite ubuntu@129.151.69.246
 sa games list
 cd ~/tile-lite-elite
 docker compose exec server tile-lite-elite-admin games list
@@ -262,7 +262,7 @@ No test coverage for `admin-cli` (it's a thin HTTP client with no logic of its o
 | `TILE_LITE_ELITE_BIND` | `127.0.0.1:3000` | Server listen address |
 | `TILE_LITE_ELITE_DATABASE_URL` | `sqlite://data/tile-lite-elite.sqlite3` | SQLite database path |
 | `TILE_LITE_ELITE_API_BASE_URL` | `http://127.0.0.1:3000` | Backend URL used by clients. Set at *build* time (`option_env!`), not runtime. An explicit empty string means "same origin as the page" — see [Container Deployment](#container-deployment) |
-| `SCRABBLE_UI_PORT` | `8080` | Web dev server port |
+| `TILE_LITE_ELITE_UI_PORT` | `8080` | Web dev server port |
 | `RUST_LOG` | `server_game=info,tower_http=info,warn` | Log verbosity for `server-game`. See [Logging](#logging) |
 | `TILE_LITE_ELITE_BUILD_ID` | unset | Optional build identifier baked in at *build* time (`option_env!`), appended as SemVer build metadata to the app version (e.g. `0.1.0+a1c9f02`). Unset (the default, used for production releases) shows only `Major.Minor.Patch`. See [Versioning](#versioning) |
 
@@ -376,7 +376,7 @@ There's no CI and no registry involved — this is a manual, on-demand push from
 If the change involves schema changes then the database should be backed up and then removed.  It will be recreated when the updated server starts to run.
 
 ```bash
-ssh scrabble-px
+ssh tile-lite-elite
 cd ~/tile-lite-elite
 
 # 1. Stop services — leaves the named volumes (tile-lite-elite-data, tile-lite-elite-caddy-data,
@@ -410,7 +410,7 @@ The live instance runs on Oracle Cloud's **Always Free** tier — genuinely free
    - **A VCN can have more than one Security List, and only the one actually attached to your specific subnet matters.** We hit this directly: a "Default Security List" had SSH already open, but the subnet in use was actually attached to a *different*, completely empty security list (no ingress, no egress — blocking outbound too, e.g. `apt-get`). Check **Subnet → Security tab** (not the subnet's Details tab, which doesn't show this) to see which list(s) are really attached, and add ingress rules there specifically. Traffic is allowed if *either* the security list *or* an NSG permits it (not both required), so one correctly-configured security list is enough — no need to also chase down the NSG the quick action created.
    - Ingress rules needed: TCP 22 (SSH), TCP 80 (HTTP), TCP 443 + UDP 443 (HTTPS, the UDP for optional HTTP/3). Egress: allow all — the default "TCP only" some security lists ship with can block outbound DNS (UDP 53), stopping `apt-get`/Docker pulls from working even though the instance is otherwise reachable.
 5. **Install Docker** on the VM (standard `apt` install from Docker's official repo — see their docs) and add a swapfile given the tight RAM (`fallocate`/`mkswap`/`swapon`, persist via `/etc/fstab`) — running the containers fits comfortably in 1GB, but the extra headroom is cheap insurance.
-6. **`scp` the SSH key's *public* half only** into the instance creation form; keep the private key local (`~/.ssh/oracle_scrabble` in this setup) — it's what `scripts/deploy.sh` and manual `ssh`/`scp` commands use.
+6. **`scp` the SSH key's *public* half only** into the instance creation form; keep the private key local (`~/.ssh/oracle_tile_lite_elite` in this setup) — it's what `scripts/deploy.sh` and manual `ssh`/`scp` commands use.
 
 ### HTTPS
 
