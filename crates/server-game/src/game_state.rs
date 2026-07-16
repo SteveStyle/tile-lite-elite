@@ -159,6 +159,14 @@ pub struct ParticipantState {
     pub score: i32,
     pub rack: Rack,
     pub resigned: bool,
+    /// This seat's player has hidden the (finished) game from their own
+    /// games list — see `GameSession::remove_for_player`. Purely a
+    /// per-viewer display concern: the game itself, and every other
+    /// participant's view of it, is completely unaffected. Missing on any
+    /// game persisted before this field existed, same as `resigned` would
+    /// be if it were added today.
+    #[serde(default)]
+    pub removed_by_player: bool,
 }
 
 /// Number of consecutive scoreless plays (passes or exchanges), summed
@@ -194,6 +202,15 @@ pub struct GameSession {
     /// they hold no seat at all. `None` only for games persisted before
     /// this field existed.
     pub creator_player_id: Option<String>,
+    /// The creator has hidden this (finished) game from their own games
+    /// list — the `creator_player_id` counterpart to
+    /// `ParticipantState::removed_by_player`. Belongs to the game itself
+    /// rather than to any seat because an unseated creator (e.g. an Engine
+    /// vs Engine game set up to watch) has no seat to carry the flag —
+    /// `remove_for_player` only ever sets this when the caller isn't seated
+    /// at all; a seated creator's removal goes on their own seat instead,
+    /// same as any other participant.
+    pub removed_by_creator: bool,
     pub random_seed: u64,
     pub rules: VariantRules,
     pub state: GameState,
@@ -239,6 +256,7 @@ impl GameSession {
             final_bonus_seat: None,
             final_bonus_points: None,
             creator_player_id,
+            removed_by_creator: false,
             random_seed,
             rules,
             state,
@@ -250,6 +268,39 @@ impl GameSession {
             move_time_limit_seconds,
             turn_started_at: now_unix_seconds().to_string(),
         }
+    }
+
+    /// Swaps two seats' positions — and with them, turn order, since
+    /// `current_seat`/rack refill/every other turn-taking mechanism walks
+    /// `participants` by index (see `start`, `apply_place_move`, etc.), not
+    /// by any separately-tracked ordering. Only meaningful before the game
+    /// starts (turn order is fixed the moment play begins) and only once
+    /// every seat is actually filled — this sidesteps the game's pending
+    /// `game_invitations` rows (keyed by `seat_number`) ever going stale,
+    /// since a pending invitation only exists for an unclaimed seat, and
+    /// none can exist once every seat has a real occupant.
+    pub fn swap_seats(&mut self, seat_a: u8, seat_b: u8) -> Result<(), String> {
+        if self.status != GameStatus::Waiting {
+            return Err("Seats can only be reordered before the game starts".to_string());
+        }
+        if self
+            .participants
+            .iter()
+            .any(|participant| participant.kind == SeatKind::Human && participant.player_id.is_none())
+        {
+            return Err("Every seat must be filled before seats can be reordered".to_string());
+        }
+        let a = seat_a as usize;
+        let b = seat_b as usize;
+        if a >= self.participants.len() || b >= self.participants.len() {
+            return Err("Unknown seat".to_string());
+        }
+        if a != b {
+            self.participants.swap(a, b);
+            self.participants[a].seat_number = a as u8;
+            self.participants[b].seat_number = b as u8;
+        }
+        Ok(())
     }
 
     pub fn start(&mut self) {
@@ -335,6 +386,7 @@ impl GameSession {
             last_activity_at,
             move_time_limit_seconds: self.move_time_limit_seconds,
             turn_started_at: self.turn_started_at.clone(),
+            last_message_at: self.messages.last().map(|message| message.created_at.clone()),
             // Caller-relative fields — `list_games` fills these in per
             // requester since "why does this game show up" depends on who's
             // asking, not on the game itself.
@@ -598,6 +650,37 @@ impl GameSession {
             .map(|other| other.seat_number);
         self.status = GameStatus::Finished;
         Ok(())
+    }
+
+    /// Hides a finished game from one seat's player — a purely per-viewer
+    /// display concern (see `ParticipantState::removed_by_player`), not a
+    /// deletion: the game keeps playing for/existing to everyone else, and
+    /// still expires normally via the existing 7-day auto-delete regardless
+    /// of who's removed it. Only offered for finished games, matching the
+    /// UI's "Remove" button, which only appears once a game is over.
+    pub fn remove_for_player(&mut self, player_id: &str) -> Result<(), String> {
+        if self.status != GameStatus::Finished {
+            return Err("Only finished games can be removed".to_string());
+        }
+        // A seated caller (including a creator who also claimed a seat,
+        // e.g. the "vs Engine"/"Play Friend" presets) has their own seat to
+        // carry the flag, checked first same as `resolve_viewer_access`
+        // preferring `Participant` over `Creator`. Only an unseated
+        // creator (e.g. watching an Engine vs Engine game) falls through to
+        // the game-level flag, since they have no seat of their own.
+        if let Some(participant) = self
+            .participants
+            .iter_mut()
+            .find(|participant| participant.player_id.as_deref() == Some(player_id))
+        {
+            participant.removed_by_player = true;
+            return Ok(());
+        }
+        if self.creator_player_id.as_deref() == Some(player_id) {
+            self.removed_by_creator = true;
+            return Ok(());
+        }
+        Err("You are not a participant in this game".to_string())
     }
 
     /// Runs the current seat's engine (if any) and applies its chosen action
@@ -1017,6 +1100,7 @@ mod tests {
             score: 0,
             rack: Rack::default(),
             resigned: false,
+            removed_by_player: false,
         }
     }
 
@@ -1157,5 +1241,101 @@ mod tests {
         assert_eq!(game.messages[0].display_name, "Bob");
         // Trimmed, matching `post_chat_message`'s own doc comment.
         assert_eq!(game.messages[0].body, "gg");
+    }
+
+    #[test]
+    fn remove_for_player_rejects_a_game_that_is_not_finished() {
+        let mut game = two_human_game(Some("alice"));
+        let result = game.remove_for_player("alice");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remove_for_player_rejects_someone_not_seated_in_the_game() {
+        let mut game = two_human_game(Some("alice"));
+        game.start();
+        game.apply_resign(0).expect("alice should be able to resign");
+        let result = game.remove_for_player("carol");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn remove_for_player_only_marks_the_calling_seat() {
+        let mut game = two_human_game(Some("alice"));
+        game.start();
+        game.apply_resign(0).expect("alice should be able to resign");
+        game.remove_for_player("alice")
+            .expect("alice is seated in this finished game");
+        assert!(game.participants[0].removed_by_player);
+        assert!(!game.participants[1].removed_by_player);
+    }
+
+    #[test]
+    fn remove_for_player_falls_back_to_the_game_level_flag_for_an_unseated_creator() {
+        // An Engine vs Engine game: the creator holds no seat at all, so
+        // there's no `ParticipantState` for `remove_for_player` to mark —
+        // it should fall back to `GameSession.removed_by_creator` instead.
+        let mut game = GameSession::new(
+            "game-2".to_string(),
+            vec![
+                participant(0, SeatKind::Engine, None),
+                participant(1, SeatKind::Engine, None),
+            ],
+            Some("carol".to_string()),
+            42,
+            VariantRules::official(),
+            3600,
+        );
+        game.status = GameStatus::Finished;
+        game.remove_for_player("carol")
+            .expect("carol created this game and should be able to remove it");
+        assert!(game.removed_by_creator);
+        assert!(game.participants.iter().all(|p| !p.removed_by_player));
+    }
+
+    #[test]
+    fn swap_seats_reorders_participants_and_updates_seat_numbers() {
+        let mut game = two_human_game(Some("alice"));
+        assert_eq!(game.participants[0].player_id.as_deref(), Some("alice"));
+        assert_eq!(game.participants[1].player_id.as_deref(), Some("bob"));
+
+        game.swap_seats(0, 1).expect("both seats are filled and the game hasn't started");
+
+        assert_eq!(game.participants[0].player_id.as_deref(), Some("bob"));
+        assert_eq!(game.participants[0].seat_number, 0);
+        assert_eq!(game.participants[1].player_id.as_deref(), Some("alice"));
+        assert_eq!(game.participants[1].seat_number, 1);
+    }
+
+    #[test]
+    fn swap_seats_rejects_an_unknown_seat() {
+        let mut game = two_human_game(Some("alice"));
+        let result = game.swap_seats(0, 5);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn swap_seats_rejects_once_the_game_has_started() {
+        let mut game = two_human_game(Some("alice"));
+        game.start();
+        let result = game.swap_seats(0, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn swap_seats_rejects_while_a_human_seat_is_still_unclaimed() {
+        let mut game = GameSession::new(
+            "game-3".to_string(),
+            vec![
+                participant(0, SeatKind::Human, Some("alice")),
+                participant(1, SeatKind::Human, None),
+            ],
+            Some("alice".to_string()),
+            42,
+            VariantRules::official(),
+            3600,
+        );
+        let result = game.swap_seats(0, 1);
+        assert!(result.is_err());
     }
 }

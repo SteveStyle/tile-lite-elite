@@ -121,6 +121,8 @@ struct PersistedGame {
     // those, same as `GameSession.creator_player_id`.
     #[serde(default)]
     creator_player_id: Option<String>,
+    #[serde(default)]
+    removed_by_creator: bool,
     random_seed: u64,
     board: Vec<BoardCellDto>,
     bag: Vec<Tile>,
@@ -316,6 +318,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         final_bonus_seat: session.final_bonus_seat,
         final_bonus_points: session.final_bonus_points,
         creator_player_id: session.creator_player_id.clone(),
+        removed_by_creator: session.removed_by_creator,
         random_seed: session.random_seed,
         board: session.to_dto().board,
         bag: session.bag.clone(),
@@ -473,6 +476,7 @@ pub async fn load_game(pool: &Pool<Sqlite>, id: &str) -> Result<Option<GameSessi
             final_bonus_seat: persisted.final_bonus_seat,
             final_bonus_points: persisted.final_bonus_points,
             creator_player_id: persisted.creator_player_id,
+            removed_by_creator: persisted.removed_by_creator,
             random_seed: persisted.random_seed,
             rules,
             state,

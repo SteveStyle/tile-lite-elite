@@ -2,7 +2,6 @@ use crate::{
     app::{MovePreviewView, RackTileView, StagedPlacementView},
     components::{board_view::BoardView, rack_view::RackView},
     edition_label::edition_label,
-    time_format::format_relative_time,
 };
 use api::{DirectionDto, GameStateDto, GameStatus, TileDto};
 use dioxus::prelude::*;
@@ -45,8 +44,6 @@ pub fn Home(
     is_your_turn: bool,
     can_pass: bool,
     on_pass: EventHandler<()>,
-    can_chat: bool,
-    on_send_chat: EventHandler<String>,
     can_resign: bool,
     on_resign: EventHandler<()>,
     can_submit_manual: bool,
@@ -61,6 +58,7 @@ pub fn Home(
     on_cancel_exchange: EventHandler<()>,
 ) -> Element {
     let has_rack = can_view_rack;
+    let has_rack_tiles = !rack_tiles.is_empty();
     let is_active = game.status == GameStatus::Active;
 
     // Resolved once and reused everywhere this component needs the active
@@ -110,7 +108,6 @@ pub fn Home(
     // Resigning ends the game outright, so it's gated behind an explicit
     // confirmation rather than firing straight off the button click.
     let mut confirming_resign = use_signal(|| false);
-    let mut chat_draft = use_signal(String::new);
     // Cloned for the `move` keydown closure below — `rules` itself is
     // still needed afterward (passed into `BoardView`/`RackView`).
     let rules_for_keydown = rules.clone();
@@ -232,36 +229,6 @@ pub fn Home(
 
             if has_rack {
                 div { class: "rack-panel",
-                    div { class: "panel-header",
-                        span { class: "meta-chip", "Bag {game.bag_count}" }
-                        if !rack_tiles.is_empty() {
-                            button {
-                                class: "direction-button direction-button-muted",
-                                onclick: move |_| on_shuffle_rack.call(()),
-                                "Shuffle"
-                            }
-                        }
-                        if !staged_placements.is_empty() {
-                            button {
-                                class: "direction-button direction-button-muted",
-                                onclick: move |_| on_clear_staged.call(()),
-                                "Clear"
-                            }
-                        }
-                        if can_toggle_direction {
-                            button {
-                                class: "direction-button direction-button-muted",
-                                title: "Change which way this word reads — same as pressing space bar",
-                                onclick: move |_| on_toggle_direction.call(()),
-                                {
-                                    match current_typing_direction {
-                                        DirectionDto::Horizontal => "⇄ Switch to Down",
-                                        DirectionDto::Vertical => "⇄ Switch to Across",
-                                    }
-                                }
-                            }
-                        }
-                    }
                     if has_unresolved_blank {
                         div { class: "blank-picker",
                             p { class: "composer-copy",
@@ -300,106 +267,96 @@ pub fn Home(
                             }
                         }
                     }
-                    RackView {
-                        tiles: rack_tiles,
-                        can_stage_moves,
-                        exchange_mode,
-                        exchange_selected: exchange_selected.clone(),
-                        letter_values: rules.letter_values,
-                        alphabet: rules.alphabet.clone(),
-                        on_drag_start: on_drag_rack_tile,
-                        on_drag_end: on_drag_end_rack_tile,
-                        on_drop_tile: on_drop_rack_tile,
-                        on_click_tile: on_click_rack_tile,
-                        on_toggle_exchange_tile,
+                    div { class: "rack-row",
+                        RackView {
+                            tiles: rack_tiles,
+                            can_stage_moves,
+                            exchange_mode,
+                            exchange_selected: exchange_selected.clone(),
+                            letter_values: rules.letter_values,
+                            alphabet: rules.alphabet.clone(),
+                            on_drag_start: on_drag_rack_tile,
+                            on_drag_end: on_drag_end_rack_tile,
+                            on_drop_tile: on_drop_rack_tile,
+                            on_click_tile: on_click_rack_tile,
+                            on_toggle_exchange_tile,
+                        }
+                        span { class: "meta-chip rack-row-bag", "Bag {game.bag_count}" }
                     }
 
                     div { class: "turn-actions",
-                        if is_active && exchange_mode {
-                            button {
-                                class: "toggle-button toggle-button-muted",
-                                disabled: is_loading,
-                                onclick: move |_| on_cancel_exchange.call(()),
-                                "Cancel"
-                            }
-                            button {
-                                class: "toggle-button",
-                                disabled: is_loading || !can_confirm_exchange,
-                                onclick: move |_| on_confirm_exchange.call(()),
-                                "Confirm Exchange ({exchange_selected.len()})"
-                            }
-                        }
-                        if is_active && !exchange_mode {
-                            button {
-                                class: "toggle-button toggle-button-muted",
-                                disabled: is_loading || !can_pass,
-                                onclick: move |_| on_pass.call(()),
-                                "Pass"
-                            }
-                            button {
-                                class: "toggle-button toggle-button-muted",
-                                disabled: is_loading || !can_toggle_exchange,
-                                onclick: move |_| on_toggle_exchange_mode.call(()),
-                                "Exchange"
-                            }
-                            button {
-                                class: "toggle-button",
-                                disabled: is_loading || !can_submit_manual,
-                                onclick: move |_| on_submit_manual.call(()),
-                                "Play"
-                            }
-                            button {
-                                class: "toggle-button toggle-button-muted resign-button",
-                                disabled: is_loading || !can_resign,
-                                onclick: move |_| confirming_resign.set(true),
-                                "Resign"
-                            }
-                        }
-                    }
-
-                    if can_chat {
-                        div { class: "chat-panel",
-                            div { class: "chat-messages",
-                                if game.messages.is_empty() {
-                                    p { class: "chat-empty", "No messages yet" }
+                        div { class: "turn-actions-left",
+                            if has_rack_tiles {
+                                button {
+                                    class: "direction-button direction-button-muted",
+                                    onclick: move |_| on_shuffle_rack.call(()),
+                                    "Shuffle"
                                 }
-                                for message in game.messages.iter() {
-                                    div { key: "{message.id}", class: "chat-message",
-                                        span { class: "chat-message-sender", "{message.display_name}" }
-                                        span { class: "chat-message-body", "{message.body}" }
-                                        span { class: "chat-message-time", "{format_relative_time(&message.created_at)}" }
+                            }
+                            if !staged_placements.is_empty() {
+                                button {
+                                    class: "direction-button direction-button-muted",
+                                    onclick: move |_| on_clear_staged.call(()),
+                                    "Clear"
+                                }
+                            }
+                            if can_toggle_direction {
+                                button {
+                                    class: "direction-button direction-button-muted",
+                                    title: "Change which way this word reads — same as pressing space bar",
+                                    onclick: move |_| on_toggle_direction.call(()),
+                                    {
+                                        match current_typing_direction {
+                                            DirectionDto::Horizontal => "⇄ Switch to Down",
+                                            DirectionDto::Vertical => "⇄ Switch to Across",
+                                        }
                                     }
                                 }
                             }
-                            div { class: "chat-composer",
-                                input {
-                                    class: "chat-input",
-                                    r#type: "text",
-                                    placeholder: "Say something...",
-                                    value: "{chat_draft}",
-                                    oninput: move |event| chat_draft.set(event.value()),
-                                    onkeydown: move |event| {
-                                        if event.key() == Key::Enter {
-                                            event.prevent_default();
-                                            let body = chat_draft().trim().to_string();
-                                            if !body.is_empty() {
-                                                chat_draft.set(String::new());
-                                                on_send_chat.call(body);
-                                            }
-                                        }
-                                    },
+                        }
+                        div { class: "turn-actions-buttons",
+                            if is_active && exchange_mode {
+                                button {
+                                    class: "toggle-button toggle-button-muted",
+                                    disabled: is_loading,
+                                    onclick: move |_| on_cancel_exchange.call(()),
+                                    "Cancel"
                                 }
                                 button {
                                     class: "toggle-button",
-                                    disabled: chat_draft().trim().is_empty(),
-                                    onclick: move |_| {
-                                        let body = chat_draft().trim().to_string();
-                                        if !body.is_empty() {
-                                            chat_draft.set(String::new());
-                                            on_send_chat.call(body);
-                                        }
-                                    },
-                                    "Send"
+                                    disabled: is_loading || !can_confirm_exchange,
+                                    onclick: move |_| on_confirm_exchange.call(()),
+                                    "Confirm Exchange ({exchange_selected.len()})"
+                                }
+                            }
+                            if is_active && !exchange_mode {
+                                button {
+                                    class: "toggle-button toggle-button-muted",
+                                    disabled: is_loading || !can_pass,
+                                    onclick: move |_| on_pass.call(()),
+                                    "Pass"
+                                }
+                                button {
+                                    class: "toggle-button toggle-button-muted",
+                                    disabled: is_loading || !can_toggle_exchange,
+                                    onclick: move |_| on_toggle_exchange_mode.call(()),
+                                    "Exchange"
+                                }
+                                button {
+                                    class: "toggle-button",
+                                    disabled: is_loading || !can_submit_manual,
+                                    onclick: move |_| on_submit_manual.call(()),
+                                    "Play"
+                                }
+                            }
+                        }
+                        if is_active && !exchange_mode {
+                            div { class: "turn-actions-resign",
+                                button {
+                                    class: "toggle-button toggle-button-muted resign-button",
+                                    disabled: is_loading || !can_resign,
+                                    onclick: move |_| confirming_resign.set(true),
+                                    "Resign"
                                 }
                             }
                         }

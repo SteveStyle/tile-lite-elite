@@ -149,6 +149,17 @@ pub struct CreateGameRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct StartGameRequest {}
 
+/// Swaps two seats' positions (and with them, turn order) in a game that
+/// hasn't started yet — see `crates/server-game/src/game_state.rs`'s
+/// `GameSession::swap_seats`. Always a single adjacent swap from the
+/// client's perspective (an up/down button in the player list); the server
+/// doesn't need to know the caller's intent beyond "swap these two."
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwapSeatsRequest {
+    pub seat_a: u8,
+    pub seat_b: u8,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EngineProfileDto {
     pub id: String,
@@ -214,6 +225,13 @@ pub struct GameSummaryDto {
     /// Set when `relationship` is `InvitedByName` or `InvitedOpen` — the
     /// invitation to accept/reject directly from the list.
     pub invitation_id: Option<String>,
+    /// When the most recent chat message was sent, if there's ever been one
+    /// — deliberately separate from `last_activity_at` (moves), so the
+    /// client can tell "new chat" apart from "new move" and show an unread
+    /// indicator. The client compares this against its own locally-stored
+    /// "last seen" watermark per game; the server has no concept of read
+    /// receipts.
+    pub last_message_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

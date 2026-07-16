@@ -1,10 +1,11 @@
 use crate::edition_label::edition_label;
 use crate::time_format::format_relative_time;
 use api::{
-    CreateSeatRequest, GameRelationship, GameStateDto, GameStatus, GameSummaryDto, MoveRecordDto,
-    ParticipantDto, SeatClaim, SeatKind,
+    ChatMessageDto, CreateSeatRequest, GameRelationship, GameStateDto, GameStatus, GameSummaryDto,
+    MoveRecordDto, ParticipantDto, SeatClaim, SeatKind,
 };
 use dioxus::prelude::*;
+use std::collections::HashMap;
 
 const DEFAULT_ENGINE_ID: &str = "greedy-v1";
 const DEFAULT_TIME_LIMIT_HOURS: u32 = 72;
@@ -99,6 +100,65 @@ fn preset_draft(kind: NewGameKind) -> (bool, Vec<AdditionalSeatDraft>) {
     }
 }
 
+/// One row of the draft roster as actually displayed — "you" (the creator)
+/// interleaved with the other seats at whatever position `creator_position`
+/// puts them, rather than always pinned first. `Seat` carries its index
+/// into `additional_seats` so editing/removing can address it directly.
+#[derive(Debug, Clone, PartialEq)]
+enum DraftRow {
+    You,
+    Seat(usize, AdditionalSeatDraft),
+}
+
+fn draft_rows(
+    include_creator: bool,
+    creator_position: usize,
+    additional: &[AdditionalSeatDraft],
+) -> Vec<DraftRow> {
+    let mut rows: Vec<DraftRow> = additional
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, draft)| DraftRow::Seat(index, draft))
+        .collect();
+    if include_creator {
+        rows.insert(creator_position.min(rows.len()), DraftRow::You);
+    }
+    rows
+}
+
+/// Swaps two display positions in the drafted roster (an up/down button in
+/// the draft table) and reports back the only two pieces of state that
+/// actually need to change — `draft_rows` above is always recomputed fresh
+/// from `creator_position`/`additional_seats`, so this doesn't touch
+/// `include_creator` at all; "you" stays included, just possibly at a new
+/// position. Out-of-range indices (nothing to swap, e.g. already at an
+/// edge) are a no-op.
+fn swap_draft_rows(
+    include_creator: bool,
+    creator_position: usize,
+    additional: &[AdditionalSeatDraft],
+    a: usize,
+    b: usize,
+) -> (usize, Vec<AdditionalSeatDraft>) {
+    let mut rows = draft_rows(include_creator, creator_position, additional);
+    if a < rows.len() && b < rows.len() {
+        rows.swap(a, b);
+    }
+    let new_creator_position = rows
+        .iter()
+        .position(|row| matches!(row, DraftRow::You))
+        .unwrap_or(0);
+    let new_additional = rows
+        .into_iter()
+        .filter_map(|row| match row {
+            DraftRow::Seat(_, draft) => Some(draft),
+            DraftRow::You => None,
+        })
+        .collect();
+    (new_creator_position, new_additional)
+}
+
 /// Seeds the draft signals from a preset and opens the draft view. A plain
 /// function (rather than a closure captured by multiple buttons) sidesteps
 /// the `FnMut`-borrow ambiguity of sharing one closure across several
@@ -107,6 +167,7 @@ fn preset_draft(kind: NewGameKind) -> (bool, Vec<AdditionalSeatDraft>) {
 fn start_draft(
     kind: NewGameKind,
     mut include_creator: Signal<bool>,
+    mut creator_position: Signal<usize>,
     mut additional_seats: Signal<Vec<AdditionalSeatDraft>>,
     mut time_limit_hours: Signal<u32>,
     mut drafting: Signal<bool>,
@@ -114,33 +175,40 @@ fn start_draft(
 ) {
     let (creator, seats) = preset_draft(kind);
     include_creator.set(creator);
+    creator_position.set(0);
     additional_seats.set(seats);
     time_limit_hours.set(DEFAULT_TIME_LIMIT_HOURS);
     variant.set("official".to_string());
     drafting.set(true);
 }
 
-/// Resolves a draft roster into `CreateSeatRequest`s ready to POST.
+/// Resolves a draft roster into `CreateSeatRequest`s ready to POST — the
+/// creator's own seat lands at `creator_position` among `additional`
+/// (clamped to a valid index) rather than always first, so a draft where
+/// "you" was moved down actually submits with that turn order.
 fn build_seats(
     include_creator: bool,
+    creator_position: usize,
     additional: &[AdditionalSeatDraft],
     my_display_name: Option<&str>,
 ) -> Vec<CreateSeatRequest> {
+    let creator_seat = || CreateSeatRequest {
+        kind: SeatKind::Human,
+        display_name: my_display_name.unwrap_or("Player 1").to_string(),
+        engine_id: None,
+        claim: Some(SeatClaim::Creator),
+    };
+    let insert_at = creator_position.min(additional.len());
     let mut seats = Vec::new();
-    if include_creator {
-        seats.push(CreateSeatRequest {
-            kind: SeatKind::Human,
-            display_name: my_display_name.unwrap_or("Player 1").to_string(),
-            engine_id: None,
-            claim: Some(SeatClaim::Creator),
-        });
+    if include_creator && insert_at == 0 {
+        seats.push(creator_seat());
     }
     let engine_count = additional
         .iter()
         .filter(|seat| seat.kind == AdditionalSeatKind::Engine)
         .count();
     let mut engine_index = 0;
-    for draft in additional {
+    for (index, draft) in additional.iter().enumerate() {
         seats.push(match draft.kind {
             AdditionalSeatKind::Named => CreateSeatRequest {
                 kind: SeatKind::Human,
@@ -171,6 +239,9 @@ fn build_seats(
                 }
             }
         });
+        if include_creator && index + 1 == insert_at {
+            seats.push(creator_seat());
+        }
     }
     seats
 }
@@ -182,18 +253,27 @@ pub fn GamesPanel(
     selected_id: Option<String>,
     current_game: Option<GameStateDto>,
     viewer_player_id: Option<String>,
+    /// game_id -> the `created_at` of the last chat message this device has
+    /// seen for that game — see `crate::local_storage::StoredChatWatermarks`.
+    /// Used only to decide whether to show the unread-mail icon in the list.
+    chat_watermarks: HashMap<String, String>,
     is_loading: bool,
     my_display_name: Option<String>,
     can_start: bool,
     on_select: EventHandler<String>,
     on_start: EventHandler<()>,
+    on_send_chat: EventHandler<String>,
     on_custom_new_game: EventHandler<CustomGameSubmission>,
     on_accept_invitation: EventHandler<String>,
     on_reject_invitation: EventHandler<String>,
+    on_remove_game: EventHandler<String>,
+    on_reorder_seats: EventHandler<(u8, u8)>,
     on_refresh: EventHandler<()>,
 ) -> Element {
     let mut drafting = use_signal(|| false);
+    let chat_draft = use_signal(String::new);
     let mut include_creator = use_signal(|| true);
+    let mut creator_position = use_signal(|| 0usize);
     let mut additional_seats = use_signal(Vec::<AdditionalSeatDraft>::new);
     let mut time_limit_hours = use_signal(|| DEFAULT_TIME_LIMIT_HOURS);
     let mut variant = use_signal(|| "official".to_string());
@@ -220,24 +300,31 @@ pub fn GamesPanel(
     let section = {
         let current_game = current_game.clone();
         let viewer_player_id = viewer_player_id.clone();
+        let chat_watermarks = chat_watermarks.clone();
         move |title: &'static str, rows: Vec<GameSummaryDto>, show_invite_actions: bool| {
             if rows.is_empty() {
                 return rsx! {};
             }
             let row_elements = rows.into_iter().map(|summary| {
+                let has_unread = has_unread_chat(&summary, &chat_watermarks);
                 game_row(
                     &summary,
                     selected_id.as_deref(),
                     show_invite_actions,
+                    has_unread,
                     current_game.as_ref(),
                     viewer_player_id.as_deref(),
                     can_start,
                     is_loading,
                     drafting,
+                    chat_draft,
                     on_select,
                     on_start,
+                    on_send_chat,
                     on_accept_invitation,
                     on_reject_invitation,
+                    on_remove_game,
+                    on_reorder_seats,
                 )
             });
             rsx! {
@@ -249,43 +336,109 @@ pub fn GamesPanel(
         }
     };
 
-    let seat_rows = additional_seats().into_iter().enumerate().map(|(index, draft)| {
-        let removable_index = index;
-        rsx! {
-            tr { key: "{index}",
-                td {
-                    if draft.kind == AdditionalSeatKind::Named {
-                        input {
-                            class: "seat-draft-name-input",
-                            placeholder: "Display name to invite",
-                            value: "{draft.name}",
-                            oninput: move |event| {
+    // "You" interleaved with the other seats at whatever position you've
+    // been moved to — see `draft_rows`. Reorder buttons work purely by
+    // swapping display positions and reading the result back into
+    // `creator_position`/`additional_seats`, so they apply uniformly to
+    // every row, "you" included, regardless of which preset button opened
+    // this draft (even a one-click "vs Engine"/"Bot Showdown" game gets a
+    // chance to reorder here, since it's the one screen every game — not
+    // just ones waiting on an invitation — passes through before it's
+    // created).
+    let rows_for_render = draft_rows(include_creator(), creator_position(), &additional_seats());
+    let last_row_position = rows_for_render.len().saturating_sub(1);
+    let draft_row_elements = rows_for_render.into_iter().enumerate().map(|(position, row)| {
+        let reorder = rsx! {
+            span { class: "player-table-reorder",
+                button {
+                    class: "player-table-reorder-button",
+                    r#type: "button",
+                    disabled: position == 0,
+                    title: "Move up (plays earlier)",
+                    onclick: move |_| {
+                        let (new_position, new_seats) = swap_draft_rows(
+                            include_creator(),
+                            creator_position(),
+                            &additional_seats(),
+                            position,
+                            position.saturating_sub(1),
+                        );
+                        creator_position.set(new_position);
+                        additional_seats.set(new_seats);
+                    },
+                    "▲"
+                }
+                button {
+                    class: "player-table-reorder-button",
+                    r#type: "button",
+                    disabled: position >= last_row_position,
+                    title: "Move down (plays later)",
+                    onclick: move |_| {
+                        let (new_position, new_seats) = swap_draft_rows(
+                            include_creator(),
+                            creator_position(),
+                            &additional_seats(),
+                            position,
+                            position + 1,
+                        );
+                        creator_position.set(new_position);
+                        additional_seats.set(new_seats);
+                    },
+                    "▼"
+                }
+            }
+        };
+        match row {
+            DraftRow::You => rsx! {
+                tr { key: "you",
+                    td { {reorder} "{my_display_name.clone().unwrap_or_default()} (you)" }
+                    td { "Human" }
+                    td {
+                        button {
+                            class: "toggle-button toggle-button-muted seat-draft-remove",
+                            onclick: move |_| include_creator.set(false),
+                            "Remove"
+                        }
+                    }
+                }
+            },
+            DraftRow::Seat(index, draft) => rsx! {
+                tr { key: "{index}",
+                    td {
+                        {reorder}
+                        if draft.kind == AdditionalSeatKind::Named {
+                            input {
+                                class: "seat-draft-name-input",
+                                placeholder: "Display name to invite",
+                                value: "{draft.name}",
+                                oninput: move |event| {
+                                    additional_seats.with_mut(|seats| {
+                                        if let Some(seat) = seats.get_mut(index) {
+                                            seat.name = event.value();
+                                        }
+                                    });
+                                },
+                            }
+                        } else {
+                            "{seat_draft_label(draft.kind)}"
+                        }
+                    }
+                    td { "{seat_draft_kind_label(draft.kind)}" }
+                    td {
+                        button {
+                            class: "toggle-button toggle-button-muted seat-draft-remove",
+                            onclick: move |_| {
                                 additional_seats.with_mut(|seats| {
-                                    if let Some(seat) = seats.get_mut(index) {
-                                        seat.name = event.value();
+                                    if index < seats.len() {
+                                        seats.remove(index);
                                     }
                                 });
                             },
+                            "Remove"
                         }
-                    } else {
-                        "{seat_draft_label(draft.kind)}"
                     }
                 }
-                td { "{seat_draft_kind_label(draft.kind)}" }
-                td {
-                    button {
-                        class: "toggle-button toggle-button-muted seat-draft-remove",
-                        onclick: move |_| {
-                            additional_seats.with_mut(|seats| {
-                                if removable_index < seats.len() {
-                                    seats.remove(removable_index);
-                                }
-                            });
-                        },
-                        "Remove"
-                    }
-                }
-            }
+            },
         }
     });
 
@@ -318,31 +471,31 @@ pub fn GamesPanel(
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::VsFriend, include_creator, additional_seats, time_limit_hours, drafting, variant),
+                        onclick: move |_| start_draft(NewGameKind::VsFriend, include_creator, creator_position, additional_seats, time_limit_hours, drafting, variant),
                         "Play Friend"
                     }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting, variant),
+                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, creator_position, additional_seats, time_limit_hours, drafting, variant),
                         "Play Stranger"
                     }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::VsEngine, include_creator, additional_seats, time_limit_hours, drafting, variant),
+                        onclick: move |_| start_draft(NewGameKind::VsEngine, include_creator, creator_position, additional_seats, time_limit_hours, drafting, variant),
                         "Play Greedy Bot"
                     }
                     button {
                         class: "toggle-button",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::EngineVsEngine, include_creator, additional_seats, time_limit_hours, drafting, variant),
+                        onclick: move |_| start_draft(NewGameKind::EngineVsEngine, include_creator, creator_position, additional_seats, time_limit_hours, drafting, variant),
                         "Bot Showdown!"
                     }
                     button {
                         class: "toggle-button toggle-button-muted",
                         disabled: is_loading,
-                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, additional_seats, time_limit_hours, drafting, variant),
+                        onclick: move |_| start_draft(NewGameKind::VsHuman, include_creator, creator_position, additional_seats, time_limit_hours, drafting, variant),
                         "New Custom Game..."
                     }
                 }
@@ -360,22 +513,7 @@ pub fn GamesPanel(
                                     th {}
                                 }
                             }
-                            tbody {
-                                if include_creator() {
-                                    tr { key: "you",
-                                        td { "{my_display_name.clone().unwrap_or_default()} (you)" }
-                                        td { "Human" }
-                                        td {
-                                            button {
-                                                class: "toggle-button toggle-button-muted seat-draft-remove",
-                                                onclick: move |_| include_creator.set(false),
-                                                "Remove"
-                                            }
-                                        }
-                                    }
-                                }
-                                {seat_rows}
-                            }
+                            tbody { {draft_row_elements} }
                         }
                         if !include_creator() {
                             button {
@@ -438,7 +576,7 @@ pub fn GamesPanel(
                                 class: "toggle-button",
                                 disabled: is_loading || !can_submit_builder,
                                 onclick: move |_| {
-                                    let seats = build_seats(include_creator(), &additional_seats(), my_display_name.as_deref());
+                                    let seats = build_seats(include_creator(), creator_position(), &additional_seats(), my_display_name.as_deref());
                                     on_custom_new_game.call(CustomGameSubmission {
                                         seats,
                                         move_time_limit_seconds: Some(time_limit_hours() as u64 * 3600),
@@ -478,15 +616,20 @@ fn game_row(
     summary: &GameSummaryDto,
     selected_id: Option<&str>,
     show_invite_actions: bool,
+    has_unread_chat: bool,
     current_game: Option<&GameStateDto>,
     viewer_player_id: Option<&str>,
     can_start: bool,
     is_loading: bool,
     mut drafting: Signal<bool>,
+    mut chat_draft: Signal<String>,
     on_select: EventHandler<String>,
     on_start: EventHandler<()>,
+    on_send_chat: EventHandler<String>,
     on_accept_invitation: EventHandler<String>,
     on_reject_invitation: EventHandler<String>,
+    on_remove_game: EventHandler<String>,
+    on_reorder_seats: EventHandler<(u8, u8)>,
 ) -> Element {
     let is_selected = selected_id == Some(summary.id.as_str());
     let row_class = if is_selected {
@@ -508,16 +651,37 @@ fn game_row(
     let select_id = summary.id.clone();
     let invitation_id = summary.invitation_id.clone();
 
-    // Prefer the fully-loaded game (has scores + move history) when it
-    // matches this row; fall back to the summary's participants (scores,
-    // no history) while the full load is still in flight.
-    let (participants, moves): (Vec<ParticipantDto>, Vec<MoveRecordDto>) =
+    // Prefer the fully-loaded game (has scores + move history + chat) when
+    // it matches this row; fall back to the summary's participants (scores,
+    // no history, no chat — the summary never carries messages) while the
+    // full load is still in flight.
+    let (participants, moves, messages): (Vec<ParticipantDto>, Vec<MoveRecordDto>, Vec<ChatMessageDto>) =
         match current_game.filter(|g| g.id == summary.id) {
-            Some(g) => (g.participants.clone(), g.moves.clone()),
-            None => (summary.participants.clone(), Vec::new()),
+            Some(g) => (g.participants.clone(), g.moves.clone(), g.messages.clone()),
+            None => (summary.participants.clone(), Vec::new(), Vec::new()),
         };
     let loaded_matches = current_game.is_some_and(|g| g.id == summary.id);
+    // Mirrors the server's `resolve_viewer_access` `Participant` tier
+    // exactly — a genuinely claimed seat. A creator watching their own game
+    // (e.g. Bot Showdown) or a spectator never gets chat.
+    let can_chat = viewer_player_id.is_some_and(|viewer_id| {
+        participants
+            .iter()
+            .any(|participant| participant.player_id.as_deref() == Some(viewer_id))
+    });
+    // Removing a finished game is available to a seated participant
+    // (`can_chat`'s exact condition) *or* an unseated creator watching
+    // their own game (e.g. Bot Showdown) — mirrors the server's
+    // `remove_for_player`, which checks the caller's seat first and falls
+    // back to `creator_player_id` only when they hold no seat at all.
+    // `relationship == Creator` is only ever set for that unseated case
+    // (see `list_games`), so it never overlaps with `can_chat`.
+    let can_remove = can_chat || summary.relationship == GameRelationship::Creator;
     let ready = is_ready_to_start(&participants);
+    // Same enable condition as the Start button below — reordering and
+    // starting are both "this row's full state is loaded, every seat's
+    // filled, and we're online" operations.
+    let can_reorder = summary.status == GameStatus::Waiting && can_start && loaded_matches && ready;
     let badge_class = format!(
         "game-status-badge game-status-{}",
         status_slug(&summary.status, ready)
@@ -533,6 +697,9 @@ fn game_row(
                 },
                 div { class: "game-row-top",
                     span { class: "{badge_class}", "{status_label(&summary.status, ready)}" }
+                    if has_unread_chat {
+                        span { class: "game-row-unread-mail", title: "New message", "✉" }
+                    }
                     span { class: "game-row-time", "{relative_time}" }
                 }
                 p { class: "game-row-participants", "{participants_label}" }
@@ -540,7 +707,7 @@ fn game_row(
             }
             if is_selected {
                 div { class: "games-panel-detail",
-                    {player_table(&participants, &moves, viewer_player_id, &summary.variant)}
+                    {player_table(&participants, &moves, viewer_player_id, &summary.variant, can_reorder, on_reorder_seats)}
                     if summary.status == GameStatus::Waiting {
                         div { class: "game-builder-add-row",
                             button {
@@ -551,6 +718,76 @@ fn game_row(
                             }
                             if !ready {
                                 span { class: "games-panel-hint", "Waiting for every seat to be filled" }
+                            }
+                        }
+                    }
+                    if summary.status == GameStatus::Finished && can_remove {
+                        div { class: "game-builder-add-row",
+                            button {
+                                class: "toggle-button toggle-button-muted",
+                                disabled: is_loading,
+                                onclick: {
+                                    let remove_id = summary.id.clone();
+                                    move |_| on_remove_game.call(remove_id.clone())
+                                },
+                                "Remove"
+                            }
+                        }
+                    }
+                    if can_chat {
+                        div { class: "chat-panel",
+                            div { class: "chat-messages",
+                                if messages.is_empty() {
+                                    p { class: "chat-empty", "No messages yet" }
+                                }
+                                for message in messages.iter() {
+                                    {
+                                        let is_own = viewer_player_id == Some(message.player_id.as_str());
+                                        let message_class = if is_own {
+                                            "chat-message chat-message-own"
+                                        } else {
+                                            "chat-message"
+                                        };
+                                        rsx! {
+                                            div { key: "{message.id}", class: "{message_class}",
+                                                span { class: "chat-message-sender", "{message.display_name}" }
+                                                span { class: "chat-message-body", "{message.body}" }
+                                                span { class: "chat-message-time", "{format_relative_time(&message.created_at)}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            div { class: "chat-composer",
+                                input {
+                                    class: "chat-input",
+                                    r#type: "text",
+                                    placeholder: "Say something...",
+                                    value: "{chat_draft}",
+                                    oninput: move |event| chat_draft.set(event.value()),
+                                    onkeydown: move |event| {
+                                        if event.key() == Key::Enter {
+                                            event.prevent_default();
+                                            let body = chat_draft().trim().to_string();
+                                            if !body.is_empty() {
+                                                chat_draft.set(String::new());
+                                                on_send_chat.call(body);
+                                            }
+                                        }
+                                    },
+                                }
+                                button {
+                                    class: "toggle-button",
+                                    disabled: chat_draft().trim().is_empty(),
+                                    onclick: move |_| {
+                                        let body = chat_draft().trim().to_string();
+                                        if !body.is_empty() {
+                                            chat_draft.set(String::new());
+                                            on_send_chat.call(body);
+                                        }
+                                    },
+                                    "Send"
+                                }
                             }
                         }
                     }
@@ -594,20 +831,48 @@ fn is_english_dictionary(variant: &str) -> bool {
         .is_some_and(|rules| matches!(rules.language.as_str(), "sowpods" | "enable2k"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn player_table(
     participants: &[ParticipantDto],
     moves: &[MoveRecordDto],
     viewer_player_id: Option<&str>,
     variant: &str,
+    // Turn order is just seat position (see `GameSession::swap_seats`), so
+    // reordering only makes sense — and is only offered — before the game
+    // starts, once every seat is filled (matching the server's own gate).
+    can_reorder: bool,
+    on_reorder_seats: EventHandler<(u8, u8)>,
 ) -> Element {
     let link_words = is_english_dictionary(variant);
+    let last_seat = participants.len().saturating_sub(1) as u8;
     let rows = participants.iter().map(|participant| {
         let is_you = viewer_player_id.is_some() && participant.player_id.as_deref() == viewer_player_id;
         let row_class = if is_you { "player-table-you" } else { "" };
         let cell = last_move_cell(moves, participant.seat_number);
+        let seat_number = participant.seat_number;
         rsx! {
             tr { key: "{participant.seat_number}", class: "{row_class}",
                 td {
+                    if can_reorder {
+                        span { class: "player-table-reorder",
+                            button {
+                                class: "player-table-reorder-button",
+                                r#type: "button",
+                                disabled: seat_number == 0,
+                                title: "Move up (plays earlier)",
+                                onclick: move |_| on_reorder_seats.call((seat_number, seat_number.saturating_sub(1))),
+                                "▲"
+                            }
+                            button {
+                                class: "player-table-reorder-button",
+                                r#type: "button",
+                                disabled: seat_number >= last_seat,
+                                title: "Move down (plays later)",
+                                onclick: move |_| on_reorder_seats.call((seat_number, seat_number + 1)),
+                                "▼"
+                            }
+                        }
+                    }
                     "{participant.display_name}"
                     if is_you {
                         span { class: "player-table-you-tag", " (you)" }
@@ -743,6 +1008,17 @@ fn is_ready_to_start(participants: &[ParticipantDto]) -> bool {
         .all(|p| p.kind == SeatKind::Engine || p.player_id.is_some())
 }
 
+/// True if this game has a chat message this device hasn't marked as seen
+/// yet (see `crate::local_storage::StoredChatWatermarks`). A game with no
+/// messages at all, or whose latest message matches our stored watermark,
+/// is never unread.
+fn has_unread_chat(summary: &GameSummaryDto, chat_watermarks: &HashMap<String, String>) -> bool {
+    summary
+        .last_message_at
+        .as_ref()
+        .is_some_and(|latest| chat_watermarks.get(&summary.id) != Some(latest))
+}
+
 fn status_label(status: &GameStatus, ready_to_start: bool) -> &'static str {
     match status {
         GameStatus::Waiting if ready_to_start => "Ready to start",
@@ -768,7 +1044,7 @@ mod tests {
     #[test]
     fn vs_engine_seats_are_one_human_one_engine() {
         let (include_creator, additional) = preset_draft(NewGameKind::VsEngine);
-        let seats = build_seats(include_creator, &additional, Some("Alice"));
+        let seats = build_seats(include_creator, 0, &additional, Some("Alice"));
         assert_eq!(seats.len(), 2);
         assert_eq!(seats[0].kind, SeatKind::Human);
         assert_eq!(seats[0].display_name, "Alice");
@@ -788,7 +1064,7 @@ mod tests {
     #[test]
     fn vs_human_seats_are_both_human() {
         let (include_creator, additional) = preset_draft(NewGameKind::VsHuman);
-        let seats = build_seats(include_creator, &additional, Some("Alice"));
+        let seats = build_seats(include_creator, 0, &additional, Some("Alice"));
         assert_eq!(seats.len(), 2);
         assert!(seats.iter().all(|seat| seat.kind == SeatKind::Human));
         assert_eq!(seats[0].display_name, "Alice");
@@ -798,7 +1074,7 @@ mod tests {
     fn engine_vs_engine_has_no_creator_seat_and_ignores_display_name() {
         let (include_creator, additional) = preset_draft(NewGameKind::EngineVsEngine);
         assert!(!include_creator);
-        let seats = build_seats(include_creator, &additional, Some("Alice"));
+        let seats = build_seats(include_creator, 0, &additional, Some("Alice"));
         assert_eq!(seats.len(), 2);
         assert!(seats.iter().all(|seat| seat.kind == SeatKind::Engine));
         assert!(seats.iter().all(|seat| seat.engine_id.is_some()));
@@ -808,7 +1084,7 @@ mod tests {
     #[test]
     fn anonymous_creator_gets_a_generic_name_instead_of_a_hardcoded_one() {
         let (include_creator, additional) = preset_draft(NewGameKind::VsEngine);
-        let seats = build_seats(include_creator, &additional, None);
+        let seats = build_seats(include_creator, 0, &additional, None);
         assert_ne!(seats[0].display_name, "Alice");
         assert!(!seats[0].display_name.is_empty());
     }
@@ -817,11 +1093,73 @@ mod tests {
     fn removing_the_creator_row_seats_only_the_others() {
         let seats = build_seats(
             false,
+            0,
             &[AdditionalSeatDraft { kind: AdditionalSeatKind::Engine, name: String::new() }],
             Some("Alice"),
         );
         assert_eq!(seats.len(), 1);
         assert_eq!(seats[0].kind, SeatKind::Engine);
+    }
+
+    fn engine_seat() -> AdditionalSeatDraft {
+        AdditionalSeatDraft { kind: AdditionalSeatKind::Engine, name: String::new() }
+    }
+
+    #[test]
+    fn draft_rows_puts_you_at_position_zero_by_default() {
+        let rows = draft_rows(true, 0, &[engine_seat()]);
+        assert_eq!(rows, vec![DraftRow::You, DraftRow::Seat(0, engine_seat())]);
+    }
+
+    #[test]
+    fn draft_rows_can_place_you_after_other_seats() {
+        let rows = draft_rows(true, 1, &[engine_seat()]);
+        assert_eq!(rows, vec![DraftRow::Seat(0, engine_seat()), DraftRow::You]);
+    }
+
+    #[test]
+    fn draft_rows_omits_you_when_not_included() {
+        let rows = draft_rows(false, 0, &[engine_seat(), engine_seat()]);
+        assert_eq!(rows, vec![DraftRow::Seat(0, engine_seat()), DraftRow::Seat(1, engine_seat())]);
+    }
+
+    #[test]
+    fn swap_draft_rows_moves_you_down_past_a_seat() {
+        // Bot-Showdown-style "vs Engine": you're first, one engine second —
+        // this is exactly the scenario that motivated adding reordering to
+        // the draft itself, since a one-click preset never passes through a
+        // `Waiting` screen where the post-creation reorder endpoint would
+        // otherwise be reachable.
+        let (new_position, new_seats) = swap_draft_rows(true, 0, &[engine_seat()], 0, 1);
+        assert_eq!(new_position, 1);
+        assert_eq!(new_seats, vec![engine_seat()]);
+        // The engine seat itself is unchanged, just now first.
+        assert_eq!(draft_rows(true, new_position, &new_seats), vec![DraftRow::Seat(0, engine_seat()), DraftRow::You]);
+    }
+
+    #[test]
+    fn swap_draft_rows_reorders_two_additional_seats_leaving_you_in_place() {
+        let named = AdditionalSeatDraft { kind: AdditionalSeatKind::Named, name: "Bob".to_string() };
+        // you, engine, named -- swap the two additional seats (positions 1, 2).
+        let (new_position, new_seats) = swap_draft_rows(true, 0, &[engine_seat(), named.clone()], 1, 2);
+        assert_eq!(new_position, 0, "you weren't involved in the swap, so your position is unchanged");
+        assert_eq!(new_seats, vec![named, engine_seat()]);
+    }
+
+    #[test]
+    fn swap_draft_rows_out_of_range_is_a_no_op() {
+        let (new_position, new_seats) = swap_draft_rows(true, 0, &[engine_seat()], 0, 5);
+        assert_eq!(new_position, 0);
+        assert_eq!(new_seats, vec![engine_seat()]);
+    }
+
+    #[test]
+    fn build_seats_honors_a_non_zero_creator_position() {
+        let seats = build_seats(true, 1, &[engine_seat()], Some("Alice"));
+        assert_eq!(seats.len(), 2);
+        assert_eq!(seats[0].kind, SeatKind::Engine);
+        assert_eq!(seats[1].kind, SeatKind::Human);
+        assert_eq!(seats[1].display_name, "Alice");
     }
 
     #[test]
@@ -912,5 +1250,49 @@ mod tests {
     fn all_engine_seats_are_always_ready() {
         let participants = vec![participant(SeatKind::Engine, None), participant(SeatKind::Engine, None)];
         assert!(is_ready_to_start(&participants));
+    }
+
+    fn summary_with_last_message_at(last_message_at: Option<&str>) -> GameSummaryDto {
+        GameSummaryDto {
+            id: "game-1".to_string(),
+            status: GameStatus::Active,
+            variant: "official".to_string(),
+            current_seat: 0,
+            participants: vec![],
+            last_activity_at: "0".to_string(),
+            move_time_limit_seconds: 0,
+            turn_started_at: "0".to_string(),
+            relationship: GameRelationship::Participant,
+            invitation_id: None,
+            last_message_at: last_message_at.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn no_unread_chat_when_the_game_has_never_had_a_message() {
+        let summary = summary_with_last_message_at(None);
+        assert!(!has_unread_chat(&summary, &HashMap::new()));
+    }
+
+    #[test]
+    fn unread_chat_when_theres_no_watermark_for_the_game_yet() {
+        let summary = summary_with_last_message_at(Some("100"));
+        assert!(has_unread_chat(&summary, &HashMap::new()));
+    }
+
+    #[test]
+    fn no_unread_chat_when_the_watermark_matches_the_latest_message() {
+        let summary = summary_with_last_message_at(Some("100"));
+        let mut watermarks = HashMap::new();
+        watermarks.insert("game-1".to_string(), "100".to_string());
+        assert!(!has_unread_chat(&summary, &watermarks));
+    }
+
+    #[test]
+    fn unread_chat_when_the_watermark_is_stale() {
+        let summary = summary_with_last_message_at(Some("200"));
+        let mut watermarks = HashMap::new();
+        watermarks.insert("game-1".to_string(), "100".to_string());
+        assert!(has_unread_chat(&summary, &watermarks));
     }
 }

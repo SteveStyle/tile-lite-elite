@@ -65,8 +65,17 @@ pub fn RackView(
                         on_click_tile.call(tile.id);
                     }
                 },
-                span { class: "tile-letter", "{tile.display}" }
-                span { class: "tile-value", "{crate::tile_value::tile_point_value(&tile.tile, &letter_values, &alphabet)}" }
+                // Mirrors `BoardView`'s `.tile-face` wrapper exactly — the
+                // point value is positioned absolutely within it, and its
+                // containing block needs to be this inner, padding-respecting
+                // box (not `.rack-tile` itself) for the offset to land in the
+                // same place relative to the rounded corner as it does on the
+                // board. See `.rack-tile .tile-face` in main.css for why a
+                // direct child wouldn't have worked.
+                div { class: "tile-face",
+                    span { class: "tile-letter", "{tile.display}" }
+                    span { class: "tile-value", "{crate::tile_value::tile_point_value(&tile.tile, &letter_values, &alphabet)}" }
+                }
             }
         }
     });

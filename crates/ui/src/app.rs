@@ -28,6 +28,12 @@ const BOARD_HEIGHT: usize = 15;
 const RECONNECT_POLL_MS: u64 = 3000;
 /// Delay between WebSocket reconnect attempts.
 const WEBSOCKET_RETRY_MS: u64 = 3000;
+/// How often the games list (and with it, unread-chat mail icons) is
+/// re-fetched in the background. The live WebSocket only covers the one
+/// game currently open, so activity in any other game — a new chat
+/// message, an opponent's move — wouldn't otherwise show up until the
+/// player manually hits Refresh.
+const GAME_LIST_POLL_MS: u64 = 10_000;
 
 /// Whether the app can currently reach the backend at all — set by the
 /// HTTP helpers (`get_json`/`post_json`) and the WebSocket subscription the
@@ -100,11 +106,18 @@ pub fn RootApp() -> Element {
     let server_url = crate::config::server_url();
     let mut game = use_signal(|| None::<GameStateDto>);
     let mut game_summaries = use_signal(Vec::<api::GameSummaryDto>::new);
+    // Per-game "last seen chat message" watermark, for the unread-messages
+    // indicator in the games list — purely local to this device/browser,
+    // no server-side read-receipt concept. Loaded once at startup; kept in
+    // sync with local storage by the reactive block below.
+    let mut chat_watermarks: Signal<HashMap<String, String>> =
+        use_signal(|| crate::local_storage::load_chat_watermarks().last_seen);
     let mut session = use_signal(|| None::<api::PlayerSessionDto>);
     let mut is_loading = use_signal(|| false);
     let mut info_message = use_signal(|| Some("Loading games from server...".to_string()));
     let mut error_message = use_signal(|| None::<String>);
     let mut bootstrapped = use_signal(|| false);
+    let mut game_list_polling_started = use_signal(|| false);
     // Loaded lazily, keyed by `VariantRules.language` — not fetched until a
     // game using that language is actually open, and cached for the rest
     // of the session once loaded (see the reactive block below, mirroring
@@ -274,9 +287,14 @@ pub fn RootApp() -> Element {
                 // `IS_ONLINE` on connect/disconnect (see `mark_online` /
                 // `mark_offline`); this loop just keeps trying.
                 while websocket_game_id().as_deref() == Some(game_id.as_str()) {
-                    let _ =
-                        subscribe_to_game_events(&server_url, &game_id, token.as_deref(), game)
-                            .await;
+                    let _ = subscribe_to_game_events(
+                        &server_url,
+                        &game_id,
+                        token.as_deref(),
+                        game,
+                        websocket_game_id,
+                    )
+                    .await;
                     if websocket_game_id().as_deref() != Some(game_id.as_str()) {
                         break;
                     }
@@ -284,6 +302,22 @@ pub fn RootApp() -> Element {
                 }
             });
         }
+    }
+
+    if !game_list_polling_started() {
+        game_list_polling_started.set(true);
+        let server_url = server_url.clone();
+        spawn(async move {
+            loop {
+                sleep_ms(GAME_LIST_POLL_MS).await;
+                let Some(token) = session().map(|current| current.session_token.clone()) else {
+                    continue;
+                };
+                if let Ok(summaries) = load_game_summaries(&server_url, Some(&token)).await {
+                    game_summaries.set(summaries);
+                }
+            }
+        });
     }
 
     if let Some(current_game) = game() {
@@ -300,6 +334,26 @@ pub fn RootApp() -> Element {
                     });
                 }
             });
+        }
+    }
+
+    // Marks the currently-open game's chat as seen — fires both when a game
+    // is first opened (loading its messages for the first time) and when a
+    // live update arrives for a game that's already open, so watching the
+    // panel counts as reading it. Never touches watermarks for any other
+    // game, since `game()` only ever holds the currently-selected one.
+    if let Some(current_game) = game() {
+        if let Some(latest) = current_game.messages.last() {
+            if chat_watermarks().get(&current_game.id) != Some(&latest.created_at) {
+                let game_id = current_game.id.clone();
+                let created_at = latest.created_at.clone();
+                chat_watermarks.with_mut(|marks| {
+                    marks.insert(game_id, created_at);
+                });
+                crate::local_storage::save_chat_watermarks(&crate::local_storage::StoredChatWatermarks {
+                    last_seen: chat_watermarks(),
+                });
+            }
         }
     }
 
@@ -329,16 +383,6 @@ pub fn RootApp() -> Element {
     // after the fact.
     let viewer_rack_seat = viewer_rack_seat(&game_for_view, viewer_player_id.as_deref());
     let can_view_rack = viewer_rack_seat.is_some();
-    // Mirrors the server's `resolve_viewer_access` `Participant` tier
-    // exactly — a genuinely claimed seat, not `viewer_rack_seat`'s looser
-    // "unclaimed seat is open to anyone" allowance. A creator watching
-    // their own game (e.g. Bot Showdown) or a spectator never gets chat.
-    let can_chat = viewer_player_id.as_deref().is_some_and(|viewer_id| {
-        game_for_view
-            .participants
-            .iter()
-            .any(|participant| participant.player_id.as_deref() == Some(viewer_id))
-    });
     let unordered_rack_tiles =
         rack_tiles_for_seat(&game_for_view, viewer_rack_seat, &staged_placements());
     if rack_order().len() != unordered_rack_tiles.len() {
@@ -381,6 +425,8 @@ pub fn RootApp() -> Element {
     let server_url_for_exchange = server_url.clone();
     let server_url_for_pass = server_url.clone();
     let server_url_for_chat = server_url.clone();
+    let server_url_for_remove = server_url.clone();
+    let server_url_for_reorder = server_url.clone();
     let server_url_for_resign = server_url.clone();
     let server_url_for_manual = server_url.clone();
     let game_for_home = game_for_view.clone();
@@ -483,9 +529,26 @@ pub fn RootApp() -> Element {
                     selected_id: game().as_ref().map(|current| current.id.clone()),
                     current_game: game().clone(),
                     viewer_player_id: viewer_player_id.clone(),
+                    chat_watermarks: chat_watermarks(),
                     is_loading: is_loading(),
                     my_display_name: session().map(|current| current.display_name.clone()),
                     can_start,
+                    on_send_chat: move |body: String| {
+                        let server_url = server_url_for_chat.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                error_message.set(None);
+                                match submit_chat_message(&server_url, &current_game, body, token.as_deref())
+                                    .await
+                                {
+                                    Ok(updated) => game.set(Some(updated)),
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                            });
+                        }
+                    },
                     on_start: move |_| {
                         let server_url = server_url_for_start.clone();
                         let current_game = game().clone();
@@ -552,6 +615,38 @@ pub fn RootApp() -> Element {
                             let start_immediately = submission.start_immediately;
                             match create_custom_game(&server_url, token.as_deref(), &submission).await {
                                 Ok(created) => {
+                                    reset_composer_state(
+                                        dragging_tile_id,
+                                        selected_blank_letter,
+                                        staged_placements,
+                                        selected_cell,
+                                        exchange_mode,
+                                        exchange_selected,
+                                        direction_override,
+                                    );
+                                    websocket_game_id.set(None);
+                                    // Select the game *before* calling `/start` (below),
+                                    // rather than after — this makes the reactive
+                                    // WebSocket-subscription effect connect right away.
+                                    // A roster with no invitation left to wait on starts
+                                    // immediately, and for an all-engine game `/start`
+                                    // runs the entire game to completion inside that one
+                                    // request; without an already-open connection, the
+                                    // moves would never be visible, only the final
+                                    // state once the request finally resolves. With one
+                                    // open, `run_engine_turns` broadcasting after every
+                                    // individual engine turn means they stream in live
+                                    // while the request is still in flight.
+                                    game.set(Some(created.clone()));
+                                    // The games list only renders a detail panel (where
+                                    // live moves would actually show up) for a game that
+                                    // has a matching entry in `game_summaries` — without
+                                    // this early refresh, the newly created game has no
+                                    // row to render into at all until the final refresh
+                                    // below, defeating the point of subscribing early.
+                                    if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                        game_summaries.set(summaries);
+                                    }
                                     // A roster with no invitation left to wait on (every
                                     // seat already resolved) starts right away — the
                                     // "Start" label on the draft button promised that,
@@ -565,16 +660,6 @@ pub fn RootApp() -> Element {
                                     match started {
                                         Ok(game_state) => {
                                             info_message.set(None);
-                                            reset_composer_state(
-                                                dragging_tile_id,
-                                                selected_blank_letter,
-                                                staged_placements,
-                                                selected_cell,
-                                                exchange_mode,
-                                                exchange_selected,
-                                                direction_override,
-                                            );
-                                            websocket_game_id.set(None);
                                             game.set(Some(game_state));
                                             if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
                                                 game_summaries.set(summaries);
@@ -624,6 +709,50 @@ pub fn RootApp() -> Element {
                             }
                             is_loading.set(false);
                         });
+                    },
+                    on_remove_game: move |game_id: String| {
+                        let server_url = server_url_for_remove.clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        spawn(async move {
+                            is_loading.set(true);
+                            error_message.set(None);
+                            match remove_game(&server_url, &game_id, token.as_deref()).await {
+                                Ok(_) => {
+                                    // The removed game's row is about to
+                                    // disappear from the list — if it was
+                                    // the one currently open, deselect it
+                                    // rather than leaving a stale detail
+                                    // panel open for a game no longer in
+                                    // view.
+                                    if game().as_ref().is_some_and(|current| current.id == game_id) {
+                                        game.set(None);
+                                    }
+                                    if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                        game_summaries.set(summaries);
+                                    }
+                                }
+                                Err(error) => error_message.set(Some(error)),
+                            }
+                            is_loading.set(false);
+                        });
+                    },
+                    on_reorder_seats: move |(seat_a, seat_b): (u8, u8)| {
+                        let server_url = server_url_for_reorder.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match swap_seats(&server_url, &current_game.id, seat_a, seat_b, token.as_deref())
+                                    .await
+                                {
+                                    Ok(updated) => game.set(Some(updated)),
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
                     },
                     on_refresh: move |_| {
                         let server_url = server_url_for_refresh.clone();
@@ -708,6 +837,10 @@ pub fn RootApp() -> Element {
                                 .with_mut(|placements| placements.retain(|p| p.board_index != board_index));
                             dragging_tile_id.set(None);
                             dragging_from_board_index.set(None);
+                            // Same reasoning as `on_remove_staged` — the
+                            // freed cell is the natural place to keep
+                            // composing from.
+                            selected_cell.set(Some(board_index));
                         }
                     },
                     on_drop_board_cell: move |board_index| {
@@ -989,6 +1122,12 @@ pub fn RootApp() -> Element {
                             .with_mut(|placements| {
                                 placements.retain(|p| p.board_index != board_index);
                             });
+                        // The cell that just gave up its tile is the most
+                        // natural place to keep composing from — lets
+                        // right-click-to-remove immediately be followed by
+                        // typing a replacement letter, rather than leaving
+                        // nothing selected.
+                        selected_cell.set(Some(board_index));
                     },
                     on_set_blank_letter: move |letter: String| {
                         error_message.set(None);
@@ -1039,23 +1178,6 @@ pub fn RootApp() -> Element {
                                     Err(error) => error_message.set(Some(error)),
                                 }
                                 is_loading.set(false);
-                            });
-                        }
-                    },
-                    can_chat,
-                    on_send_chat: move |body: String| {
-                        let server_url = server_url_for_chat.clone();
-                        let current_game = game().clone();
-                        let token = session().map(|current| current.session_token.clone());
-                        if let Some(current_game) = current_game {
-                            spawn(async move {
-                                error_message.set(None);
-                                match submit_chat_message(&server_url, &current_game, body, token.as_deref())
-                                    .await
-                                {
-                                    Ok(updated) => game.set(Some(updated)),
-                                    Err(error) => error_message.set(Some(error)),
-                                }
                             });
                         }
                     },
@@ -1513,11 +1635,32 @@ async fn reject_invitation(server_url: &str, invitation_id: &str, token: Option<
     post_json(&format!("{server_url}/invitations/{invitation_id}/reject"), token, &()).await
 }
 
+/// Hides a finished game from the caller's own games list — see
+/// `crate::components::games_panel::game_row`'s "Remove" button.
+async fn remove_game(server_url: &str, game_id: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
+    post_json(&format!("{server_url}/games/{game_id}/remove"), token, &()).await
+}
+
 async fn start_game(server_url: &str, game_id: &str, token: Option<&str>) -> Result<GameStateDto, String> {
     post_json(
         &format!("{server_url}/games/{game_id}/start"),
         token,
         &StartGameRequest::default(),
+    )
+    .await
+}
+
+async fn swap_seats(
+    server_url: &str,
+    game_id: &str,
+    seat_a: u8,
+    seat_b: u8,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    post_json(
+        &format!("{server_url}/games/{game_id}/reorder-seats"),
+        token,
+        &api::SwapSeatsRequest { seat_a, seat_b },
     )
     .await
 }
@@ -1844,8 +1987,9 @@ async fn subscribe_to_game_events(
     game_id: &str,
     token: Option<&str>,
     game_signal: Signal<Option<GameStateDto>>,
+    websocket_game_id: Signal<Option<String>>,
 ) -> Result<(), String> {
-    subscribe_to_game_events_impl(server_url, game_id, token, game_signal).await
+    subscribe_to_game_events_impl(server_url, game_id, token, game_signal, websocket_game_id).await
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1854,6 +1998,7 @@ async fn subscribe_to_game_events_impl(
     game_id: &str,
     token: Option<&str>,
     mut game_signal: Signal<Option<GameStateDto>>,
+    websocket_game_id: Signal<Option<String>>,
 ) -> Result<(), String> {
     let ws_url = websocket_url(server_url, game_id, token)?;
     let (stream, _) = connect_async(ws_url).await.map_err(|_| mark_offline())?;
@@ -1861,6 +2006,13 @@ async fn subscribe_to_game_events_impl(
     let (_, mut read) = stream.split();
 
     while let Some(message) = read.next().await {
+        // The player may have switched to a different game while this
+        // connection was awaiting its next message. Stop applying updates
+        // (and drop `read`, closing the socket) rather than clobbering the
+        // now-selected game's state with this abandoned game's events.
+        if websocket_game_id.peek().as_deref() != Some(game_id) {
+            break;
+        }
         let message = message.map_err(|_| mark_offline())?;
         let text = match message.to_text() {
             Ok(text) => text,
@@ -1887,12 +2039,20 @@ async fn subscribe_to_game_events_impl(
     game_id: &str,
     token: Option<&str>,
     mut game_signal: Signal<Option<GameStateDto>>,
+    websocket_game_id: Signal<Option<String>>,
 ) -> Result<(), String> {
     let ws_url = websocket_url(server_url, game_id, token)?;
     let mut read = WebSocket::open(&ws_url).map_err(|_| mark_offline())?;
     mark_online();
 
     while let Some(message) = read.next().await {
+        // See the native impl's comment: without this check, a connection
+        // left over from a game the player has since navigated away from
+        // keeps delivering events that would otherwise overwrite the
+        // currently-selected game's state.
+        if websocket_game_id.peek().as_deref() != Some(game_id) {
+            break;
+        }
         let message = message.map_err(|_| mark_offline())?;
         let text = match message {
             WsMessage::Text(text) => text,

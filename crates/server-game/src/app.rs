@@ -9,7 +9,7 @@ use api::{
     CreateGameRequest, GameActionRequest, GameEventDto, GameInvitationDto, InvitationStatus,
     InvitePlayerRequest, LoginPlayerRequest, PlayerActionDto, PlayerDto, PlayerSessionDto,
     PostChatMessageRequest, PreviewMoveRequest, RegisterPlayerRequest, StartGameRequest,
-    ValidateSessionRequest,
+    SwapSeatsRequest, ValidateSessionRequest,
 };
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Path, Query, Request, State, WebSocketUpgrade};
@@ -94,8 +94,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/games", post(create_game).get(list_games))
         .route("/games/{game_id}", get(get_game))
         .route("/games/{game_id}/start", post(start_game))
+        .route("/games/{game_id}/reorder-seats", post(swap_seats))
         .route("/games/{game_id}/actions", post(submit_action))
         .route("/games/{game_id}/chat", post(post_chat_message))
+        .route("/games/{game_id}/remove", post(remove_game_for_player))
         .route("/games/{game_id}/preview", post(preview_move))
         .route("/games/{game_id}/suggest", post(suggest_move))
         .route("/games/{game_id}/events", get(game_events))
@@ -197,6 +199,12 @@ async fn list_games(
             .iter()
             .any(|p| p.player_id.as_deref() == Some(caller_player_id.as_str()));
         if is_participant {
+            let removed_by_caller = game.participants.iter().any(|p| {
+                p.player_id.as_deref() == Some(caller_player_id.as_str()) && p.removed_by_player
+            });
+            if removed_by_caller {
+                continue;
+            }
             let relationship = if game.status == api::GameStatus::Active
                 && game
                     .participants
@@ -235,8 +243,12 @@ async fn list_games(
 
         // Not seated and not invited — still show it if the caller is the
         // one who created it (e.g. an Engine vs Engine game set up to
-        // watch, where nobody is ever seated as a human).
-        if game.creator_player_id.as_deref() == Some(caller_player_id.as_str()) {
+        // watch, where nobody is ever seated as a human) and they haven't
+        // removed it (the unseated-creator counterpart to the seated
+        // `removed_by_caller` check above).
+        if game.creator_player_id.as_deref() == Some(caller_player_id.as_str())
+            && !game.removed_by_creator
+        {
             let mut summary = game.to_summary_dto(last_activity_at);
             summary.relationship = api::GameRelationship::Creator;
             summaries.push(summary);
@@ -320,6 +332,7 @@ async fn create_game(
                 score: 0,
                 rack: rules_shared::Rack::default(),
                 resigned: false,
+                removed_by_player: false,
             }
         })
         .collect::<Vec<_>>();
@@ -447,7 +460,7 @@ async fn start_game(
         }
 
         game.start();
-        run_engine_turns(game, &state.engines).await?;
+        run_engine_turns(game, &state.engines, &state.events).await?;
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
@@ -472,6 +485,58 @@ async fn start_game(
     let _ = state
         .events
         .send(GameEventDto::GameStarted { game: dto.clone() });
+    Ok(Json(redact_game_state(dto, &access)))
+}
+
+/// Reorders two seats before the game starts — see
+/// `GameSession::swap_seats` for why this is only ever offered once every
+/// seat is filled. Ownership check is identical to `start_game`'s: a game
+/// with no claimed seats at all (engine vs engine) has no meaningful owner,
+/// so any signed-in caller may reorder it; otherwise only a player already
+/// seated in the game can.
+async fn swap_seats(
+    Path(game_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SwapSeatsRequest>,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers).await;
+
+    let (dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+        let claimed_owners: Vec<&str> = game
+            .participants
+            .iter()
+            .filter_map(|participant| participant.player_id.as_deref())
+            .collect();
+        let caller_owns_a_seat = caller_player_id
+            .as_deref()
+            .is_some_and(|id| claimed_owners.contains(&id));
+        if !claimed_owners.is_empty() && !caller_owns_a_seat {
+            return Err(ApiProblem::unauthorized(
+                "Only a player with a claimed seat in this game can reorder seats",
+            ));
+        }
+
+        game.swap_seats(request.seat_a, request.seat_b)
+            .map_err(ApiProblem::bad_request)?;
+        let dto = game.to_dto();
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        let access = resolve_viewer_access(game, caller_player_id.as_deref());
+        (dto, access)
+    };
+
+    // Broadcast the unredacted dto — per-connection redaction happens in
+    // `stream_events`, not here (see the identical note in `start_game`).
+    let _ = state
+        .events
+        .send(GameEventDto::StateUpdated { game: dto.clone() });
     Ok(Json(redact_game_state(dto, &access)))
 }
 
@@ -534,7 +599,7 @@ async fn submit_action(
                 .map_err(ApiProblem::bad_request)?,
         }
 
-        run_engine_turns(game, &state.engines).await?;
+        run_engine_turns(game, &state.engines, &state.events).await?;
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
@@ -599,6 +664,35 @@ async fn post_chat_message(
     // `stream_events`, not here (see the identical note in `start_game`).
     let _ = state.events.send(GameEventDto::StateUpdated { game: dto.clone() });
     Ok(Json(redact_game_state(dto, &access)))
+}
+
+/// Hides a finished game from the caller's own games list — see
+/// `GameSession::remove_for_player`. Not broadcast over the WebSocket: this
+/// is purely a per-viewer concern, so nobody else's view of the game (or
+/// even this same player's other logged-in devices, until they next reload
+/// their own list) needs to change in response.
+async fn remove_game_for_player(
+    Path(game_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to remove this game from your list"))?;
+
+    let mut games = state.games.write().await;
+    let game = games
+        .get_mut(&game_id)
+        .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+    game.remove_for_player(&caller_player_id)
+        .map_err(ApiProblem::bad_request)?;
+
+    persistence::save_game(&state.db, game)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+    Ok(Json(serde_json::json!({"status": "removed"})))
 }
 
 async fn preview_move(
@@ -745,7 +839,7 @@ async fn suggest_move(
             None => game.apply_pass(seat).map_err(ApiProblem::bad_request)?,
         }
 
-        run_engine_turns(game, &state.engines).await?;
+        run_engine_turns(game, &state.engines, &state.events).await?;
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
@@ -1373,7 +1467,31 @@ const ENGINE_TURN_TIMEOUT: Duration = Duration::from_secs(5);
 /// break the loop.
 const MAX_ENGINE_TURNS_PER_TRIGGER: usize = 400;
 
-async fn run_engine_turns(game: &mut GameSession, engines: &EngineRegistry) -> Result<(), ApiProblem> {
+/// Paced gap between broadcasting one engine turn and computing the next.
+/// A greedy move search on a 15x15 board is fast enough (single-digit
+/// milliseconds) that an all-engine game would otherwise finish before a
+/// freshly-opened WebSocket even completes its handshake, let alone before
+/// the client can render each state — so *some* artificial pacing is
+/// required for the moves to be visible at all, not just theoretically
+/// broadcast. Short enough that a full engine-vs-engine game (well under
+/// `MAX_ENGINE_TURNS_PER_TRIGGER`) still finishes in a few seconds.
+const ENGINE_TURN_BROADCAST_DELAY: Duration = Duration::from_millis(120);
+
+/// Broadcasts a `StateUpdated`/`GameFinished` event after every individual
+/// engine turn, not just once when the whole loop finishes. Without this, an
+/// all-engine game (nothing left to block on a human) runs start-to-finish
+/// inside a single `/start` (or `/actions`) request, and a client watching
+/// it live never sees anything but the final state — the moves happen too
+/// fast to be visible in the one HTTP response, but the WebSocket is a
+/// separate connection, so a caller subscribed to this game *before*
+/// issuing that request still receives every intermediate move as it's
+/// computed, even though the request itself won't resolve until the whole
+/// game is done.
+async fn run_engine_turns(
+    game: &mut GameSession,
+    engines: &EngineRegistry,
+    events: &broadcast::Sender<GameEventDto>,
+) -> Result<(), ApiProblem> {
     for _ in 0..MAX_ENGINE_TURNS_PER_TRIGGER {
         let advanced = game
             .maybe_run_engine_turn(engines, ENGINE_TURN_TIMEOUT)
@@ -1382,9 +1500,18 @@ async fn run_engine_turns(game: &mut GameSession, engines: &EngineRegistry) -> R
         if !advanced {
             break;
         }
-        if game.status == api::GameStatus::Finished {
+        let dto = game.to_dto();
+        let finished = game.status == api::GameStatus::Finished;
+        let event = if finished {
+            GameEventDto::GameFinished { game: dto }
+        } else {
+            GameEventDto::StateUpdated { game: dto }
+        };
+        let _ = events.send(event);
+        if finished {
             break;
         }
+        tokio::time::sleep(ENGINE_TURN_BROADCAST_DELAY).await;
     }
     Ok(())
 }
@@ -3168,7 +3295,11 @@ mod tests {
         bob: PlayerSessionDto,
     }
 
-    async fn create_two_human_game(app: Router) -> TwoHumanGame {
+    /// Everything `create_two_human_game` does, minus the final `/start` —
+    /// both seats claimed, game still `Waiting`. Its own fixture since a
+    /// couple of tests (seat reordering) specifically need that
+    /// pre-start window.
+    async fn create_two_human_game_waiting(app: Router) -> TwoHumanGame {
         let alice = register_player(app.clone(), "Alice").await;
         let bob = register_player(app.clone(), "Bob").await;
 
@@ -3228,19 +3359,24 @@ mod tests {
         .await;
         assert_eq!(accept_response.status(), StatusCode::OK);
 
+        TwoHumanGame { game: created, alice, bob }
+    }
+
+    async fn create_two_human_game(app: Router) -> TwoHumanGame {
+        let waiting = create_two_human_game_waiting(app.clone()).await;
         let started: GameStateDto = read_json(
             send_json_auth(
                 app,
                 Method::POST,
-                &format!("/games/{}/start", created.id),
-                Some(&alice.session_token),
+                &format!("/games/{}/start", waiting.game.id),
+                Some(&waiting.alice.session_token),
                 &StartGameRequest::default(),
             )
             .await,
         )
         .await;
         assert_eq!(started.status, api::GameStatus::Active);
-        TwoHumanGame { game: started, alice, bob }
+        TwoHumanGame { game: started, alice: waiting.alice, bob: waiting.bob }
     }
 
     #[tokio::test]
@@ -3341,6 +3477,103 @@ mod tests {
         // A resignation has no rack transfer — only going out does.
         assert_eq!(updated.final_bonus_seat, None);
         assert_eq!(updated.final_bonus_points, None);
+    }
+
+    #[tokio::test]
+    async fn removing_a_finished_game_hides_it_from_only_that_player() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.alice.session_token),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Resign,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let remove_response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/remove", started.game.id),
+            Some(&started.alice.session_token),
+        )
+        .await;
+        assert_eq!(remove_response.status(), StatusCode::OK);
+
+        let alice_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&started.alice.session_token))
+                .await,
+        )
+        .await;
+        assert!(
+            !alice_games.iter().any(|summary| summary.id == started.game.id),
+            "Alice removed this game, it should no longer appear in her list"
+        );
+
+        let bob_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&started.bob.session_token)).await,
+        )
+        .await;
+        assert!(
+            bob_games.iter().any(|summary| summary.id == started.game.id),
+            "Bob never removed this game, it should still appear in his list"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_game_that_is_not_finished_is_rejected() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        let remove_response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/remove", started.game.id),
+            Some(&started.alice.session_token),
+        )
+        .await;
+        assert_eq!(remove_response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn removing_a_game_you_are_not_seated_in_is_rejected() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.alice.session_token),
+            &GameActionRequest {
+                seat_number: 0,
+                action: PlayerActionDto::Resign,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let stranger = register_player(app.clone(), "Stranger").await;
+        let remove_response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/remove", started.game.id),
+            Some(&stranger.session_token),
+        )
+        .await;
+        assert_eq!(remove_response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -4241,6 +4474,156 @@ mod tests {
             .find(|summary| summary.id == created.id)
             .expect("engine-vs-engine game should still appear for its creator");
         assert_eq!(summary.relationship, api::GameRelationship::Creator);
+    }
+
+    #[tokio::test]
+    async fn removing_a_finished_engine_vs_engine_game_hides_it_from_its_unseated_creator() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let owner = register_player(app.clone(), "Referee3").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&owner.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy One".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy Two".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                    ],
+                    seed: Some(779),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let started: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                Some(&owner.session_token),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(started.status, api::GameStatus::Finished);
+
+        let remove_response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/remove", started.id),
+            Some(&owner.session_token),
+        )
+        .await;
+        assert_eq!(remove_response.status(), StatusCode::OK);
+
+        let listed: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&owner.session_token)).await,
+        )
+        .await;
+        assert!(
+            !listed.iter().any(|summary| summary.id == started.id),
+            "the creator removed this game, it should no longer appear in their list"
+        );
+    }
+
+    #[tokio::test]
+    async fn reorder_seats_swaps_turn_order_before_the_game_starts() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let waiting = create_two_human_game_waiting(app.clone()).await;
+        assert_eq!(waiting.game.participants[0].display_name, "Alice");
+        assert_eq!(waiting.game.participants[1].display_name, "Open seat");
+
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/reorder-seats", waiting.game.id),
+            Some(&waiting.alice.session_token),
+            &api::SwapSeatsRequest { seat_a: 0, seat_b: 1 },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let reordered: GameStateDto = read_json(response).await;
+        assert_eq!(reordered.participants[0].display_name, "Open seat");
+        assert_eq!(reordered.participants[0].seat_number, 0);
+        assert_eq!(reordered.participants[1].display_name, "Alice");
+        assert_eq!(reordered.participants[1].seat_number, 1);
+
+        // The new order actually determines turn order once started.
+        let started: GameStateDto = read_json(
+            send_json_auth(
+                app,
+                Method::POST,
+                &format!("/games/{}/start", waiting.game.id),
+                Some(&waiting.alice.session_token),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(started.current_seat, 0);
+        assert_eq!(started.participants[0].display_name, "Open seat");
+    }
+
+    #[tokio::test]
+    async fn reorder_seats_is_rejected_once_the_game_has_started() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/reorder-seats", started.game.id),
+            Some(&started.alice.session_token),
+            &api::SwapSeatsRequest { seat_a: 0, seat_b: 1 },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn reorder_seats_is_rejected_for_a_caller_with_no_claimed_seat() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let waiting = create_two_human_game_waiting(app.clone()).await;
+        let stranger = register_player(app.clone(), "Stranger").await;
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/reorder-seats", waiting.game.id),
+            Some(&stranger.session_token),
+            &api::SwapSeatsRequest { seat_a: 0, seat_b: 1 },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

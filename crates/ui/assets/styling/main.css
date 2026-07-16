@@ -111,13 +111,12 @@ button:disabled {
 
 /* A step further from Pass/Exchange/Play — ends the game outright, so it
    gets a quieter, slightly warm-warning tint rather than sitting flush
-   with the routine turn actions next to it. */
+   with the routine turn actions next to it. Kept out of their reach by
+   living in its own `.turn-actions-resign` group (see below), not by any
+   margin trick on the button itself. */
 .resign-button {
     color: #8a2d1e;
     box-shadow: inset 0 0 0 1px rgba(199, 104, 72, 0.35);
-    /* Sits apart from the routine turn actions in the same flex row,
-       rather than flush against Play. */
-    margin-left: auto;
 }
 
 .workspace-shell {
@@ -157,7 +156,6 @@ button:disabled {
 }
 
 .hero-copy,
-.panel-header p,
 .empty-copy,
 .history-copy {
     color: rgba(35, 25, 15, 0.72);
@@ -213,10 +211,6 @@ button:disabled {
     padding: 16px;
 }
 
-.rack-panel .panel-header {
-    margin-bottom: 10px;
-}
-
 .status-strip {
     display: flex;
     gap: 10px;
@@ -224,12 +218,47 @@ button:disabled {
     align-items: center;
 }
 
+.rack-row {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+}
+
+.rack-row-bag {
+    flex-shrink: 0;
+}
+
+.rack-row .rack-strip {
+    flex: 1;
+}
+
+/* Mirrors `.rack-row`'s layout: a flexible middle region that right-aligns
+   against a fixed-width element at the end (there, the tiles against the
+   Bag chip; here, Pass/Exchange/Play against Resign), so the two rows read
+   as aligned columns rather than one bunched-up cluster. */
 .turn-actions {
     display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-top: 10px;
+}
+
+.turn-actions-left,
+.turn-actions-resign {
+    display: flex;
+    flex-shrink: 0;
     gap: 10px;
     flex-wrap: wrap;
     align-items: center;
-    margin-top: 10px;
+}
+
+.turn-actions-buttons {
+    display: flex;
+    flex: 1;
+    justify-content: flex-end;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: center;
 }
 
 .chat-panel {
@@ -257,7 +286,19 @@ button:disabled {
     flex-wrap: wrap;
     gap: 6px;
     align-items: baseline;
+    align-self: flex-start;
+    max-width: 88%;
     font-size: 0.85rem;
+    padding: 5px 10px;
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.7);
+}
+
+.chat-message-own {
+    align-self: flex-end;
+    background: rgba(199, 104, 72, 0.18);
+    flex-direction: row-reverse;
+    text-align: right;
 }
 
 .chat-message-sender {
@@ -274,6 +315,23 @@ button:disabled {
     color: rgba(35, 25, 15, 0.5);
 }
 
+.game-row-unread-mail {
+    font-size: 1.3rem;
+    color: var(--gold, #d4a23a);
+    filter: drop-shadow(0 0 2px rgba(212, 162, 58, 0.6));
+    animation: unread-mail-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes unread-mail-pulse {
+    0%,
+    100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.6;
+    }
+}
+
 .chat-composer {
     display: flex;
     gap: 8px;
@@ -287,14 +345,6 @@ button:disabled {
     background: rgba(255, 255, 255, 0.7);
     box-shadow: inset 0 0 0 1px rgba(35, 25, 15, 0.1);
     font-size: 0.85rem;
-}
-
-.panel-header {
-    display: flex;
-    justify-content: space-between;
-    gap: 16px;
-    align-items: start;
-    margin-bottom: 18px;
 }
 
 .panel-tag {
@@ -362,20 +412,27 @@ button:disabled {
         0 10px 18px rgba(77, 50, 26, 0.08);
 }
 
-/* Marks the squares the most recent move placed a tile on — cleared the
-   moment a pass/exchange happens (see `last_move_board_indices` in
-   home.rs), since nothing changed on the board that turn. */
-.board-cell-last-move {
-    box-shadow:
-        inset 0 0 0 2px var(--gold, rgba(212, 162, 58, 0.95)),
-        0 6px 14px rgba(77, 50, 26, 0.1);
-}
-
 .board-cell-filled {
     background: linear-gradient(160deg, #f6dca4, #ddb771);
     box-shadow:
         inset 0 0 0 1px rgba(77, 50, 26, 0.24),
         0 6px 14px rgba(77, 50, 26, 0.12);
+}
+
+/* Marks the squares the most recent move placed a tile on — cleared the
+   moment a pass/exchange happens (see `last_move_board_indices` in
+   home.rs), since nothing changed on the board that turn. Deliberately
+   placed after `.board-cell-filled` above (equal specificity, so source
+   order decides) so this actually wins instead of being silently
+   overridden by it — and before the `.premium-*` rules below, so a
+   last-move tile landing on a colored premium square still shows that
+   color through the background, the same look a staged (not-yet-submitted)
+   tile already has on a premium square. */
+.board-cell-last-move {
+    background: linear-gradient(160deg, rgba(212, 162, 58, 0.62), rgba(244, 228, 188, 0.92));
+    box-shadow:
+        inset 0 0 0 2px var(--gold, rgba(212, 162, 58, 0.95)),
+        0 6px 14px rgba(77, 50, 26, 0.1);
 }
 
 .premium-double-letter {
@@ -423,6 +480,15 @@ button:disabled {
     font-size: clamp(1rem, 2vw, 1.45rem);
 }
 
+/* The rack's `.tile-face` exists purely to give `.tile-value` the same
+   padding-respecting containing block the board's has (see `rack_view.rs`)
+   — not to pull in the board's clamped font size, which would otherwise
+   override `.rack-tile`'s own `font-size` the moment it became the nearer
+   ancestor. */
+.rack-tile .tile-face {
+    font-size: inherit;
+}
+
 .tile-value {
     position: absolute;
     right: 3px;
@@ -445,6 +511,13 @@ button:disabled {
     width: 52px;
     height: 52px;
     border-radius: 14px;
+    /* Matches `.board-cell`'s padding so `.tile-value`'s absolute
+       `right`/`bottom` offset (measured from this element's padding box,
+       since it's the nearest positioned ancestor here) lands in the same
+       place relative to the rounded corner as it does on the board, where
+       `.tile-face` sits inside that padding instead. Without this, the
+       value sat right at the unpadded corner and the curve clipped it. */
+    padding: 4px;
     display: grid;
     place-items: center;
     background: linear-gradient(160deg, #f6dca4, #ddb771);
@@ -849,6 +922,38 @@ button:disabled {
     color: rgba(35, 25, 15, 0.55);
 }
 
+.player-table-reorder {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-right: 8px;
+    vertical-align: middle;
+}
+
+.player-table-reorder-button {
+    border: none;
+    border-radius: 6px;
+    width: 26px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(111, 75, 44, 0.14);
+    color: var(--ink);
+    font-size: 0.75rem;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.player-table-reorder-button:hover:not(:disabled) {
+    background: rgba(111, 75, 44, 0.26);
+}
+
+.player-table-reorder-button:disabled {
+    cursor: default;
+    opacity: 0.3;
+}
+
 .player-table-score {
     font-weight: 700;
     text-align: right;
@@ -1029,7 +1134,6 @@ button:disabled {
         overflow-y: visible;
     }
 
-    .panel-header,
     .topbar {
         flex-direction: column;
         align-items: start;
