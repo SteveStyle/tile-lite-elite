@@ -804,13 +804,17 @@ pub async fn get_player_by_name(
 /// normalization (trimming, lowercasing) is the caller's job, matching how
 /// `register_player`/`login_player` already treat `display_name`.
 ///
-/// `players.email` has no `unique` constraint (unlike `display_name`), so
-/// two accounts can already share an email today; if that ever happens,
-/// `fetch_optional` silently returns whichever row the query planner visits
-/// first and a password-reset request would only ever be able to reach that
-/// one account. Flagging rather than fixing here — deciding whether email
-/// should become unique (and what to do with any pre-existing duplicates)
-/// is a registration-flow decision, not a reset-flow one.
+/// `players.email` deliberately has no `unique` constraint (unlike
+/// `display_name`) — one person legitimately running several identities
+/// under the same email (the project owner's own multi-account testing
+/// setup, at minimum) is an accepted use case, not a bug. The tradeoff this
+/// creates: if duplicates exist, `fetch_optional` returns whichever row the
+/// query planner visits first, so a `/auth/forgot-password` request can
+/// only ever reach one of that email's accounts, arbitrarily, never "all
+/// accounts with this email" or "let the requester choose." Acceptable for
+/// now — this app has no real user base depending on account recovery — but
+/// worth revisiting (e.g. reset-all-matching-accounts, or a picker) if that
+/// ever changes.
 pub async fn get_player_by_email(
     pool: &Pool<Sqlite>,
     email: &str,
