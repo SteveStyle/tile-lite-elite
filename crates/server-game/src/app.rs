@@ -1026,18 +1026,7 @@ async fn register_player(
 
     tracing::info!(player_id, display_name, "player registered");
 
-    crate::email::send(
-        &state.email,
-        email,
-        "Welcome to Tile Lite Elite",
-        &format!(
-            "<p>Hi {display_name},</p>\
-             <p>Your Tile Lite Elite account is ready. Head over to \
-             <a href=\"{base}\">{base}</a> to create or join a game.</p>",
-            base = state.public_base_url,
-        ),
-    )
-    .await;
+    crate::email::send_welcome(&state.email, email, display_name, &state.public_base_url).await;
 
     Ok(Json(PlayerSessionDto {
         player_id,
@@ -1172,8 +1161,8 @@ async fn change_password(
 ///
 /// The reset link only ever appears in a log line if `state.email` has no
 /// provider configured (see `EmailConfig`'s doc comment) — with Resend
-/// wired up, `crate::email::send` delivers it and does not log the link
-/// itself, so a live reset link never sits in server logs.
+/// wired up, `crate::email::send_password_reset` delivers it and does not
+/// log the link itself, so a live reset link never sits in server logs.
 async fn request_password_reset(
     State(state): State<AppState>,
     Json(request): Json<RequestPasswordResetRequest>,
@@ -1208,19 +1197,7 @@ async fn request_password_reset(
 
         let reset_url = format!("{}/reset-password?token={}", state.public_base_url, token);
         tracing::info!(player_id = %player.id, "password reset requested");
-        crate::email::send(
-            &state.email,
-            &email,
-            "Reset your Tile Lite Elite password",
-            &format!(
-                "<p>Someone (hopefully you) requested a password reset for your \
-                 Tile Lite Elite account.</p>\
-                 <p><a href=\"{reset_url}\">Click here to choose a new password</a>. \
-                 This link expires in an hour and only works once.</p>\
-                 <p>If you didn't request this, you can ignore this email.</p>"
-            ),
-        )
-        .await;
+        crate::email::send_password_reset(&state.email, &email, &reset_url).await;
     } else {
         tracing::info!(email = %email, "password reset requested for unknown email");
     }
@@ -1387,18 +1364,12 @@ async fn invite_player_to_game(
     // Only named invitations have a specific person to notify — an
     // open/stranger invitation has no invitee yet, just an open seat.
     if let Some(invited_player) = &invited_player {
-        crate::email::send(
+        crate::email::send_invitation(
             &state.email,
             &invited_player.email,
-            &format!("{} invited you to a game of Tile Lite Elite", inviting_player.display_name),
-            &format!(
-                "<p>Hi {invitee},</p>\
-                 <p>{inviter} has invited you to a game of Tile Lite Elite. \
-                 Log in at <a href=\"{base}\">{base}</a> to accept.</p>",
-                invitee = invited_player.display_name,
-                inviter = inviting_player.display_name,
-                base = state.public_base_url,
-            ),
+            &invited_player.display_name,
+            &inviting_player.display_name,
+            &state.public_base_url,
         )
         .await;
     }

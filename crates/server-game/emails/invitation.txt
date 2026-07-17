@@ -1,0 +1,5 @@
+Subject: {{inviter_name}} invited you to a game of Tile Lite Elite
+
+Hi {{invitee_name}},
+
+{{inviter_name}} has invited you to a game of Tile Lite Elite. Log in at {{base_url}} to accept.

@@ -1,7 +1,9 @@
-//! Minimal Resend client — one function, no retry/queue/template system.
-//! Every call site (welcome, invitation notice, password reset) builds its
-//! own subject/HTML and calls `send`; this hobby-scale app has no reason
-//! for anything heavier than that yet.
+//! Minimal Resend client. Content lives in `crates/server-game/emails/*.txt`
+//! — plain text, `{{placeholder}}` substitution, no conditionals or loops —
+//! deliberately not a real templating engine, since these are all flat "hi
+//! X, here's a link" emails and a template-engine dependency would be
+//! solving a problem this project doesn't have. Editing the wording is a
+//! content change to those files, not a code change here.
 
 use serde_json::json;
 
@@ -24,19 +26,75 @@ impl EmailConfig {
     }
 }
 
+const WELCOME_TEMPLATE: &str = include_str!("../emails/welcome.txt");
+const INVITATION_TEMPLATE: &str = include_str!("../emails/invitation.txt");
+const PASSWORD_RESET_TEMPLATE: &str = include_str!("../emails/password-reset.txt");
+
+pub async fn send_welcome(config: &EmailConfig, to: &str, display_name: &str, base_url: &str) {
+    let (subject, body) = render(
+        WELCOME_TEMPLATE,
+        &[("display_name", display_name), ("base_url", base_url)],
+    );
+    send(config, to, &subject, &body).await;
+}
+
+pub async fn send_invitation(
+    config: &EmailConfig,
+    to: &str,
+    invitee_name: &str,
+    inviter_name: &str,
+    base_url: &str,
+) {
+    let (subject, body) = render(
+        INVITATION_TEMPLATE,
+        &[
+            ("invitee_name", invitee_name),
+            ("inviter_name", inviter_name),
+            ("base_url", base_url),
+        ],
+    );
+    send(config, to, &subject, &body).await;
+}
+
+pub async fn send_password_reset(config: &EmailConfig, to: &str, reset_url: &str) {
+    let (subject, body) = render(PASSWORD_RESET_TEMPLATE, &[("reset_url", reset_url)]);
+    send(config, to, &subject, &body).await;
+}
+
+/// Template format: a `Subject: ...` first line, a blank line, then the
+/// plain-text body — everything after is verbatim aside from `{{key}}`
+/// substitution (applied to both subject and body, since the invitation
+/// email's subject line itself uses a placeholder).
+fn render(template: &str, values: &[(&str, &str)]) -> (String, String) {
+    let (subject_line, body) = template
+        .split_once('\n')
+        .expect("email template should have a Subject line, a blank line, then the body");
+    let subject = subject_line
+        .strip_prefix("Subject: ")
+        .expect("email template's first line should read 'Subject: ...'");
+    let body = body.trim_start_matches('\n');
+
+    let substitute = |text: &str| {
+        values.iter().fold(text.to_string(), |acc, (key, value)| {
+            acc.replace(&format!("{{{{{key}}}}}"), value)
+        })
+    };
+    (substitute(subject), substitute(body))
+}
+
 /// Fire-and-log, never fire-and-fail: a missing/failed send is always a
 /// `warn`-level side note, never something that fails the caller's request.
 /// Registering, inviting someone, or requesting a password reset should all
 /// succeed on their own merits — none of them ought to depend on Resend
 /// being reachable, same principle as everything else in this codebase that
 /// treats a notification as best-effort rather than load-bearing.
-pub async fn send(config: &EmailConfig, to: &str, subject: &str, html_body: &str) {
+async fn send(config: &EmailConfig, to: &str, subject: &str, text_body: &str) {
     let Some(api_key) = config.api_key.as_deref() else {
         // The email body is the only place this content exists when
         // there's no provider to deliver it — log it in full (rather than
         // just "would have sent something") so the flow stays usable and
         // testable in local dev with zero Resend setup.
-        tracing::info!(to, subject, html_body, "email not sent (no RESEND_API_KEY configured)");
+        tracing::info!(to, subject, text_body, "email not sent (no RESEND_API_KEY configured)");
         return;
     };
 
@@ -48,7 +106,7 @@ pub async fn send(config: &EmailConfig, to: &str, subject: &str, html_body: &str
             "from": config.from_address,
             "to": [to],
             "subject": subject,
-            "html": html_body,
+            "text": text_body,
         }))
         .send()
         .await;
@@ -64,6 +122,40 @@ pub async fn send(config: &EmailConfig, to: &str, subject: &str, html_body: &str
         }
         Err(error) => {
             tracing::warn!(to, subject, %error, "email send failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_substitutes_every_placeholder_in_subject_and_body() {
+        let (subject, body) = render(
+            "Subject: {{a}} says hi\n\nHello {{b}}, from {{a}}.\n",
+            &[("a", "Alice"), ("b", "Bob")],
+        );
+        assert_eq!(subject, "Alice says hi");
+        assert_eq!(body, "Hello Bob, from Alice.\n");
+    }
+
+    #[test]
+    fn every_template_file_parses_and_leaves_no_placeholder_unfilled() {
+        for (template, keys) in [
+            (WELCOME_TEMPLATE, &["display_name", "base_url"][..]),
+            (
+                INVITATION_TEMPLATE,
+                &["invitee_name", "inviter_name", "base_url"][..],
+            ),
+            (PASSWORD_RESET_TEMPLATE, &["reset_url"][..]),
+        ] {
+            let values: Vec<(&str, &str)> = keys.iter().map(|key| (*key, "x")).collect();
+            let (subject, body) = render(template, &values);
+            assert!(
+                !subject.contains("{{") && !body.contains("{{"),
+                "template left an unfilled {{{{placeholder}}}}: subject={subject:?} body={body:?}"
+            );
         }
     }
 }

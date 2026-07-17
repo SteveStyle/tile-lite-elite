@@ -1,0 +1,5 @@
+Subject: Welcome to Tile Lite Elite
+
+Hi {{display_name}},
+
+Your Tile Lite Elite account is ready. Head over to {{base_url}} to create or join a game.
