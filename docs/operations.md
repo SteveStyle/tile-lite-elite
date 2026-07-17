@@ -263,6 +263,9 @@ No test coverage for `admin-cli` (it's a thin HTTP client with no logic of its o
 | `TILE_LITE_ELITE_DATABASE_URL` | `sqlite://data/tile-lite-elite.sqlite3` | SQLite database path |
 | `TILE_LITE_ELITE_API_BASE_URL` | `http://127.0.0.1:3000` | Backend URL used by clients. Set at *build* time (`option_env!`), not runtime. An explicit empty string means "same origin as the page" — see [Container Deployment](#container-deployment) |
 | `TILE_LITE_ELITE_UI_PORT` | `8080` | Web dev server port |
+| `TILE_LITE_ELITE_PUBLIC_BASE_URL` | `http://127.0.0.1:8080` | Where the web client is served from — used only to build the link inside emails (password reset, welcome, invitation). Production sets this to `https://tileliteelite.com` in `docker-compose.yml` |
+| `RESEND_API_KEY` | unset | [Resend](https://resend.com) API key for sending email. Unset means no provider is configured — every email-triggering flow (register, invite, forgot-password) still works, it just logs the message instead of sending it (see `crates/server-game/src/email.rs`). Set via a `.env` file next to `docker-compose.yml`, **not** committed to git — see [Container Deployment](#container-deployment) |
+| `RESEND_FROM_ADDRESS` | `Tile Lite Elite <noreply@mail.tileliteelite.com>` | The `From:` address emails are sent as. Deliberately a subdomain (`mail.tileliteelite.com`), not the root domain — keeps Resend's required SPF/DKIM records completely separate from the root domain's own mailbox (GoDaddy Email) records, so nothing here can affect real mail deliverability |
 | `RUST_LOG` | `server_game=info,tower_http=info,warn` | Log verbosity for `server-game`. See [Logging](#logging) |
 | `TILE_LITE_ELITE_BUILD_ID` | unset | Optional build identifier baked in at *build* time (`option_env!`), appended as SemVer build metadata to the app version (e.g. `0.1.0+a1c9f02`). Unset (the default, used for production releases) shows only `Major.Minor.Patch`. See [Versioning](#versioning) |
 
@@ -360,6 +363,18 @@ Caddy's obtained TLS certificate lives on its own named volumes (`caddy-data`, `
 **Admin CLI**: `/admin/*` stays loopback-only exactly as it is locally — a request proxied in from the `web` container isn't a loopback connection, so the server rejects it the same as it would over a LAN. See the [Admin CLI](#admin-cli) section above for how to reach it here (`docker compose exec server tile-lite-elite-admin ...`) versus against a local dev server — they're not interchangeable.
 
 **Why one image serves both, same-origin**: the web build is compiled with `TILE_LITE_ELITE_API_BASE_URL=""` (explicitly empty, not unset — see the Configuration table above), which makes the client derive its API/WebSocket target from whatever origin actually served the page (`crates/ui/src/app.rs`'s `websocket_url`/`same_origin_websocket_url`). That's what lets the same compiled wasm bundle work regardless of the host's IP or domain, with no rebuild needed if either changes — and it sidesteps CORS entirely, since Caddy serves both the static assets and the proxied API from one origin.
+
+**Setting `RESEND_API_KEY`**: `docker-compose.yml` reads it via `${RESEND_API_KEY:-}` substitution, which Compose fills in from a `.env` file it auto-loads from the same directory — *not* from the `environment:` block itself, so the real key never goes anywhere near git. Create it once on the VM (`scripts/deploy.sh` only ever scps `docker-compose.yml` and the image tarball, never `.env`, so this survives every future redeploy untouched — same handling as the deploy SSH key):
+
+```bash
+ssh tile-lite-elite
+cat > ~/tile-lite-elite/.env <<'EOF'
+RESEND_API_KEY=re_your_real_key_here
+EOF
+cd ~/tile-lite-elite && docker compose up -d   # picks up the new .env immediately
+```
+
+Leaving `.env` absent (or `RESEND_API_KEY` unset within it) is a supported, fully-functional state — see `RESEND_API_KEY`'s row in the Configuration table above.
 
 ### Redeploying (after a code change)
 

@@ -16,6 +16,17 @@ services:
       # Only used to build the link inside a password-reset email — see
       # AppState::public_base_url's doc comment in crates/server-game/src/app.rs.
       TILE_LITE_ELITE_PUBLIC_BASE_URL: https://tileliteelite.com
+      # `${VAR}` substitution reads from a `.env` file Compose auto-loads
+      # from this same directory — NOT the `environment:` block above,
+      # which would commit the real secret to git. `deploy.sh` never
+      # touches `.env`, so it's created once on the VM by hand (see
+      # docs/operations.md's Configuration section) and survives every
+      # redeploy untouched, same as the deploy SSH key's own handling.
+      # Missing/empty RESEND_API_KEY just means EmailConfig has no
+      # provider configured — every email-triggering flow still works,
+      # it logs the message instead of sending it (see crates/server-game/src/email.rs).
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM_ADDRESS: ${RESEND_FROM_ADDRESS:-Tile Lite Elite <noreply@mail.tileliteelite.com>}
     volumes:
       - tile-lite-elite-data:/data
     restart: unless-stopped

@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use server_game::email::EmailConfig;
 use server_game::{AppState, build_router};
 
 #[tokio::main]
@@ -24,7 +25,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // set; production sets it explicitly (docker-compose.yml).
     let public_base_url = std::env::var("TILE_LITE_ELITE_PUBLIC_BASE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-    let state = AppState::new(&database_url, public_base_url).await?;
+    // Unset in local dev by default — every email-triggering flow still
+    // works without it, just logging the message instead of sending it
+    // (see EmailConfig's doc comment). Production sets both explicitly.
+    let email_api_key = std::env::var("RESEND_API_KEY").ok().filter(|key| !key.is_empty());
+    let email_from_address = std::env::var("RESEND_FROM_ADDRESS")
+        .unwrap_or_else(|_| "Tile Lite Elite <noreply@mail.tileliteelite.com>".to_string());
+    let email_config = EmailConfig::new(email_api_key, email_from_address);
+    let state = AppState::new(&database_url, public_base_url, email_config).await?;
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(bind.parse::<SocketAddr>()?).await?;
 

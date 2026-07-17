@@ -44,10 +44,15 @@ pub struct AppState {
     /// own doc comment in `docs/operations.md` for why the *client* doesn't
     /// need this baked in), so this field exists solely for that one link.
     pub public_base_url: String,
+    pub email: crate::email::EmailConfig,
 }
 
 impl AppState {
-    pub async fn new(database_url: &str, public_base_url: String) -> Result<Self, sqlx::Error> {
+    pub async fn new(
+        database_url: &str,
+        public_base_url: String,
+        email: crate::email::EmailConfig,
+    ) -> Result<Self, sqlx::Error> {
         let db = persistence::connect(database_url).await?;
         let engines = EngineRegistry::default();
         persistence::upsert_engine_profiles(&db, &engines.metadata()).await?;
@@ -67,6 +72,7 @@ impl AppState {
             events,
             engines,
             public_base_url,
+            email,
         })
     }
 }
@@ -1020,6 +1026,19 @@ async fn register_player(
 
     tracing::info!(player_id, display_name, "player registered");
 
+    crate::email::send(
+        &state.email,
+        email,
+        "Welcome to Tile Lite Elite",
+        &format!(
+            "<p>Hi {display_name},</p>\
+             <p>Your Tile Lite Elite account is ready. Head over to \
+             <a href=\"{base}\">{base}</a> to create or join a game.</p>",
+            base = state.public_base_url,
+        ),
+    )
+    .await;
+
     Ok(Json(PlayerSessionDto {
         player_id,
         session_token,
@@ -1151,11 +1170,10 @@ async fn change_password(
 /// error message, just with a shared *success* instead, since this endpoint
 /// has no legitimate reason to distinguish the two outcomes to the caller.
 ///
-/// No email provider is wired up yet (see `docs/authentication.md`) — the
-/// reset link is logged at `info` instead of sent, so the flow is complete
-/// and testable end-to-end already; swapping the `tracing::info!` below for
-/// a real send is the only change needed once Resend (or similar) is
-/// configured.
+/// The reset link only ever appears in a log line if `state.email` has no
+/// provider configured (see `EmailConfig`'s doc comment) — with Resend
+/// wired up, `crate::email::send` delivers it and does not log the link
+/// itself, so a live reset link never sits in server logs.
 async fn request_password_reset(
     State(state): State<AppState>,
     Json(request): Json<RequestPasswordResetRequest>,
@@ -1189,11 +1207,20 @@ async fn request_password_reset(
         .map_err(ApiProblem::from_sqlx)?;
 
         let reset_url = format!("{}/reset-password?token={}", state.public_base_url, token);
-        tracing::info!(
-            player_id = %player.id,
-            reset_url = %reset_url,
-            "password reset requested; link logged instead of emailed (no mail provider configured yet)"
-        );
+        tracing::info!(player_id = %player.id, "password reset requested");
+        crate::email::send(
+            &state.email,
+            &email,
+            "Reset your Tile Lite Elite password",
+            &format!(
+                "<p>Someone (hopefully you) requested a password reset for your \
+                 Tile Lite Elite account.</p>\
+                 <p><a href=\"{reset_url}\">Click here to choose a new password</a>. \
+                 This link expires in an hour and only works once.</p>\
+                 <p>If you didn't request this, you can ignore this email.</p>"
+            ),
+        )
+        .await;
     } else {
         tracing::info!(email = %email, "password reset requested for unknown email");
     }
@@ -1349,6 +1376,32 @@ async fn invite_player_to_game(
         invited_player_id = record.invited_player_id.as_deref(),
         "invitation created"
     );
+
+    // `game`/`seat` (borrowed from this guard) aren't needed past this
+    // point — released explicitly rather than held across the email send
+    // below, which talks to an external service and could be much slower
+    // than the local DB awaits this guard was already (pre-existing
+    // pattern) held across.
+    drop(games);
+
+    // Only named invitations have a specific person to notify — an
+    // open/stranger invitation has no invitee yet, just an open seat.
+    if let Some(invited_player) = &invited_player {
+        crate::email::send(
+            &state.email,
+            &invited_player.email,
+            &format!("{} invited you to a game of Tile Lite Elite", inviting_player.display_name),
+            &format!(
+                "<p>Hi {invitee},</p>\
+                 <p>{inviter} has invited you to a game of Tile Lite Elite. \
+                 Log in at <a href=\"{base}\">{base}</a> to accept.</p>",
+                invitee = invited_player.display_name,
+                inviter = inviting_player.display_name,
+                base = state.public_base_url,
+            ),
+        )
+        .await;
+    }
 
     Ok(Json(GameInvitationDto {
         id: record.id,
@@ -1994,9 +2047,13 @@ mod tests {
     use tower::util::ServiceExt;
 
     async fn create_test_state(database_url: &str) -> AppState {
-        AppState::new(database_url, "http://127.0.0.1:8080".to_string())
-            .await
-            .expect("test app state should initialize")
+        AppState::new(
+            database_url,
+            "http://127.0.0.1:8080".to_string(),
+            crate::email::EmailConfig::new(None, "Tile Lite Elite <noreply@mail.tileliteelite.com>".to_string()),
+        )
+        .await
+        .expect("test app state should initialize")
     }
 
     fn test_database_url() -> String {

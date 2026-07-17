@@ -4711,6 +4711,7 @@ dependencies = [
  "axum",
  "engine-core",
  "rand 0.8.5",
+ "reqwest",
  "rules-shared",
  "serde",
  "serde_json",
