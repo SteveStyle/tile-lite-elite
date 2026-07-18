@@ -15,7 +15,7 @@ The goal is to keep the database simple enough for local use and free or near-fr
 ## Core Tables
 
 ### `schema_migrations`
-Tracks applied migrations.
+Created by `persistence::migrate()`, but dead scaffolding in practice — nothing currently inserts into or reads from it. There is no real migration runner; schema evolution is entirely via additive `create table if not exists`/JSON-field-default changes, which is exactly why this table doing nothing hasn't blocked anything yet (see the migration-limitation note at the bottom of this doc).
 
 Fields:
 
@@ -40,9 +40,10 @@ Fields:
 - `winner_seat` integer null
 - `random_seed` integer null
 - `notes` text null
+- `snapshot_json` text not null — the actual authoritative game state (full board, racks, bag, move history, per-seat `resigned`/`removed_by_player`/`invited_email`, etc.), deserialized as `PersistedGame`. Every other column on this table, plus `game_participants`/`game_moves` below, is a denormalized read-optimization derived from this blob, not a second source of truth.
 
 ### `game_participants`
-Players or engines assigned to seats in a game.
+Players or engines assigned to seats in a game — a queryable, denormalized mirror of the participant rows embedded in `games.snapshot_json` (see that column below), rewritten wholesale on every `save_game` call. `snapshot_json` is the actual source of truth for game state (including per-seat fields that aren't mirrored here, like `resigned`, `removed_by_player`, and `invited_email`); this table exists so the server can query across games (last-activity lookups, etc.) without deserializing every snapshot.
 
 Fields:
 
@@ -62,7 +63,7 @@ Constraints:
 - unique `game_id` + `seat_number`
 
 ### `game_moves`
-Every move or turn action in order.
+Every move or turn action in order — same denormalized-mirror relationship to `snapshot_json` as `game_participants` above (the authoritative `MoveRecord` list lives in the snapshot; this table exists for querying).
 
 Fields:
 
@@ -81,8 +82,47 @@ Constraints:
 
 - unique `game_id` + `move_number`
 
-### `game_state_snapshots`
-Optional saved snapshots for replay, restore, or debugging.
+### `game_messages`
+In-game chat, one row per message.
+
+Fields:
+
+- `id` text primary key
+- `game_id` text not null foreign key to `games.id`
+- `player_id` text not null
+- `display_name` text not null (the sender's display name at send time — not re-derived from `players` on read, so a later display-name change doesn't rewrite chat history)
+- `body` text not null
+- `created_at` text not null
+
+### `game_invitations`
+One row per invitation ever sent for a seat (a seat's full history — send, decline, resend — isn't overwritten, just appended). See `authentication-and-invitations.md` for the full seat-claim/invitation model this backs.
+
+Fields:
+
+- `id` text primary key
+- `game_id` text not null foreign key to `games.id`
+- `invited_player_id` text null — the specific invitee for a `Named` invitation; `null` for an `Open` invitation (any signed-in player may accept) or an `Email` invitation before it's been claimed
+- `inviting_player_id` text not null
+- `seat_number` integer not null
+- `status` text not null — `pending`, `accepted`, `rejected`, or `cancelled`
+- `created_at` text not null
+- `responded_at` text null
+- `invited_email` text null — set only for an `Email`-claim invitation (the address its join link was sent to). Distinguishes it from a plain `Open` invitation, which also has `invited_player_id is null` until claimed: `get_open_invitations` (the query behind the games list's generic "open invitations" section, visible to every signed-in player) explicitly excludes rows where this is set, since an email invite is only supposed to be reachable via its mailed link, not general browsing.
+
+### `password_reset_tokens`
+Single-use "forgot password" tokens — mirrors `sessions`'s hashed-secret shape rather than `game_invitations`'s plain-id shape, since a reset token is an unguessable secret, never used as a REST resource id.
+
+Fields:
+
+- `id` text primary key
+- `player_id` text not null
+- `token_hash` text not null
+- `created_at` text not null
+- `expires_at` text not null (1 hour after creation)
+- `consumed_at` text null
+
+### `game_state_snapshots` — not implemented
+Not created by `persistence::migrate()`; described here only as a possible future addition (optional saved snapshots for replay, restore, or debugging) if `snapshot_json`'s current live-state-only approach ever needs point-in-time history. Read this section as a proposal, not a description of the current schema.
 
 Fields:
 
@@ -129,8 +169,8 @@ Fields:
 - `last_seen_at` text null
 - `preferences_json` text null
 
-### `saved_games`
-Optional saved-match records if we want explicit save/load beyond the live `games` table.
+### `saved_games` — not implemented
+Not created by `persistence::migrate()` — like `game_state_snapshots` above, a proposal for optional saved-match records beyond the live `games` table, not part of the current schema.
 
 Fields:
 
@@ -155,27 +195,16 @@ Fields:
 
 ## Suggested Relationships
 
-- One game has many participants.
-- One game has many moves.
-- One game may have many snapshots.
-- One game may have many saved-game records.
+- One game has many participants and many moves (mirrored in `game_participants`/`game_moves`; authoritative in `games.snapshot_json`).
+- One game has many chat messages (`game_messages`) and many invitations across its lifetime (`game_invitations`).
+- One game may have many snapshots or saved-game records — not implemented, see those two tables' entries above.
 - One session may point to a player and optionally a game.
-- One player may have many sessions over time.
+- One player may have many sessions, and many password-reset tokens, over time.
 - Engine metadata is separate from game state so engines can be managed independently.
 
-## Recommended MVP Shape
+## Actual Current Shape
 
-For the first version, the minimum useful schema is:
-
-- `schema_migrations`
-- `players`
-- `games`
-- `game_participants`
-- `game_moves`
-- `engine_profiles`
-- `sessions`
-
-The snapshot and saved-game tables can be added when replay, restore, or manual save/load become first-class features.
+What `persistence::migrate()` actually creates, in order: `schema_migrations` (dead scaffolding), `players`, `engine_profiles`, `games`, `game_participants`, `game_moves`, `game_messages`, `sessions`, `game_invitations`, `password_reset_tokens`. `game_state_snapshots` and `saved_games` remain proposals, not implemented.
 
 ## Notes
 

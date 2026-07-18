@@ -5,7 +5,7 @@
 The Tile Lite Elite server provides two complementary systems:
 
 1. **Authentication** — Player identification and session management
-2. **Game Invitations** — Invite players to join games without needing to know all participants upfront
+2. **Game Invitations** — Fill a game's seats without needing every participant to have an account upfront, and let the creator manage the roster after the game exists
 
 ## Authentication API
 
@@ -16,6 +16,7 @@ The Tile Lite Elite server provides two complementary systems:
 Create a new player account.
 
 **Request:**
+
 ```json
 {
   "display_name": "Alice",
@@ -25,6 +26,7 @@ Create a new player account.
 ```
 
 **Response:** `200 OK`
+
 ```json
 {
   "player_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -35,12 +37,15 @@ Create a new player account.
 ```
 
 **Errors:**
+
 - `400 Bad Request` — missing/empty field, or `display_name` is already taken (enforced at the DB level — see `schema.md`)
 
 **Notes:**
+
 - Store the `session_token` on the client — real browser `localStorage` on web, a plain (unencrypted) JSON file under the OS config directory on desktop. Neither is a secure secret store; see `authentication-examples.md` for the caveat.
 - The `password` is hashed with argon2 server-side; use it to log back in on another device.
-- Email is captured for future account recovery; no verification required in MVP. The "forgot password" flow (`/auth/forgot-password`, `/auth/reset-password`) exists and works end-to-end, but has no email provider wired up yet — see `docs/authentication.md`'s status section.
+- Email is captured for future account recovery; no verification required. `players.email` has *deliberately* no uniqueness constraint — one person running several identities under the same email is an accepted use case (see `get_player_by_email`'s doc comment in `persistence.rs`).
+- Sends a welcome email (see `authentication.md`'s status section for the transactional-email setup).
 
 ### Login with Password
 
@@ -49,6 +54,7 @@ Create a new player account.
 Restore an existing player account using display name + password.
 
 **Request:**
+
 ```json
 {
   "display_name": "Alice",
@@ -57,6 +63,7 @@ Restore an existing player account using display name + password.
 ```
 
 **Response:** `200 OK`
+
 ```json
 {
   "player_id": "550e8400-e29b-41d4-a716-446655440000",
@@ -67,27 +74,30 @@ Restore an existing player account using display name + password.
 ```
 
 **Errors:**
+
 - `400 Bad Request` — `"Incorrect name or password"`, returned identically whether the display name doesn't exist or the password is wrong. This is deliberate: a distinct 404-for-unknown-name response would let a caller enumerate registered display names. There is no separate 404 case.
 
 **Notes:**
-- Use this endpoint when opening the app on a new device
-- Each login generates a fresh session token
-- Just display name + password — no separate recovery mechanism yet beyond this
+
+- Use this endpoint when opening the app on a new device.
+- Each login generates a fresh session token; old ones stay valid (sessions don't currently expire, and logging in on a second device doesn't invalidate the first).
 
 ### Validate Session
 
 **Endpoint:** `POST /auth/validate`
 
-Check if a session token is still valid, and return the associated player.
+Check whether a session token is still valid, and return the associated player. Called once at app startup if a token was stored locally ("stay logged in").
 
 **Request:**
+
 ```json
 {
   "session_token": "770e8400-e29b-41d4-a716-446655440000"
 }
 ```
 
-**Response:** `200 OK` (future implementation)
+**Response:** `200 OK`
+
 ```json
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
@@ -98,53 +108,142 @@ Check if a session token is still valid, and return the associated player.
 }
 ```
 
-## Game Invitations API
+**Errors:**
 
-### Invite a Player to a Game
+- `401 Unauthorized` — token missing, unknown, or expired.
 
-**Endpoint:** `POST /games/{game_id}/invite`
+### Change Password
 
-Invite another player to join a specific game seat.
+**Endpoint:** `POST /auth/change-password`
 
-**Request:**
+**Request:** `{ "current_password": "...", "new_password": "..." }`
+
+Requires the *current* password, not just a valid session — this is what makes it a deliberate account action rather than something a stolen "stay logged in" token alone can do. On success, invalidates every session for the account (including the one that made the request), so the client is expected to send the user back to the login screen.
+
+### Update Display Name / Email
+
+**Endpoint:** `POST /auth/update-details`
+
+**Request:** `{ "display_name": "Alicia", "email": "alicia@example.com" }` — both fields optional, but at least one must be set; a present-but-blank value is rejected.
+
+Unlike `change-password`, this does **not** require the current password — a valid session is enough, and the session that made the request stays valid afterward (no forced re-login). `display_name` is re-checked against the same uniqueness constraint as registration; `email` has no uniqueness constraint, same as registration.
+
+**Response:** `200 OK`, the updated player:
+
 ```json
 {
-  "invited_display_name": "Bob",
-  "seat_number": 1
-}
-```
-
-**Response:** `200 OK`
-```json
-{
-  "id": "inv-550e8400-e29b-41d4-a716-446655440000",
-  "game_id": "game-123",
-  "invited_player_id": "player-bob-id",
-  "inviting_player_id": "player-alice-id",
-  "seat_number": 1,
-  "status": "pending",
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "display_name": "Alicia",
+  "email": "alicia@example.com",
   "created_at": "1234567890",
-  "responded_at": null,
-  "inviting_player_display_name": "Alice"
+  "last_seen_at": "1234567890"
 }
 ```
 
 **Errors:**
-- `400 Bad Request` — Game not in waiting state, or invited player not found
-- `404 Not Found` — Game not found
 
-**Notes:**
-- Only games in "waiting" status can receive invitations
-- The inviting player is inferred from the first participant in the game
-- The same display name must exist as a player in the system
+- `400 Bad Request` — a field present but blank, no fields set at all, or `display_name` already taken by another account.
+- `401 Unauthorized` — no valid session.
 
-### List Pending Invitations for a Player
+**UI:** the "Edit user details" dialog in `AuthPanel` (replaced a bare "Change password" trigger) — display name + email save through this endpoint, with password-change kept as a nested sub-section that still goes through `change-password` and its current-password requirement.
+
+### Search Players by Name
+
+**Endpoint:** `GET /players/search?q=<prefix>`
+
+Case-insensitive prefix match against `display_name`, capped at 8 results. Requires auth (any signed-in player). Backs the "invite by name" seat picker's autocomplete dropdown — lets the creator confirm a display name exists (and pick the right one among near-duplicates) before submitting an invitation.
+
+**Response:** `200 OK`, `["Alice", "Alicia"]` — just the matching display names, nothing else.
+
+**Errors:**
+
+- `401 Unauthorized` — no valid session.
+- An empty or missing `q` returns an empty array rather than an error.
+
+## Game Invitations API
+
+### The Seat-Claim Model
+
+Every `Human` seat in `CreateGameRequest`/`POST /games/{game_id}/seats` carries a `claim`, one of four kinds:
+
+| Claim | Shape | Meaning |
+| --- | --- | --- |
+| `Creator` | `{ "type": "creator" }` | Bound immediately to the caller creating the game. At most one seat per game may use this. |
+| `Named` | `{ "type": "named", "display_name": "Bob" }` | Pending until the specific named player accepts. `display_name` must already exist as a registered player — resolved up front, so a typo fails the whole request cleanly instead of leaving a half-built game. |
+| `Open` | `{ "type": "open" }` | Pending until *any* signed-in player accepts — first to accept claims the seat. Shows up in every signed-in player's `GET /games` response, tagged `InvitedOpen`. |
+| `Email` | `{ "type": "email", "email": "carol@example.com" }` | Pending until whoever holds the mailed join link registers or logs in and confirms. No account needs to exist yet. Accepting works exactly like `Open` — there's no cryptographic proof the confirmer is really the emailed person, so "whoever has the link" is the practical trust bar — but unlike `Open`, an email invitation does **not** show up in the generic open-invitations list; it's only reachable via its own link. See "Invite by Email" below for the full landing-page flow. |
+
+An `Engine` seat ignores `claim` entirely (`engine_id` picks which engine fills it, immediately).
+
+Every non-creator Human seat, once the game exists, has a computed `invitation_status` (`ParticipantDto.invitation_status`): `not_sent` (seat exists, nothing sent yet — only reachable via the roster-management "add seat" endpoint below, since every seat submitted at creation time gets its invitation sent in the same request), `pending` (sent, awaiting response), or `rejected` (declined, or previously accepted then withdrawn — see "Roster Management" below). `None` once the seat is claimed (`player_id` is set) or for an `Engine` seat.
+
+### Create a Game
+
+**Endpoint:** `POST /games` — requires auth.
+
+```json
+{
+  "seats": [
+    { "kind": "human", "display_name": "Alice", "engine_id": null, "claim": { "type": "creator" } },
+    { "kind": "human", "display_name": "Bob", "engine_id": null, "claim": { "type": "named", "display_name": "Bob" } },
+    { "kind": "human", "display_name": "carol@example.com", "engine_id": null, "claim": { "type": "email", "email": "carol@example.com" } }
+  ],
+  "seed": null,
+  "variant": null,
+  "language": null,
+  "board_layout": null,
+  "move_time_limit_seconds": null
+}
+```
+
+Every Human seat's invitation (named, open, or email) is created and its notification sent in this same request. `seed`/`variant`/`language`/`board_layout`/`move_time_limit_seconds` are all optional — `seed` exists purely for deterministic tests (real play always gets a fresh random shuffle), the rest fall back to sensible defaults (`"official"` edition, 72-hour move time limit).
+
+**Response:** `200 OK`, a full `GameStateDto` (see `GET /games/{id}` below for the shape) — the game exists and is `waiting` as soon as this returns.
+
+**Errors:**
+
+- `400 Bad Request` — a Human seat with no `claim`, more than one `Creator` claim, or an unknown `variant`.
+- `404 Not Found` — a `Named` claim's `display_name` doesn't match any registered player.
+
+### Roster Management (Waiting Games, Creator-Only)
+
+Once a game exists and is still `waiting`, the creator (identified by `GameStateDto.creator_player_id`) can keep managing its roster. All of these return the updated `GameStateDto` and reject with `401 Unauthorized` if the caller isn't the creator (except `withdraw`, which is for the seat's own holder — see below).
+
+- **`POST /games/{game_id}/seats`** — add a new seat, same body shape as one entry in `CreateGameRequest.seats` above. Deliberately does *not* send the invitation itself — that's the separate `invite` call below, so the creator can stage several additions before sending any of them.
+- **`POST /games/{game_id}/invite`** — send (or resend, after a decline) the invitation for an existing seat. `{ "seat_number": 1, "invited_display_name": "Bob" }` for a named target, `{ "seat_number": 2, "invited_email": "carol@example.com" }` for an email target, or both `null` for an open seat — mutually exclusive with each other, and rejected with `400` if both are set. A seat that already has a *pending* invitation can't be re-sent until it's answered.
+- **`POST /games/{game_id}/seats/{seat_number}/remove`** — removes a seat entirely, claimed or not (this is how the creator kicks a confirmed participant, not just cancels an outstanding invite). Every later seat's number shifts down by one to stay contiguous; a live pending invitation on the removed seat is marked `cancelled`. Cannot target the creator's own seat.
+- **`POST /games/{game_id}/seats/{seat_number}/withdraw`** — lets whoever *holds* a claimed non-creator seat give it back up voluntarily. Caller must be that seat's own `player_id`, not the creator. The seat stays in the roster (same seat number, still `Human`) with `player_id` cleared and its invitation flipped to `rejected` — from there it behaves like any other declined seat (the creator can resend or remove it).
+- **`POST /games/{game_id}/reorder-seats`** — `{ "seat_a": 0, "seat_b": 1" }`, swaps two seats' turn order. Creator-only, `waiting`-only.
+- **`POST /games/{game_id}/start`** — begins the match. Creator-only (an all-engine game is the one exception — any signed-in caller may start it, since there's no human seat to gate on), and requires every Human seat claimed.
+
+### Force-Resign (Active Games, Creator-Only)
+
+**Endpoint:** `POST /games/{game_id}/seats/{seat_number}/force-resign`
+
+The `Active`-game counterpart to remove/withdraw, for a participant who's gone unresponsive mid-game. Creator-only; ends the game immediately and hands the win to whoever's left, exactly like a self-resign — the difference is it doesn't require it to currently be that seat's own turn (a self-resign does), since the whole point is the creator can end a game where someone is stuck on *any* seat's turn indefinitely. Cannot target the creator's own seat, or one that's already resigned.
+
+### Invite by Email
+
+An `Email`-claim seat's invitation link points the recipient at `{base_url}/invite?id=<invitation_id>` — a landing page (no dedicated server route needed; the app has no router, so this is a `window.location` path check in `RootApp`, same pattern as `/reset-password`). The flow:
+
+1. **`GET /invitations/{invitation_id}/preview`** — unauthenticated. Returns just enough to render "X invited you to play" before the visitor has necessarily registered or logged in:
+
+   ```json
+   { "inviting_player_display_name": "Alice", "status": "pending" }
+   ```
+
+   `404 Not Found` if the id doesn't exist. `status` can also come back `accepted`/`rejected`/`cancelled` if the link is stale.
+2. If there's no existing valid session, the normal register/login modal shows, with a banner naming the inviter (from the preview above). If a "stay logged in" session already exists, this step is skipped entirely.
+3. Either way, the flow always ends on an explicit confirmation ("Accept invitation from Alice?") before actually joining — this is the one place a visitor can back out, including the case where the *wrong* account happened to already be signed in on that browser (there's no cryptographic check that the confirmer is really the emailed person, matching `Open`-invitation trust). Confirming calls the same `POST /invitations/{id}/accept` used everywhere else.
+
+### List a Player's Own Invitations
 
 **Endpoint:** `GET /players/{player_id}/invitations`
 
-Retrieve all pending and responded invitations for a player.
+Every `Named` invitation ever addressed to this player (any status). Does **not** include `Open` or `Email` invitations — those have no single addressee; an `Open` invitation instead shows up in every signed-in player's `GET /games` response (tagged `InvitedOpen`), and an `Email` invitation is only reachable via its own link.
 
 **Response:** `200 OK`
+
 ```json
 [
   {
@@ -157,147 +256,101 @@ Retrieve all pending and responded invitations for a player.
     "created_at": "1234567890",
     "responded_at": null,
     "inviting_player_display_name": "Alice"
-  },
-  {
-    "id": "inv-660e8400-e29b-41d4-a716-446655440000",
-    "game_id": "game-456",
-    "invited_player_id": "player-bob-id",
-    "inviting_player_id": "player-charlie-id",
-    "seat_number": 2,
-    "status": "rejected",
-    "created_at": "1234567888",
-    "responded_at": "1234567889",
-    "inviting_player_display_name": "Charlie"
   }
 ]
 ```
 
 **Status Values:**
+
 - `pending` — Invitation awaiting response
 - `accepted` — Player accepted
-- `rejected` — Player declined
-- `cancelled` — Inviter cancelled
+- `rejected` — Player declined (or previously accepted, then withdrew — see "Roster Management" above)
+- `cancelled` — Creator removed the seat while the invitation was still outstanding
 
 ### Accept an Invitation
 
-**Endpoint:** `POST /invitations/{invitation_id}/accept`
+**Endpoint:** `POST /invitations/{invitation_id}/accept` — requires auth.
 
-Accept an invitation to join a game.
+Atomically binds the caller as `player_id` on the invitation's seat, and sets the seat's `display_name` to the caller's real display name (replacing the `Open`/`Email` placeholder, if there was one). Race-safe for `Open`/`Email` invitations: the underlying update is a single `where status = 'pending'` SQL statement, so if two players accept the same open seat at once, only the first succeeds — the second gets `400 Bad Request`, not a silent double-claim.
 
-**Response:** `200 OK`
-```json
-{
-  "status": "accepted"
-}
-```
+**Response:** `200 OK`, the full updated `GameStateDto` (not just a status string) — the client uses this to drop the caller straight into the game.
 
 **Errors:**
-- `400 Bad Request` — Failed to update invitation
-- `404 Not Found` — Invitation not found
 
-**Notes:**
-- Accepting an invitation updates the invitation status to "accepted"
-- Server does not automatically add the player to the game seat; that's handled by game start logic
-- A future version may automatically place the player in the seat
+- `400 Bad Request` — the invitation is no longer `pending` (already accepted/rejected/cancelled).
+- `401 Unauthorized` — no valid session, or (for a `Named` invitation only) the caller isn't the named invitee.
+- `404 Not Found` — invitation id doesn't exist.
 
 ### Reject an Invitation
 
-**Endpoint:** `POST /invitations/{invitation_id}/reject`
+**Endpoint:** `POST /invitations/{invitation_id}/reject` — requires auth. `Named` invitations only (an `Open`/`Email` invitation has no single invitee to reject on behalf of — simply not accepting is equivalent).
 
-Decline an invitation to join a game.
-
-**Response:** `200 OK`
-```json
-{
-  "status": "rejected"
-}
-```
+**Response:** `200 OK`, `{ "status": "rejected" }`
 
 **Errors:**
-- `400 Bad Request` — Failed to update invitation
-- `404 Not Found` — Invitation not found
+
+- `400 Bad Request` — already responded to.
+- `404 Not Found` — no invitation addressed to this caller with that id.
 
 ## Usage Flow
 
 ### Scenario: Alice Invites Bob to a Game
 
-1. **Alice creates a game:**
+1. **Alice registers and creates a game, claiming her own seat and naming Bob for the second:**
+
    ```bash
    POST /games
+   Authorization: Bearer <alice-token>
    {
      "seats": [
-       { "kind": "human", "display_name": "Alice" }
-     ]
+       { "kind": "human", "display_name": "Alice", "engine_id": null, "claim": { "type": "creator" } },
+       { "kind": "human", "display_name": "Bob", "engine_id": null, "claim": { "type": "named", "display_name": "Bob" } }
+     ],
+     "seed": null, "variant": null, "language": null, "board_layout": null, "move_time_limit_seconds": null
    }
    ```
-   Response: Game ID is `game-123`
 
-2. **Alice invites Bob:**
-   ```bash
-   POST /games/game-123/invite
-   {
-     "invited_display_name": "Bob",
-     "seat_number": 1
-   }
-   ```
-   Response: Invitation created
+   Response: full `GameStateDto`, `status: "waiting"`. Bob's invitation was created and emailed in this same call.
 
-3. **Bob checks his invitations:**
+2. **Bob checks his invitations** (or sees it directly in `GET /games`, tagged `InvitedByName`, with `invitation_id` already attached):
+
    ```bash
    GET /players/{bob_id}/invitations
+   Authorization: Bearer <bob-token>
    ```
-   Response: List of invitations including Alice's
 
-4. **Bob accepts:**
+3. **Bob accepts:**
+
    ```bash
    POST /invitations/{invitation_id}/accept
+   Authorization: Bearer <bob-token>
    ```
-   Response: Invitation status = "accepted"
 
-5. **Alice starts the game:**
+   Response: full `GameStateDto` — Bob's `player_id` and real display name are now on seat 1.
+
+4. **Alice starts the game** (creator-only, requires every Human seat claimed):
+
    ```bash
-   POST /games/game-123/start
+   POST /games/{game_id}/start
+   Authorization: Bearer <alice-token>
    ```
-   Both players are now in the game
 
 ## Database Schema
 
-### `players` table
-- `id` — Unique player identifier
-- `display_name` — Player username, **unique** (enforced at the DB level, so two players can never collide under the same name)
-- `email` — Contact email (for recovery)
-- `password_hash` — argon2-hashed password (not the raw password)
-- `created_at` — Registration timestamp
-- `updated_at` — Last profile update
-- `last_seen_at` — Last activity timestamp
+See `schema.md` for the authoritative field-by-field breakdown of `players`, `sessions`, `game_invitations`, and `password_reset_tokens`. Summary relevant to this doc:
 
-### `sessions` table
-- `id` — Unique session identifier
-- `player_id` — Reference to `players.id`
-- `token_hash` — sha256-hashed session token (not the raw token)
-- `created_at` — Session creation timestamp
-- `last_seen_at` — Last activity timestamp
-- `expires_at` — Optional expiration (not yet set by any endpoint — sessions are currently non-expiring)
-
-### `game_invitations` table
-- `id` — Unique invitation identifier
-- `game_id` — Reference to `games.id`
-- `invited_player_id` — Reference to `players.id`
-- `inviting_player_id` — Reference to `players.id`
-- `seat_number` — Which seat in the game is being offered
-- `status` — "pending", "accepted", "rejected", or "cancelled"
-- `created_at` — Invitation sent timestamp
-- `responded_at` — Response timestamp (if responded)
-
-Unique constraint: `(game_id, invited_player_id, seat_number)`
+- `players.display_name` is unique at the DB level; `players.email` deliberately is not.
+- `game_invitations` keeps a full history per seat (send, decline, resend all append rather than overwrite) and carries `invited_email` for `Email`-claim invitations — the column `get_open_invitations` excludes on, so an email invite doesn't leak into the generic open-invitations list.
+- `sessions.expires_at` exists in the schema but nothing currently sets it — sessions don't expire.
 
 ## Security Notes
 
 - Passwords are hashed with **argon2** (deliberately slow, salted — resists brute-force guessing of human-chosen passwords).
 - Session tokens are hashed with **sha256** before storage — deliberately fast, since a session token is a high-entropy UUID rather than a human-chosen secret, and the hash needs to support a lookup on every authenticated request.
 - Session tokens are opaque UUIDs; clients must treat them like passwords.
-- Email is unverified in MVP; future versions can add verification flow.
-- Invitations carry no authentication; game-level access control is handled separately (and, as of the seat-ownership work, only `submit_action` actually enforces it — see `authentication.md`'s status section).
+- Email is unverified — captured at registration, never confirmed.
+- Every action-capable endpoint enforces seat ownership (see `authentication.md`'s status section) — an unclaimed Human seat rejects everyone, not just requests from the wrong account.
+- Accepting an `Open` or `Email` invitation has no cryptographic proof the accepter is "the intended person" — for `Open`, there never was one intended person; for `Email`, whoever holds the mailed link is the practical trust bar. Both are a deliberate, documented tradeoff for a hobby-scale trust model, not an oversight.
 
 ## Future Enhancements
 
@@ -305,5 +358,3 @@ Unique constraint: `(game_id, invited_player_id, seat_number)`
 - Email verification with short codes
 - Invitation timeout and auto-cancellation
 - Player blocking / ignore list
-- Invitation via email (send invitation link)
-- Player search / directory
