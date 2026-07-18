@@ -1,0 +1,7 @@
+Subject: {{inviter_name}} invited you to play Tile Lite Elite
+
+Hi,
+
+{{inviter_name}} has invited you to a game of Tile Lite Elite. You don't need an account yet — follow this link to register (or log in, if you already have one) and join the game:
+
+{{join_url}}

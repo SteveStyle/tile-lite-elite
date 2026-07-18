@@ -123,6 +123,14 @@ pub enum SeatClaim {
     /// Pending until any logged-in player accepts — first to accept claims
     /// the seat.
     Open,
+    /// Pending until whoever holds the emailed join link registers or logs
+    /// in and confirms — no account is required to exist yet. Accepting
+    /// works exactly like `Open` (first to confirm claims the seat; there's
+    /// no cryptographic proof the confirmer is really the emailed person),
+    /// it's just reached via a mailed link instead of general browsing —
+    /// see `SeatInvitationStatus` and `get_open_invitations`'s doc comment
+    /// for why this doesn't show up as a generic open seat to everyone.
+    Email { email: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -189,6 +197,11 @@ pub struct ParticipantDto {
     /// always `None`, which is also correct there (every seat is claimed
     /// once a game is `Active`, since `start_game` requires full seating).
     pub invitation_status: Option<SeatInvitationStatus>,
+    /// Set only for a seat created with `SeatClaim::Email`, and only until
+    /// claimed — the address the join link was sent to, so the creator's
+    /// roster view can show it and a "Send"/"Resend" click doesn't need it
+    /// re-typed. `None` for every other seat kind/claim.
+    pub invited_email: Option<String>,
 }
 
 /// A `Waiting` game's unclaimed-seat lifecycle, inferred from that seat's
@@ -411,6 +424,18 @@ pub struct ChangePasswordRequest {
     pub new_password: String,
 }
 
+/// Updates the caller's own display name and/or email — unlike
+/// `ChangePasswordRequest`, doesn't require re-proving the current password:
+/// a valid session is already the bar for these, matching every other
+/// account action that isn't the password itself (see `change_password`'s
+/// doc comment for why *that* one is different). Both fields optional so a
+/// client can send just the one being edited; at least one must be set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdatePlayerDetailsRequest {
+    pub display_name: Option<String>,
+    pub email: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ValidateSessionRequest {
     pub session_token: String,
@@ -474,7 +499,23 @@ pub struct InvitePlayerRequest {
     /// `None` invites any logged-in player (open/stranger) rather than one
     /// specific person by name.
     pub invited_display_name: Option<String>,
+    /// Set instead of `invited_display_name` to (re)send an email-invite
+    /// join link — mutually exclusive with it; both `None` means a plain
+    /// open/stranger invitation.
+    pub invited_email: Option<String>,
     pub seat_number: u8,
+}
+
+/// Minimal, unauthenticated preview of an invitation — what the emailed
+/// join link's landing page shows before the visitor has registered or
+/// logged in (see the doc comment on `SeatClaim::Email`). Deliberately
+/// excludes anything about the game itself (board, other players' names,
+/// etc.) — just enough to render "X invited you to play" and know whether
+/// the link is still live.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvitationPreviewDto {
+    pub inviting_player_display_name: String,
+    pub status: InvitationStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

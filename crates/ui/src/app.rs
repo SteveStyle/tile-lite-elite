@@ -158,6 +158,29 @@ pub fn RootApp() -> Element {
     // never actually look shuffled.
     let mut rack_order = use_signal(Vec::<usize>::new);
 
+    // Set once at startup from `/invite?id=...` (see `invite_id_from_url`),
+    // then cleared once the invitation's been accepted or dismissed —
+    // `invite_preview` is fetched (unauthenticated) as soon as an id shows
+    // up, independent of whether `session` is populated yet, so the banner
+    // in `AuthPanel`'s logged-out modal has an inviter name to show even
+    // before the visitor does anything.
+    let mut pending_invite_id = use_signal(invite_id_from_url);
+    let mut invite_preview = use_signal(|| None::<api::InvitationPreviewDto>);
+    let mut invite_preview_error = use_signal(|| None::<String>);
+    let mut invite_preview_requested = use_signal(|| false);
+
+    if pending_invite_id().is_some() && !invite_preview_requested() {
+        invite_preview_requested.set(true);
+        let server_url = server_url.clone();
+        let invitation_id = pending_invite_id().clone().expect("checked above");
+        spawn(async move {
+            match preview_invitation(&server_url, &invitation_id).await {
+                Ok(preview) => invite_preview.set(Some(preview)),
+                Err(error) => invite_preview_error.set(Some(error)),
+            }
+        });
+    }
+
     if !bootstrapped() {
         bootstrapped.set(true);
         let server_url = server_url.clone();
@@ -419,6 +442,7 @@ pub fn RootApp() -> Element {
     let server_url_for_login = server_url.clone();
     let server_url_for_custom_create = server_url.clone();
     let server_url_for_accept = server_url.clone();
+    let server_url_for_invite_accept = server_url.clone();
     let server_url_for_reject = server_url.clone();
     let server_url_for_refresh = server_url.clone();
     let server_url_for_select = server_url.clone();
@@ -466,6 +490,7 @@ pub fn RootApp() -> Element {
                 AuthPanel {
                     server_url: server_url.clone(),
                     session: session().clone(),
+                    invite_inviter_name: invite_preview().map(|preview| preview.inviting_player_display_name),
                     on_authenticated: move |(new_session, remember, stay): (api::PlayerSessionDto, bool, bool)| {
                         let stored = crate::local_storage::StoredAuth {
                             remembered_name: if remember {
@@ -513,6 +538,25 @@ pub fn RootApp() -> Element {
                             session_token: None,
                         });
                         session.set(None);
+                        // Everything behind the login modal belongs to the
+                        // account that just logged out — leaving it in
+                        // place would show the next person to log in on
+                        // this device (or the same person's own re-login) a
+                        // stale games list, board, and rack until a fresh
+                        // load happens to overwrite it. Same reset already
+                        // used when switching games entirely.
+                        game.set(None);
+                        game_summaries.set(Vec::new());
+                        websocket_game_id.set(None);
+                        reset_composer_state(
+                            dragging_tile_id,
+                            selected_blank_letter,
+                            staged_placements,
+                            selected_cell,
+                            exchange_mode,
+                            exchange_selected,
+                            direction_override,
+                        );
                         info_message.set(Some("Logged out".to_string()));
                     },
                     on_password_changed: move |_| {
@@ -529,11 +573,116 @@ pub fn RootApp() -> Element {
                         session.set(None);
                         info_message.set(Some("Password changed — please log in again.".to_string()));
                     },
+                    on_details_updated: move |updated: api::PlayerDto| {
+                        session.with_mut(|current| {
+                            if let Some(current) = current {
+                                current.display_name = updated.display_name;
+                                current.email = updated.email;
+                            }
+                        });
+                        info_message.set(Some("Details updated".to_string()));
+                    },
+                }
+            }
+
+            // Reached once a session exists — either it was already there
+            // ("stay logged in") or `AuthPanel`'s blocking modal above just
+            // produced one. Either way, this confirmation is the one place
+            // the visitor can back out, including the case where the wrong
+            // account happened to already be signed in on this browser (see
+            // `SeatClaim::Email`'s doc comment: there's no cryptographic
+            // check that the confirmer is really the emailed person).
+            if session().is_some() && pending_invite_id().is_some() {
+                div { class: "modal-backdrop",
+                    div { class: "auth-panel modal-card",
+                        if let Some(error) = invite_preview_error() {
+                            h2 { class: "modal-title", "Invitation unavailable" }
+                            p { class: "modal-copy", "{error}" }
+                            div { class: "modal-actions",
+                                button {
+                                    class: "toggle-button",
+                                    onclick: move |_| {
+                                        pending_invite_id.set(None);
+                                        invite_preview.set(None);
+                                        invite_preview_error.set(None);
+                                        strip_invite_from_url();
+                                    },
+                                    "Dismiss"
+                                }
+                            }
+                        } else if let Some(preview) = invite_preview() {
+                            if preview.status == api::InvitationStatus::Pending {
+                                h2 { class: "modal-title", "Game invitation" }
+                                p { class: "modal-copy",
+                                    "{preview.inviting_player_display_name} invited you to play Tile Lite Elite."
+                                }
+                                div { class: "modal-actions",
+                                    button {
+                                        class: "toggle-button toggle-button-muted",
+                                        onclick: move |_| {
+                                            pending_invite_id.set(None);
+                                            invite_preview.set(None);
+                                            strip_invite_from_url();
+                                        },
+                                        "Not now"
+                                    }
+                                    button {
+                                        class: "toggle-button",
+                                        onclick: move |_| {
+                                            let server_url = server_url_for_invite_accept.clone();
+                                            let token = session().map(|current| current.session_token.clone());
+                                            let Some(invitation_id) = pending_invite_id() else { return; };
+                                            spawn(async move {
+                                                is_loading.set(true);
+                                                error_message.set(None);
+                                                match accept_invitation(&server_url, &invitation_id, token.as_deref()).await {
+                                                    Ok(joined) => {
+                                                        info_message.set(None);
+                                                        websocket_game_id.set(None);
+                                                        game.set(Some(joined));
+                                                        if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                                            game_summaries.set(summaries);
+                                                        }
+                                                        pending_invite_id.set(None);
+                                                        invite_preview.set(None);
+                                                        strip_invite_from_url();
+                                                    }
+                                                    Err(error) => error_message.set(Some(error)),
+                                                }
+                                                is_loading.set(false);
+                                            });
+                                        },
+                                        "Accept"
+                                    }
+                                }
+                            } else {
+                                h2 { class: "modal-title", "Invitation unavailable" }
+                                p { class: "modal-copy",
+                                    "This invitation is no longer available — it may already have been accepted or declined."
+                                }
+                                div { class: "modal-actions",
+                                    button {
+                                        class: "toggle-button",
+                                        onclick: move |_| {
+                                            pending_invite_id.set(None);
+                                            invite_preview.set(None);
+                                            strip_invite_from_url();
+                                        },
+                                        "Dismiss"
+                                    }
+                                }
+                            }
+                        } else {
+                            p { class: "modal-copy", "Loading invitation..." }
+                        }
+                    }
                 }
             }
 
             div { class: "workspace-shell",
                 GamesPanel {
+                    server_url: server_url.clone(),
+                    token: session().map(|current| current.session_token.clone()),
                     summaries: game_summaries().clone(),
                     selected_id: game().as_ref().map(|current| current.id.clone()),
                     current_game: game().clone(),
@@ -767,27 +916,34 @@ pub fn RootApp() -> Element {
                     // (and the original pre-creation draft builder,
                     // `build_seats`) both use for an Open-claim seat's
                     // `display_name` — there's no dedicated field on
-                    // `ParticipantDto` recording which kind of claim a seat
-                    // was created with, so this reuses that same
-                    // already-established convention to tell "resend to
-                    // this named person" from "this is an open invitation"
-                    // apart, rather than introducing a second way to
-                    // encode it.
+                    // `ParticipantDto` recording a Named seat's claim, so
+                    // this reuses that same already-established convention
+                    // to tell "resend to this named person" from "this is an
+                    // open invitation" apart, rather than introducing a
+                    // second way to encode it. An Email seat *does* have a
+                    // dedicated field (`invited_email`), so that one's
+                    // unambiguous.
                     on_send_invitation: move |seat_number: u8| {
                         let server_url = server_url_for_send_invitation.clone();
                         let current_game = game().clone();
                         let token = session().map(|current| current.session_token.clone());
                         if let Some(current_game) = current_game {
-                            let invited_display_name = current_game
+                            let participant = current_game
                                 .participants
                                 .iter()
-                                .find(|participant| participant.seat_number == seat_number)
-                                .filter(|participant| participant.display_name != "Open seat")
-                                .map(|participant| participant.display_name.clone());
+                                .find(|participant| participant.seat_number == seat_number);
+                            let invited_email = participant.and_then(|p| p.invited_email.clone());
+                            let invited_display_name = if invited_email.is_some() {
+                                None
+                            } else {
+                                participant
+                                    .filter(|participant| participant.display_name != "Open seat")
+                                    .map(|participant| participant.display_name.clone())
+                            };
                             spawn(async move {
                                 is_loading.set(true);
                                 error_message.set(None);
-                                match invite_player(&server_url, &current_game.id, seat_number, invited_display_name, token.as_deref()).await {
+                                match invite_player(&server_url, &current_game.id, seat_number, invited_display_name, invited_email, token.as_deref()).await {
                                     Ok(_) => {
                                         if let Ok(loaded) = load_game_by_id(&server_url, &current_game.id, token.as_deref()).await {
                                             game.set(Some(loaded));
@@ -1488,6 +1644,7 @@ fn empty_live_game() -> GameStateDto {
             engine_id: None,
             score: 0,
             invitation_status: None,
+            invited_email: None,
         }],
         board: empty_board(),
         racks: vec![RackDto {
@@ -1542,6 +1699,35 @@ fn mirrored_positions(x: u8, y: u8) -> [(u8, u8); 4] {
     [(x, y), (max - x, y), (x, max - y), (max - x, max - y)]
 }
 
+/// Minimal percent-encoding for a single query-string value — just enough
+/// to keep a display name with a space or other reserved character (`&`,
+/// `#`, `+`, ...) from corrupting the `?q=` query string it's placed into.
+/// No crate already in this workspace does this for the client (`reqwest`/
+/// `gloo-net` both expect the caller to have a well-formed URL already).
+fn url_encode_query_param(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
+}
+
+pub(crate) async fn search_players(
+    server_url: &str,
+    query: &str,
+    token: Option<&str>,
+) -> Result<Vec<String>, String> {
+    get_json_auth(
+        &format!("{server_url}/players/search?q={}", url_encode_query_param(query)),
+        token,
+    )
+    .await
+}
+
 async fn load_game_summaries(
     server_url: &str,
     token: Option<&str>,
@@ -1593,6 +1779,24 @@ pub(crate) async fn change_password(
     .await
 }
 
+pub(crate) async fn update_player_details(
+    server_url: &str,
+    token: &str,
+    display_name: &str,
+    email: &str,
+) -> Result<api::PlayerDto, String> {
+    let request = api::UpdatePlayerDetailsRequest {
+        display_name: Some(display_name.to_string()),
+        email: Some(email.to_string()),
+    };
+    post_json(
+        &format!("{server_url}/auth/update-details"),
+        Some(token),
+        &request,
+    )
+    .await
+}
+
 pub(crate) async fn request_password_reset(server_url: &str, email: &str) -> Result<(), String> {
     let request = api::RequestPasswordResetRequest {
         email: email.to_string(),
@@ -1620,6 +1824,15 @@ pub(crate) async fn reset_password(
         &request,
     )
     .await
+}
+
+/// Unauthenticated — see `api::InvitationPreviewDto`'s doc comment for why
+/// this is safe to call before the visitor has registered or logged in.
+pub(crate) async fn preview_invitation(
+    server_url: &str,
+    invitation_id: &str,
+) -> Result<api::InvitationPreviewDto, String> {
+    get_json(&format!("{server_url}/invitations/{invitation_id}/preview")).await
 }
 
 async fn validate_session(server_url: &str, session_token: &str) -> Result<api::PlayerDto, String> {
@@ -1819,20 +2032,23 @@ async fn swap_seats(
 }
 
 /// Sends (or resends, after a decline) the invitation for a seat that
-/// already exists in the roster — creator-only server-side. `None` invites
-/// any logged-in player (an `Open` seat); `Some(name)` targets one specific
-/// person (a `Named` seat).
+/// already exists in the roster — creator-only server-side. Both `None`
+/// invites any logged-in player (an `Open` seat); `invited_display_name`
+/// targets one specific person by name (a `Named` seat); `invited_email`
+/// targets a join-link address (an `Email` seat) — mutually exclusive, same
+/// as the request DTO itself.
 async fn invite_player(
     server_url: &str,
     game_id: &str,
     seat_number: u8,
     invited_display_name: Option<String>,
+    invited_email: Option<String>,
     token: Option<&str>,
 ) -> Result<serde_json::Value, String> {
     post_json(
         &format!("{server_url}/games/{game_id}/invite"),
         token,
-        &InvitePlayerRequest { invited_display_name, seat_number },
+        &InvitePlayerRequest { invited_display_name, invited_email, seat_number },
     )
     .await
 }
@@ -2367,6 +2583,43 @@ fn reset_password_token_from_url() -> Option<String> {
 fn reset_password_token_from_url() -> Option<String> {
     None
 }
+
+/// Same pattern as `reset_password_token_from_url` — an emailed
+/// `SeatClaim::Email` join link (`/invite?id=...`) is the other place this
+/// app reads a URL, always clicked from an email client, never opened by
+/// the desktop build.
+#[cfg(target_arch = "wasm32")]
+fn invite_id_from_url() -> Option<String> {
+    let location = web_sys::window()?.location();
+    if location.pathname().ok()?.trim_end_matches('/') != "/invite" {
+        return None;
+    }
+    let search = location.search().ok()?;
+    search.strip_prefix('?')?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == "id" && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn invite_id_from_url() -> Option<String> {
+    None
+}
+
+/// Clears `/invite?id=...` back to `/` once the invitation's been handled
+/// (accepted or dismissed) — so reloading or navigating back doesn't
+/// re-trigger the confirmation flow for an invitation that's already been
+/// dealt with. A no-op if the app never had a URL to read from in the first
+/// place (native, or web with nothing to strip).
+#[cfg(target_arch = "wasm32")]
+fn strip_invite_from_url() {
+    if let Some(history) = web_sys::window().and_then(|window| window.history().ok()) {
+        let _ = history.replace_state_with_url(&web_sys::wasm_bindgen::JsValue::NULL, "", Some("/"));
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn strip_invite_from_url() {}
 
 #[cfg(target_arch = "wasm32")]
 fn same_origin_websocket_url(game_id: &str, token: Option<&str>) -> Result<String, String> {
@@ -3501,6 +3754,7 @@ mod tests {
             engine_id: None,
             score: 0,
             invitation_status: None,
+            invited_email: None,
         }
     }
 

@@ -840,6 +840,59 @@ button:disabled {
     font-size: 0.75rem;
 }
 
+/* Wraps a "Named" seat's display-name input — positioned relative so the
+   suggestions dropdown below can be positioned absolute against it rather
+   than the page, and sized to match the input it wraps (both draft-builder
+   locations use the same flex-wrap row as every other seat-kind control,
+   so this needs to participate in that layout the same way the bare
+   `input` it replaced did). */
+.name-autocomplete {
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 120px;
+}
+
+.name-autocomplete .seat-draft-name-input {
+    width: 100%;
+    min-width: 0;
+}
+
+.name-autocomplete-dropdown {
+    position: absolute;
+    top: calc(100% + 2px);
+    left: 0;
+    right: 0;
+    z-index: 20;
+    background: var(--panel);
+    border: 1px solid rgba(111, 75, 44, 0.25);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    max-height: 160px;
+    overflow-y: auto;
+}
+
+.name-autocomplete-item {
+    display: block;
+    width: 100%;
+    text-align: left;
+    padding: 6px 10px;
+    border: none;
+    background: none;
+    font-size: 0.85rem;
+    cursor: pointer;
+}
+
+.name-autocomplete-item:hover {
+    background: rgba(212, 162, 58, 0.18);
+}
+
+.name-autocomplete-empty {
+    display: block;
+    margin-top: 3px;
+    font-size: 0.75rem;
+    color: rgba(35, 25, 15, 0.5);
+}
+
 .game-builder-add-row {
     display: flex;
     flex-wrap: wrap;
@@ -1142,6 +1195,14 @@ button:disabled {
 .modal-copy {
     color: rgba(35, 25, 15, 0.72);
     margin-bottom: 4px;
+}
+
+.invite-banner {
+    font-weight: 600;
+    color: rgba(35, 25, 15, 0.9);
+    background: rgba(212, 162, 58, 0.15);
+    border-radius: 8px;
+    padding: 8px 10px;
 }
 
 .modal-actions {

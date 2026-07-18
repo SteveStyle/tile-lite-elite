@@ -28,6 +28,7 @@ impl EmailConfig {
 
 const WELCOME_TEMPLATE: &str = include_str!("../emails/welcome.txt");
 const INVITATION_TEMPLATE: &str = include_str!("../emails/invitation.txt");
+const JOIN_INVITATION_TEMPLATE: &str = include_str!("../emails/join-invitation.txt");
 const PASSWORD_RESET_TEMPLATE: &str = include_str!("../emails/password-reset.txt");
 
 pub async fn send_welcome(config: &EmailConfig, to: &str, display_name: &str, base_url: &str) {
@@ -52,6 +53,17 @@ pub async fn send_invitation(
             ("inviter_name", inviter_name),
             ("base_url", base_url),
         ],
+    );
+    send(config, to, &subject, &body).await;
+}
+
+/// Unlike `send_invitation`, `to` has no known `Player` account behind it
+/// yet — this is what `SeatClaim::Email` sends instead (see its doc
+/// comment), a plain join link rather than "log in to accept".
+pub async fn send_join_invitation(config: &EmailConfig, to: &str, inviter_name: &str, join_url: &str) {
+    let (subject, body) = render(
+        JOIN_INVITATION_TEMPLATE,
+        &[("inviter_name", inviter_name), ("join_url", join_url)],
     );
     send(config, to, &subject, &body).await;
 }
@@ -147,6 +159,10 @@ mod tests {
             (
                 INVITATION_TEMPLATE,
                 &["invitee_name", "inviter_name", "base_url"][..],
+            ),
+            (
+                JOIN_INVITATION_TEMPLATE,
+                &["inviter_name", "join_url"][..],
             ),
             (PASSWORD_RESET_TEMPLATE, &["reset_url"][..]),
         ] {

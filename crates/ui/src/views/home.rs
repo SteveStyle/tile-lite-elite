@@ -515,6 +515,7 @@ mod tests {
             engine_id: None,
             score,
             invitation_status: None,
+            invited_email: None,
         }
     }
 

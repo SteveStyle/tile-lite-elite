@@ -204,6 +204,12 @@ pub struct ParticipantState {
     /// be if it were added today.
     #[serde(default)]
     pub removed_by_player: bool,
+    /// Set only for a seat created with `api::SeatClaim::Email`, and only
+    /// until claimed — see `api::ParticipantDto.invited_email`'s doc
+    /// comment. Missing on any game persisted before this field existed,
+    /// same as `removed_by_player`.
+    #[serde(default)]
+    pub invited_email: Option<String>,
 }
 
 /// Number of consecutive scoreless plays (passes or exchanges), summed
@@ -491,6 +497,7 @@ impl GameSession {
                     score: participant.score,
                     // Not meaningful in a list-view summary.
                     invitation_status: None,
+                    invited_email: participant.invited_email.clone(),
                 })
                 .collect(),
             last_activity_at,
@@ -535,6 +542,7 @@ impl GameSession {
                     // meaningful — see `attach_invitation_status` in app.rs
                     // and `ParticipantDto::invitation_status`'s doc comment.
                     invitation_status: None,
+                    invited_email: participant.invited_email.clone(),
                 })
                 .collect(),
             board: board_to_dto(&self.state.board, &self.rules.alphabet),
@@ -1247,6 +1255,7 @@ mod tests {
             rack: Rack::default(),
             resigned: false,
             removed_by_player: false,
+            invited_email: None,
         }
     }
 

@@ -60,9 +60,20 @@ fn submit_login_or_register(
 pub fn AuthPanel(
     server_url: String,
     session: Option<api::PlayerSessionDto>,
+    /// Set once the emailed join link's invitation preview has loaded — see
+    /// `RootApp`'s `invite_preview` — shown as a banner above the tabs so a
+    /// first-time visitor following that link knows what they're signing up
+    /// for before they register.
+    invite_inviter_name: Option<String>,
     on_authenticated: EventHandler<(api::PlayerSessionDto, bool, bool)>,
     on_logout: EventHandler<()>,
     on_password_changed: EventHandler<()>,
+    /// Fired after a successful display-name/email save — `RootApp` patches
+    /// its own `session` signal with the returned values so "Logged in as
+    /// X" and everywhere else that reads the session stay in sync without a
+    /// fresh login (unlike a password change, this doesn't invalidate the
+    /// session, so there's no re-login to piggyback the refresh on).
+    on_details_updated: EventHandler<api::PlayerDto>,
 ) -> Element {
     let stored = crate::local_storage::load();
     let has_remembered_name = stored.remembered_name.is_some();
@@ -77,6 +88,12 @@ pub fn AuthPanel(
     let mut error_message = use_signal(|| None::<String>);
     let is_submitting = use_signal(|| false);
 
+    let mut show_edit_details = use_signal(|| false);
+    let mut edit_display_name_input = use_signal(String::new);
+    let mut edit_email_input = use_signal(String::new);
+    let mut edit_details_error = use_signal(|| None::<String>);
+    let mut is_updating_details = use_signal(|| false);
+
     let mut show_change_password = use_signal(|| false);
     let mut current_password_input = use_signal(String::new);
     let mut new_password_input = use_signal(String::new);
@@ -90,17 +107,42 @@ pub fn AuthPanel(
     let mut is_requesting_reset = use_signal(|| false);
 
     if let Some(session) = session {
+        // Two closures below each need their own owned copy of `server_url`
+        // — a `move` closure that does `server_url.clone()` on the outer
+        // parameter still moves that outer value into itself first, so a
+        // second such closure would otherwise be moving an already-moved
+        // value (same reasoning as the `server_url_for_*` clones above).
+        let server_url_for_save_details = server_url.clone();
+        let server_url_for_update_password = server_url.clone();
         return rsx! {
             div { class: "auth-widget",
                 div { class: "auth-widget-row",
                     span { class: "auth-status", "Logged in as {session.display_name}" }
                     button {
                         class: "toggle-button toggle-button-muted",
-                        onclick: move |_| {
-                            show_change_password.set(!show_change_password());
-                            change_password_error.set(None);
+                        onclick: {
+                            let session = session.clone();
+                            move |_| {
+                                let opening = !show_edit_details();
+                                show_edit_details.set(opening);
+                                edit_details_error.set(None);
+                                if opening {
+                                    // Prefill from the live session each time
+                                    // it's opened, not just on first mount —
+                                    // otherwise a save earlier in the same
+                                    // page load would leave stale values here.
+                                    edit_display_name_input.set(session.display_name.clone());
+                                    edit_email_input.set(session.email.clone());
+                                } else {
+                                    show_change_password.set(false);
+                                    change_password_error.set(None);
+                                    current_password_input.set(String::new());
+                                    new_password_input.set(String::new());
+                                    confirm_password_input.set(String::new());
+                                }
+                            }
                         },
-                        "Change password"
+                        "Edit user details"
                     }
                     button {
                         class: "toggle-button toggle-button-muted",
@@ -123,88 +165,173 @@ pub fn AuthPanel(
                         "Log out"
                     }
                 }
-                if show_change_password() {
+                if show_edit_details() {
                     div { class: "auth-panel",
                         input {
                             class: "auth-input",
-                            r#type: "password",
-                            placeholder: "Current password",
-                            value: "{current_password_input}",
-                            oninput: move |event| current_password_input.set(event.value()),
+                            placeholder: "Display name",
+                            value: "{edit_display_name_input}",
+                            oninput: move |event| edit_display_name_input.set(event.value()),
                         }
                         input {
                             class: "auth-input",
-                            r#type: "password",
-                            placeholder: "New password",
-                            value: "{new_password_input}",
-                            oninput: move |event| new_password_input.set(event.value()),
+                            placeholder: "Email",
+                            value: "{edit_email_input}",
+                            oninput: move |event| edit_email_input.set(event.value()),
                         }
-                        input {
-                            class: "auth-input",
-                            r#type: "password",
-                            placeholder: "Confirm new password",
-                            value: "{confirm_password_input}",
-                            oninput: move |event| confirm_password_input.set(event.value()),
-                        }
-                        if let Some(error) = change_password_error() {
+                        if let Some(error) = edit_details_error() {
                             p { class: "error-banner", "{error}" }
                         }
                         div { class: "auth-panel-actions",
                             button {
                                 class: "toggle-button toggle-button-muted",
-                                disabled: is_changing_password(),
+                                disabled: is_updating_details(),
                                 onclick: move |_| {
-                                    show_change_password.set(false);
-                                    change_password_error.set(None);
-                                    current_password_input.set(String::new());
-                                    new_password_input.set(String::new());
-                                    confirm_password_input.set(String::new());
+                                    show_edit_details.set(false);
+                                    edit_details_error.set(None);
                                 },
                                 "Cancel"
                             }
                             button {
                                 class: "toggle-button",
-                                disabled: is_changing_password(),
-                                onclick: move |_| {
-                                    let server_url = server_url.clone();
-                                    let token = session.session_token.clone();
-                                    let current = current_password_input();
-                                    let new_password_value = new_password_input();
-                                    let confirm = confirm_password_input();
+                                disabled: is_updating_details(),
+                                onclick: {
+                                    let session = session.clone();
+                                    let server_url = server_url_for_save_details.clone();
+                                    move |_| {
+                                        let server_url = server_url.clone();
+                                        let token = session.session_token.clone();
+                                        let new_display_name = edit_display_name_input().trim().to_string();
+                                        let new_email = edit_email_input().trim().to_string();
 
-                                    if current.is_empty() || new_password_value.is_empty() {
-                                        change_password_error.set(Some("Both current and new password are required".to_string()));
-                                        return;
-                                    }
-                                    if new_password_value != confirm {
-                                        change_password_error.set(Some("New password and confirmation don't match".to_string()));
-                                        return;
-                                    }
-
-                                    spawn(async move {
-                                        is_changing_password.set(true);
-                                        change_password_error.set(None);
-                                        match crate::app::change_password(&server_url, &token, &current, &new_password_value).await {
-                                            Ok(()) => {
-                                                show_change_password.set(false);
-                                                current_password_input.set(String::new());
-                                                new_password_input.set(String::new());
-                                                confirm_password_input.set(String::new());
-                                                mode.set(AuthMode::Login);
-                                                email.set(String::new());
-                                                password.set(String::new());
-                                                stay_logged_in.set(false);
-                                                if !remember_me() {
-                                                    display_name.set(String::new());
-                                                }
-                                                on_password_changed.call(());
-                                            }
-                                            Err(error) => change_password_error.set(Some(error)),
+                                        if new_display_name.is_empty() || new_email.is_empty() {
+                                            edit_details_error.set(Some("Display name and email cannot be blank".to_string()));
+                                            return;
                                         }
-                                        is_changing_password.set(false);
-                                    });
+
+                                        spawn(async move {
+                                            is_updating_details.set(true);
+                                            edit_details_error.set(None);
+                                            match crate::app::update_player_details(&server_url, &token, &new_display_name, &new_email).await {
+                                                Ok(updated) => {
+                                                    // A remembered display name should track a rename —
+                                                    // otherwise the next login's pre-filled name would be
+                                                    // the one that no longer exists.
+                                                    let stored = crate::local_storage::load();
+                                                    if stored.remembered_name.is_some() {
+                                                        crate::local_storage::save(&crate::local_storage::StoredAuth {
+                                                            remembered_name: Some(updated.display_name.clone()),
+                                                            session_token: stored.session_token,
+                                                        });
+                                                    }
+                                                    show_edit_details.set(false);
+                                                    on_details_updated.call(updated);
+                                                }
+                                                Err(error) => edit_details_error.set(Some(error)),
+                                            }
+                                            is_updating_details.set(false);
+                                        });
+                                    }
                                 },
-                                "Update password"
+                                "Save"
+                            }
+                        }
+                        button {
+                            class: "toggle-button toggle-button-muted",
+                            onclick: move |_| {
+                                show_change_password.set(!show_change_password());
+                                change_password_error.set(None);
+                            },
+                            "Change password"
+                        }
+                        if show_change_password() {
+                            div { class: "auth-panel",
+                                input {
+                                    class: "auth-input",
+                                    r#type: "password",
+                                    placeholder: "Current password",
+                                    value: "{current_password_input}",
+                                    oninput: move |event| current_password_input.set(event.value()),
+                                }
+                                input {
+                                    class: "auth-input",
+                                    r#type: "password",
+                                    placeholder: "New password",
+                                    value: "{new_password_input}",
+                                    oninput: move |event| new_password_input.set(event.value()),
+                                }
+                                input {
+                                    class: "auth-input",
+                                    r#type: "password",
+                                    placeholder: "Confirm new password",
+                                    value: "{confirm_password_input}",
+                                    oninput: move |event| confirm_password_input.set(event.value()),
+                                }
+                                if let Some(error) = change_password_error() {
+                                    p { class: "error-banner", "{error}" }
+                                }
+                                div { class: "auth-panel-actions",
+                                    button {
+                                        class: "toggle-button toggle-button-muted",
+                                        disabled: is_changing_password(),
+                                        onclick: move |_| {
+                                            show_change_password.set(false);
+                                            change_password_error.set(None);
+                                            current_password_input.set(String::new());
+                                            new_password_input.set(String::new());
+                                            confirm_password_input.set(String::new());
+                                        },
+                                        "Cancel"
+                                    }
+                                    button {
+                                        class: "toggle-button",
+                                        disabled: is_changing_password(),
+                                        onclick: {
+                                            let session = session.clone();
+                                            let server_url = server_url_for_update_password.clone();
+                                            move |_| {
+                                            let server_url = server_url.clone();
+                                            let token = session.session_token.clone();
+                                            let current = current_password_input();
+                                            let new_password_value = new_password_input();
+                                            let confirm = confirm_password_input();
+
+                                            if current.is_empty() || new_password_value.is_empty() {
+                                                change_password_error.set(Some("Both current and new password are required".to_string()));
+                                                return;
+                                            }
+                                            if new_password_value != confirm {
+                                                change_password_error.set(Some("New password and confirmation don't match".to_string()));
+                                                return;
+                                            }
+
+                                            spawn(async move {
+                                                is_changing_password.set(true);
+                                                change_password_error.set(None);
+                                                match crate::app::change_password(&server_url, &token, &current, &new_password_value).await {
+                                                    Ok(()) => {
+                                                        show_change_password.set(false);
+                                                        current_password_input.set(String::new());
+                                                        new_password_input.set(String::new());
+                                                        confirm_password_input.set(String::new());
+                                                        mode.set(AuthMode::Login);
+                                                        email.set(String::new());
+                                                        password.set(String::new());
+                                                        stay_logged_in.set(false);
+                                                        if !remember_me() {
+                                                            display_name.set(String::new());
+                                                        }
+                                                        on_password_changed.call(());
+                                                    }
+                                                    Err(error) => change_password_error.set(Some(error)),
+                                                }
+                                                is_changing_password.set(false);
+                                            });
+                                            }
+                                        },
+                                        "Update password"
+                                    }
+                                }
                             }
                         }
                     }
@@ -235,6 +362,11 @@ pub fn AuthPanel(
         div { class: "modal-backdrop",
         div { class: "auth-panel modal-card",
             h2 { class: "modal-title", "Welcome to Tile Lite Elite" }
+            if let Some(inviter_name) = &invite_inviter_name {
+                p { class: "modal-copy invite-banner",
+                    "{inviter_name} invited you to play — log in or register below to accept."
+                }
+            }
             p { class: "modal-copy", "Log in or register to create and play games." }
             div { class: "auth-panel-tabs",
                 button {

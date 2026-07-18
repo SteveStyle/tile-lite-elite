@@ -294,7 +294,8 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             seat_number integer not null,
             status text not null,
             created_at text not null,
-            responded_at text
+            responded_at text,
+            invited_email text
         )",
     )
     .execute(pool)
@@ -618,6 +619,33 @@ pub async fn update_player_password(
     Ok(result.rows_affected() > 0)
 }
 
+/// Updates display name and/or email — unlike `update_player_password`,
+/// doesn't invalidate other sessions (see `UpdatePlayerDetailsRequest`'s doc
+/// comment on why these don't need the same "start fresh" treatment). Only
+/// the fields that are `Some` change; a `None` leaves that column as-is.
+pub async fn update_player_details(
+    pool: &Pool<Sqlite>,
+    player_id: &str,
+    display_name: Option<&str>,
+    email: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let now = now_iso();
+    let result = sqlx::query(
+        "update players
+         set display_name = coalesce(?1, display_name),
+             email = coalesce(?2, email),
+             updated_at = ?3
+         where id = ?4",
+    )
+    .bind(display_name)
+    .bind(email)
+    .bind(&now)
+    .bind(player_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Signs out every session for this player — used after a self-service
 /// password change, so a leaked/stolen session token stops working the
 /// moment the account holder reacts to it, rather than staying valid
@@ -838,6 +866,32 @@ pub async fn get_player_by_email(
     }))
 }
 
+/// Case-insensitive prefix match on `display_name`, for the "invite by
+/// name" autocomplete — a live-typing UX needs something a caller can
+/// actually browse toward, unlike `get_player_by_name`'s exact match. Only
+/// returns display names (not full records): nothing else about a player
+/// belongs in a search-suggestions payload. `limit` keeps a broad/short
+/// query (e.g. a single letter) from returning the whole players table.
+pub async fn search_players_by_name_prefix(
+    pool: &Pool<Sqlite>,
+    prefix: &str,
+    limit: i64,
+) -> Result<Vec<String>, sqlx::Error> {
+    let pattern = format!("{}%", prefix.replace('%', "\\%").replace('_', "\\_"));
+    let rows = sqlx::query(
+        "select display_name from players
+         where display_name like ?1 escape '\\' collate nocase
+         order by display_name
+         limit ?2",
+    )
+    .bind(pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(|r| r.get(0)).collect())
+}
+
 pub async fn get_player_by_id(
     pool: &Pool<Sqlite>,
     id: &str,
@@ -1045,7 +1099,8 @@ pub async fn invalidate_password_reset_tokens_for_player(
 pub struct InvitationRecord {
     pub id: String,
     pub game_id: String,
-    /// `None` means an open/stranger invitation — visible to any logged-in
+    /// `None` means an open/stranger invitation, or an email invitation not
+    /// yet accepted (see `invited_email`) — visible to any logged-in
     /// player, first to accept claims the seat.
     pub invited_player_id: Option<String>,
     pub inviting_player_id: String,
@@ -1053,6 +1108,13 @@ pub struct InvitationRecord {
     pub status: String,
     pub created_at: String,
     pub responded_at: Option<String>,
+    /// Set only for a `SeatClaim::Email` invitation — the address the join
+    /// link was sent to. Distinguishes it from a plain open/stranger
+    /// invitation (both have `invited_player_id: None` until claimed), most
+    /// importantly in `get_open_invitations`, which excludes these: an
+    /// email invite is only reachable via its mailed link, not general
+    /// browsing.
+    pub invited_email: Option<String>,
 }
 
 fn invitation_from_row(row: sqlx::sqlite::SqliteRow) -> InvitationRecord {
@@ -1065,11 +1127,12 @@ fn invitation_from_row(row: sqlx::sqlite::SqliteRow) -> InvitationRecord {
         status: row.get(5),
         created_at: row.get(6),
         responded_at: row.get(7),
+        invited_email: row.get(8),
     }
 }
 
 const INVITATION_COLUMNS: &str =
-    "id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, responded_at";
+    "id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, responded_at, invited_email";
 
 pub async fn create_invitation(
     pool: &Pool<Sqlite>,
@@ -1078,11 +1141,12 @@ pub async fn create_invitation(
     invited_player_id: Option<&str>,
     inviting_player_id: &str,
     seat_number: u8,
+    invited_email: Option<&str>,
 ) -> Result<InvitationRecord, sqlx::Error> {
     let now = now_iso();
     sqlx::query(
-        "insert into game_invitations (id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at)
-         values (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+        "insert into game_invitations (id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, invited_email)
+         values (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
     )
     .bind(id)
     .bind(game_id)
@@ -1090,6 +1154,7 @@ pub async fn create_invitation(
     .bind(inviting_player_id)
     .bind(seat_number as i64)
     .bind(&now)
+    .bind(invited_email)
     .execute(pool)
     .await?;
 
@@ -1102,6 +1167,7 @@ pub async fn create_invitation(
         status: "pending".to_string(),
         created_at: now,
         responded_at: None,
+        invited_email: invited_email.map(str::to_string),
     })
 }
 
@@ -1139,16 +1205,36 @@ pub async fn get_invitations_for_game(
 }
 
 /// Pending open/stranger invitations — visible to every logged-in player,
-/// not just one specific invitee.
+/// not just one specific invitee. Excludes email invitations (also
+/// `invited_player_id is null` until claimed): those are only reachable via
+/// their mailed link, not general browsing — see `InvitationRecord.
+/// invited_email`'s doc comment.
 pub async fn get_open_invitations(pool: &Pool<Sqlite>) -> Result<Vec<InvitationRecord>, sqlx::Error> {
     let rows = sqlx::query(&format!(
         "select {INVITATION_COLUMNS} from game_invitations
-         where invited_player_id is null and status = 'pending'"
+         where invited_player_id is null and invited_email is null and status = 'pending'"
     ))
     .fetch_all(pool)
     .await?;
 
     Ok(rows.into_iter().map(invitation_from_row).collect())
+}
+
+/// Looks up a single invitation by id regardless of status — used by the
+/// public preview endpoint an email join-link lands on, before the visitor
+/// has necessarily registered or logged in.
+pub async fn get_invitation_by_id(
+    pool: &Pool<Sqlite>,
+    invitation_id: &str,
+) -> Result<Option<InvitationRecord>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "select {INVITATION_COLUMNS} from game_invitations where id = ?1"
+    ))
+    .bind(invitation_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(invitation_from_row))
 }
 
 /// The still-pending invitation (if any) already outstanding for this seat —

@@ -104,8 +104,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/login", post(login_player))
         .route("/auth/validate", post(validate_session))
         .route("/auth/change-password", post(change_password))
+        .route("/auth/update-details", post(update_player_details))
         .route("/auth/forgot-password", post(request_password_reset))
         .route("/auth/reset-password", post(reset_password))
+        .route("/players/search", get(search_players))
         // Games
         .route("/games", post(create_game).get(list_games))
         .route("/games/{game_id}", get(get_game))
@@ -135,6 +137,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/players/{player_id}/invitations",
             get(list_player_invitations),
+        )
+        .route(
+            "/invitations/{invitation_id}/preview",
+            get(preview_invitation),
         )
         .route(
             "/invitations/{invitation_id}/accept",
@@ -352,6 +358,10 @@ async fn create_game(
                 Some(api::SeatClaim::Creator) => Some(creator_player_id.clone()),
                 _ => None,
             };
+            let invited_email = match &seat.claim {
+                Some(api::SeatClaim::Email { email }) => Some(email.clone()),
+                _ => None,
+            };
             ParticipantState {
                 seat_number: seat_number as u8,
                 kind: seat.kind,
@@ -362,6 +372,7 @@ async fn create_game(
                 rack: rules_shared::Rack::default(),
                 resigned: false,
                 removed_by_player: false,
+                invited_email,
             }
         })
         .collect::<Vec<_>>();
@@ -388,34 +399,38 @@ async fn create_game(
         .await
         .map_err(ApiProblem::from_sqlx)?;
 
-    // Only fetched if there's at least one named invitee to notify — the
-    // common case (no invitees, or open-only invitations) shouldn't pay for
-    // a lookup nothing will use.
-    let creator_display_name = if named_invitees.is_empty() {
-        None
-    } else {
+    // Only fetched if there's at least one named or email invitee to notify
+    // — the common case (no invitees, or open-only invitations) shouldn't
+    // pay for a lookup nothing will use.
+    let has_notifiable_invitee =
+        !named_invitees.is_empty() || game.participants.iter().any(|p| p.invited_email.is_some());
+    let creator_display_name = if has_notifiable_invitee {
         persistence::get_player_by_id(&state.db, &creator_player_id)
             .await
             .map_err(ApiProblem::from_sqlx)?
             .map(|player| player.display_name)
+    } else {
+        None
     };
 
     // Every Human seat that isn't the creator's needs a pending invitation:
-    // named if a specific invitee was resolved above, open otherwise. Only
-    // named invitations have a specific person to email — matches
-    // invite_player_to_game's identical reasoning for the same case.
+    // named, email, or open. Named and email invitations have a specific
+    // address to notify — matches invite_player_to_game's identical
+    // reasoning for the same cases.
     for participant in &game.participants {
         if participant.kind != api::SeatKind::Human || participant.player_id.is_some() {
             continue;
         }
         let invited_player = named_invitees.get(&participant.seat_number);
-        persistence::create_invitation(
+        let invited_email = participant.invited_email.as_deref();
+        let record = persistence::create_invitation(
             &state.db,
             &Uuid::new_v4().to_string(),
             &game.id,
             invited_player.map(|player| player.id.as_str()),
             &creator_player_id,
             participant.seat_number,
+            invited_email,
         )
         .await
         .map_err(ApiProblem::from_sqlx)?;
@@ -429,6 +444,10 @@ async fn create_game(
                 &state.public_base_url,
             )
             .await;
+        } else if let (Some(invited_email), Some(creator_display_name)) = (invited_email, &creator_display_name) {
+            let join_url = format!("{}/invite?id={}", state.public_base_url, record.id);
+            crate::email::send_join_invitation(&state.email, invited_email, creator_display_name, &join_url)
+                .await;
         }
     }
 
@@ -596,7 +615,7 @@ async fn add_seat_to_game(
     }
     if request.kind == api::SeatKind::Human && request.claim.is_none() {
         return Err(ApiProblem::bad_request(
-            "A human seat needs a claim: named or open",
+            "A human seat needs a claim: named, open, or email",
         ));
     }
 
@@ -612,6 +631,10 @@ async fn add_seat_to_game(
             ));
         }
 
+        let invited_email = match &request.claim {
+            Some(api::SeatClaim::Email { email }) => Some(email.clone()),
+            _ => None,
+        };
         let participant = ParticipantState {
             seat_number: 0, // GameSession::add_seat assigns the real number
             kind: request.kind,
@@ -622,6 +645,7 @@ async fn add_seat_to_game(
             rack: rules_shared::Rack::default(),
             resigned: false,
             removed_by_player: false,
+            invited_email,
         };
         game.add_seat(participant).map_err(ApiProblem::bad_request)?;
 
@@ -1362,6 +1386,34 @@ async fn validate_session(
     }))
 }
 
+#[derive(serde::Deserialize)]
+struct SearchPlayersQuery {
+    q: String,
+}
+
+/// "Invite by name" autocomplete — display names aren't sensitive (already
+/// shown throughout every game's participant list), so this is only
+/// gated on being signed in at all, not on any relationship to a specific
+/// game or invitee.
+async fn search_players(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchPlayersQuery>,
+) -> Result<Json<Vec<String>>, ApiProblem> {
+    authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to search players"))?;
+
+    let prefix = query.q.trim();
+    if prefix.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    let names = persistence::search_players_by_name_prefix(&state.db, prefix, 8)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    Ok(Json(names))
+}
+
 async fn change_password(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1407,6 +1459,67 @@ async fn change_password(
     tracing::info!(player_id, "password changed; all sessions invalidated");
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Updates display name and/or email — see `api::UpdatePlayerDetailsRequest`'s
+/// doc comment for why this doesn't require the current password the way
+/// `change_password` does, and doesn't invalidate other sessions either.
+async fn update_player_details(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<api::UpdatePlayerDetailsRequest>,
+) -> Result<Json<api::PlayerDto>, ApiProblem> {
+    let player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to update your details"))?;
+
+    // `Some("")` (field present but blank) is a validation error; `None`
+    // (field omitted) just means "leave this one alone" — trim first so a
+    // whitespace-only value is treated the same as blank.
+    if request.display_name.as_deref().is_some_and(|value| value.trim().is_empty()) {
+        return Err(ApiProblem::bad_request("Display name cannot be blank"));
+    }
+    if request.email.as_deref().is_some_and(|value| value.trim().is_empty()) {
+        return Err(ApiProblem::bad_request("Email cannot be blank"));
+    }
+    let display_name = request.display_name.as_deref().map(str::trim);
+    let email = request.email.as_deref().map(str::trim);
+    if display_name.is_none() && email.is_none() {
+        return Err(ApiProblem::bad_request("Nothing to update"));
+    }
+
+    // Same uniqueness rule as registration — email deliberately isn't
+    // checked here, matching how duplicate emails are already allowed at
+    // registration (see `register_player`).
+    if let Some(display_name) = display_name {
+        if let Some(existing) = persistence::get_player_by_name(&state.db, display_name)
+            .await
+            .map_err(ApiProblem::from_sqlx)?
+        {
+            if existing.id != player_id {
+                return Err(ApiProblem::bad_request("That display name is already taken"));
+            }
+        }
+    }
+
+    persistence::update_player_details(&state.db, &player_id, display_name, email)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+    let player = persistence::get_player_by_id(&state.db, &player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?
+        .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
+
+    tracing::info!(player_id, "player details updated");
+
+    Ok(Json(api::PlayerDto {
+        id: player.id,
+        display_name: player.display_name,
+        email: player.email,
+        created_at: player.created_at,
+        last_seen_at: player.last_seen_at,
+    }))
 }
 
 /// "Forgot password" step 1: request a reset link by email.
@@ -1570,6 +1683,12 @@ async fn invite_player_to_game(
         ));
     }
 
+    if request.invited_display_name.is_some() && request.invited_email.is_some() {
+        return Err(ApiProblem::bad_request(
+            "An invitation can target a display name or an email, not both",
+        ));
+    }
+
     // `None` means an open/stranger invitation — any logged-in player may
     // accept it, not just one specific invitee.
     let invited_player = match &request.invited_display_name {
@@ -1581,6 +1700,7 @@ async fn invite_player_to_game(
         ),
         None => None,
     };
+    let invited_email = request.invited_email.as_deref();
 
     let inviting_player = persistence::get_player_by_id(&state.db, &inviting_player_id)
         .await
@@ -1595,6 +1715,7 @@ async fn invite_player_to_game(
         invited_player.as_ref().map(|p| p.id.as_str()),
         &inviting_player_id,
         request.seat_number,
+        invited_email,
     )
     .await
     .map_err(ApiProblem::from_sqlx)?;
@@ -1614,7 +1735,7 @@ async fn invite_player_to_game(
     // pattern) held across.
     drop(games);
 
-    // Only named invitations have a specific person to notify — an
+    // Named and email invitations have a specific address to notify — an
     // open/stranger invitation has no invitee yet, just an open seat.
     if let Some(invited_player) = &invited_player {
         crate::email::send_invitation(
@@ -1625,6 +1746,10 @@ async fn invite_player_to_game(
             &state.public_base_url,
         )
         .await;
+    } else if let Some(invited_email) = invited_email {
+        let join_url = format!("{}/invite?id={}", state.public_base_url, record.id);
+        crate::email::send_join_invitation(&state.email, invited_email, &inviting_player.display_name, &join_url)
+            .await;
     }
 
     Ok(Json(GameInvitationDto {
@@ -1655,20 +1780,13 @@ async fn list_player_invitations(
             .map_err(|_| ApiProblem::bad_request("Database error"))?;
 
         if let Some(inviter) = inviting_player {
-            let status = match inv.status.as_str() {
-                "accepted" => InvitationStatus::Accepted,
-                "rejected" => InvitationStatus::Rejected,
-                "cancelled" => InvitationStatus::Cancelled,
-                _ => InvitationStatus::Pending,
-            };
-
             result.push(GameInvitationDto {
                 id: inv.id,
                 game_id: inv.game_id,
                 invited_player_id: inv.invited_player_id,
                 inviting_player_id: inv.inviting_player_id,
                 seat_number: inv.seat_number,
-                status,
+                status: invitation_status_from_str(&inv.status),
                 created_at: inv.created_at,
                 responded_at: inv.responded_at,
                 inviting_player_display_name: inviter.display_name,
@@ -1677,6 +1795,38 @@ async fn list_player_invitations(
     }
 
     Ok(Json(result))
+}
+
+fn invitation_status_from_str(status: &str) -> InvitationStatus {
+    match status {
+        "accepted" => InvitationStatus::Accepted,
+        "rejected" => InvitationStatus::Rejected,
+        "cancelled" => InvitationStatus::Cancelled,
+        _ => InvitationStatus::Pending,
+    }
+}
+
+/// Unauthenticated: the landing page an emailed join link opens on needs
+/// this before the visitor has necessarily registered or logged in — see
+/// `api::InvitationPreviewDto`'s doc comment for exactly what it does and
+/// doesn't reveal.
+async fn preview_invitation(
+    Path(invitation_id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<api::InvitationPreviewDto>, ApiProblem> {
+    let invitation = persistence::get_invitation_by_id(&state.db, &invitation_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?
+        .ok_or_else(|| ApiProblem::not_found("Invitation not found"))?;
+    let inviter = persistence::get_player_by_id(&state.db, &invitation.inviting_player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?
+        .ok_or_else(|| ApiProblem::not_found("Invitation not found"))?;
+
+    Ok(Json(api::InvitationPreviewDto {
+        inviting_player_display_name: inviter.display_name,
+        status: invitation_status_from_str(&invitation.status),
+    }))
 }
 
 async fn accept_invitation(
@@ -1705,6 +1855,16 @@ async fn accept_invitation(
             }
         })?;
 
+    // Needed to fill in the seat's real display name below — an Open
+    // seat's participant row is created with a generic "Open seat"
+    // placeholder (there's no invitee to name yet), and a Named seat's
+    // already-correct name shouldn't silently diverge from the account
+    // that actually claimed it (e.g. after a display-name change).
+    let claimant = persistence::get_player_by_id(&state.db, &caller_player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?
+        .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
+
     let (dto, access) = {
         let mut games = state.games.write().await;
         let game = games
@@ -1716,6 +1876,7 @@ async fn accept_invitation(
             .find(|p| p.seat_number == record.seat_number)
         {
             participant.player_id = Some(caller_player_id.clone());
+            participant.display_name = claimant.display_name.clone();
         }
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
@@ -2196,6 +2357,7 @@ async fn admin_list_games(
                     score: participant.score,
                     // Not meaningful in an admin summary view.
                     invitation_status: None,
+                    invited_email: participant.invited_email.clone(),
                 })
                 .collect(),
         })
@@ -4795,6 +4957,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn search_players_matches_by_prefix_case_insensitively_and_requires_auth() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+        register_player(app.clone(), "Alicia").await;
+        register_player(app.clone(), "Bob").await;
+
+        let unauthenticated = send_empty_auth(app.clone(), Method::GET, "/players/search?q=ali", None).await;
+        assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+        let names: Vec<String> = read_json(
+            send_empty_auth(app, Method::GET, "/players/search?q=ALI", Some(&alice.session_token)).await,
+        )
+        .await;
+        assert_eq!(names, vec!["Alice".to_string(), "Alicia".to_string()]);
+    }
+
+    #[tokio::test]
     async fn engine_vs_engine_game_runs_to_completion() {
         let database_url = test_database_url();
         let state = create_test_state(&database_url).await;
@@ -5027,7 +5209,11 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let reordered: GameStateDto = read_json(response).await;
-        assert_eq!(reordered.participants[0].display_name, "Open seat");
+        // "Bob", not "Open seat" — this is fetched fresh after Bob already
+        // accepted (unlike `waiting.game` above, a snapshot from before
+        // that), so it reflects `accept_invitation` filling in the real
+        // display name of whoever claimed the open seat.
+        assert_eq!(reordered.participants[0].display_name, "Bob");
         assert_eq!(reordered.participants[0].seat_number, 0);
         assert_eq!(reordered.participants[1].display_name, "Alice");
         assert_eq!(reordered.participants[1].seat_number, 1);
@@ -5045,7 +5231,7 @@ mod tests {
         )
         .await;
         assert_eq!(started.current_seat, 0);
-        assert_eq!(started.participants[0].display_name, "Open seat");
+        assert_eq!(started.participants[0].display_name, "Bob");
     }
 
     #[tokio::test]
@@ -5163,12 +5349,7 @@ mod tests {
         )
         .await;
 
-        let log = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let log = start_capturing_log_on_this_thread();
 
         let response = send_json_auth(
             app.clone(),
@@ -5177,13 +5358,13 @@ mod tests {
             Some(&waiting.alice.session_token),
             &api::InvitePlayerRequest {
                 invited_display_name: Some("Carol".to_string()),
+                invited_email: None,
                 seat_number: added.participants[2].seat_number,
             },
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        drop(_guard);
         let log_text = log.text();
         assert!(
             log_text.contains("carol@example.com"),
@@ -5745,17 +5926,49 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
-    /// Captures everything logged via `tracing` while `_guard` is alive.
-    /// Used to verify `crate::email::send_*` actually fired — with no
-    /// `RESEND_API_KEY` configured in tests, a send logs the full message
-    /// (see `EmailConfig`'s doc comment) instead of calling out over the
-    /// network, which this reads back instead of standing up a mock server.
+    /// Captures everything logged via `tracing` on the calling thread while
+    /// its `CapturedLog` is registered. Used to verify `crate::email::send_*`
+    /// actually fired — with no `RESEND_API_KEY` configured in tests, a send
+    /// logs the full message (see `EmailConfig`'s doc comment) instead of
+    /// calling out over the network, which this reads back instead of
+    /// standing up a mock server.
+    ///
+    /// Installs exactly one global `tracing` subscriber for the whole test
+    /// binary (via `Once`), rather than each test installing its own with
+    /// `tracing::subscriber::set_default`. `tracing`'s callsite "interest" is
+    /// cached process-wide, not per-thread: with `cargo test`'s default
+    /// parallelism, one test's `set_default`/drop churn can flip another
+    /// concurrently-running test's callsite back to "nobody's interested"
+    /// mid-request, silently swallowing the exact log line being asserted
+    /// on — this was observed as intermittent, full-suite-only failures of
+    /// `creating_a_game_with_a_named_invitee_emails_them` with an empty or
+    /// partial captured log. A single subscriber installed once means
+    /// interest is computed once and never invalidated; routing a given
+    /// thread's output to that thread's own test is done with an ordinary
+    /// (non-tracing) `thread_local!`, which the standard test harness's
+    /// one-OS-thread-per-test model keeps cleanly isolated.
     #[derive(Clone, Default)]
     struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
-    impl std::io::Write for CapturedLog {
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("log output should be utf8")
+        }
+    }
+
+    thread_local! {
+        static LOG_SINK: std::cell::RefCell<Option<CapturedLog>> = const { std::cell::RefCell::new(None) };
+    }
+
+    struct ThreadLocalWriter;
+
+    impl std::io::Write for ThreadLocalWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
+            LOG_SINK.with(|sink| {
+                if let Some(log) = sink.borrow().as_ref() {
+                    log.0.lock().unwrap().extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -5763,17 +5976,46 @@ mod tests {
         }
     }
 
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
-        type Writer = CapturedLog;
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadLocalWriter {
+        type Writer = ThreadLocalWriter;
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            ThreadLocalWriter
         }
     }
 
-    impl CapturedLog {
+    /// Guard returned by `start_capturing_log_on_this_thread`: reads back
+    /// with `.text()`, and clears this thread's capture slot on drop
+    /// (including on an assertion panic) so a later test whose OS thread
+    /// gets reused by the harness never inherits a stale sink.
+    struct LogCapture(CapturedLog);
+
+    impl LogCapture {
         fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).expect("log output should be utf8")
+            self.0.text()
         }
+    }
+
+    impl Drop for LogCapture {
+        fn drop(&mut self) {
+            LOG_SINK.with(|sink| *sink.borrow_mut() = None);
+        }
+    }
+
+    /// Starts capturing this thread's `tracing` output, readable via the
+    /// returned guard's `.text()` once the request under test has completed.
+    fn start_capturing_log_on_this_thread() -> LogCapture {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(ThreadLocalWriter)
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("global default should only be installed once per test binary");
+        });
+        let log = CapturedLog::default();
+        LOG_SINK.with(|sink| *sink.borrow_mut() = Some(log.clone()));
+        LogCapture(log)
     }
 
     /// This is a regression test for a real bug found in production
@@ -5792,12 +6034,7 @@ mod tests {
         let alice = register_player(app.clone(), "Alice").await;
         register_player(app.clone(), "Bob").await;
 
-        let log = CapturedLog::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(log.clone())
-            .with_ansi(false)
-            .finish();
-        let _guard = tracing::subscriber::set_default(subscriber);
+        let log = start_capturing_log_on_this_thread();
 
         let response = send_json_auth(
             app,
@@ -5831,7 +6068,6 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        drop(_guard);
         let log_text = log.text();
         assert!(
             log_text.contains("bob@example.com"),
@@ -5841,6 +6077,249 @@ mod tests {
             log_text.contains("invited you"),
             "expected the invitation email's subject/body, got log:\n{log_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn creating_a_game_with_an_email_invitee_emails_a_join_link() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let log = start_capturing_log_on_this_thread();
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            "/games",
+            Some(&alice.session_token),
+            &CreateGameRequest {
+                seats: vec![
+                    CreateSeatRequest {
+                        kind: SeatKind::Human,
+                        display_name: "Alice".to_string(),
+                        engine_id: None,
+                        claim: Some(SeatClaim::Creator),
+                    },
+                    CreateSeatRequest {
+                        kind: SeatKind::Human,
+                        display_name: "carol@example.com".to_string(),
+                        engine_id: None,
+                        claim: Some(SeatClaim::Email {
+                            email: "carol@example.com".to_string(),
+                        }),
+                    },
+                ],
+                seed: Some(1),
+                variant: None,
+                language: None,
+                board_layout: None,
+                move_time_limit_seconds: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let log_text = log.text();
+        assert!(
+            log_text.contains("carol@example.com"),
+            "expected an email addressed to carol@example.com, got log:\n{log_text}"
+        );
+        assert!(
+            log_text.contains("/invite?id="),
+            "expected a join link in the email body, got log:\n{log_text}"
+        );
+    }
+
+    /// Regression guard for the reason `SeatClaim::Email` doesn't just reuse
+    /// `SeatClaim::Open`: without the `invited_email is null` clause in
+    /// `get_open_invitations`, this exact scenario would let Mallory —
+    /// nobody Alice ever addressed — see and snipe the seat before
+    /// carol@example.com even opens her inbox.
+    #[tokio::test]
+    async fn email_invitation_does_not_appear_as_a_generic_open_invitation() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let mallory = register_player(app.clone(), "Mallory").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "carol@example.com".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Email {
+                                email: "carol@example.com".to_string(),
+                            }),
+                        },
+                    ],
+                    seed: Some(1),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let mallory_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(
+                app,
+                Method::GET,
+                "/games",
+                Some(&mallory.session_token),
+            )
+            .await,
+        )
+        .await;
+        assert!(
+            mallory_games.iter().all(|summary| summary.id != created.id),
+            "an email invitation must not be visible as a generic open invitation"
+        );
+    }
+
+    #[tokio::test]
+    async fn invitation_preview_returns_the_inviter_and_status_without_auth() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let db = state.db.clone();
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "carol@example.com".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Email {
+                                email: "carol@example.com".to_string(),
+                            }),
+                        },
+                    ],
+                    seed: Some(1),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        let invitations = persistence::get_invitations_for_game(&db, &created.id)
+            .await
+            .expect("invitations should load");
+        let invitation_id = invitations.first().expect("one invitation").id.clone();
+
+        // Deliberately no auth header — this is reached before the visitor
+        // has necessarily registered or logged in.
+        let response = send_empty(app, Method::GET, &format!("/invitations/{invitation_id}/preview")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let preview: api::InvitationPreviewDto = read_json(response).await;
+        assert_eq!(preview.inviting_player_display_name, "Alice");
+        assert_eq!(preview.status, api::InvitationStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn invitation_preview_404s_for_an_unknown_id() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_empty(app, Method::GET, "/invitations/does-not-exist/preview").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn accepting_an_email_invitation_claims_the_seat_like_an_open_one() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let db = state.db.clone();
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let carol = register_player(app.clone(), "Carol").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "carol@example.com".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Email {
+                                email: "carol@example.com".to_string(),
+                            }),
+                        },
+                    ],
+                    seed: Some(1),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        let invitations = persistence::get_invitations_for_game(&db, &created.id)
+            .await
+            .expect("invitations should load");
+        let invitation_id = invitations.first().expect("one invitation").id.clone();
+
+        let response = send_empty_auth(
+            app,
+            Method::POST,
+            &format!("/invitations/{invitation_id}/accept"),
+            Some(&carol.session_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let joined: GameStateDto = read_json(response).await;
+        assert_eq!(joined.participants[1].display_name, "Carol");
+        assert_eq!(joined.participants[1].player_id.as_deref(), Some(carol.player_id.as_str()));
     }
 
     #[tokio::test]
@@ -6042,6 +6521,77 @@ mod tests {
         )
         .await;
         assert_eq!(mallory_accept.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Regression test: `accept_invitation` used to only set `player_id`,
+    /// leaving an open seat's placeholder "Open seat" display name in place
+    /// forever even after someone genuinely claimed it.
+    #[tokio::test]
+    async fn accepting_an_open_invitation_replaces_the_placeholder_display_name() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let bob = register_player(app.clone(), "Bob").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Open seat".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Open),
+                        },
+                    ],
+                    seed: Some(1),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(created.participants[1].display_name, "Open seat");
+
+        let bob_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&bob.session_token)).await,
+        )
+        .await;
+        let invitation_id = bob_games
+            .iter()
+            .find(|summary| summary.id == created.id)
+            .expect("invitation id")
+            .invitation_id
+            .clone()
+            .expect("invitation id");
+
+        let accepted: GameStateDto = read_json(
+            send_empty_auth(
+                app,
+                Method::POST,
+                &format!("/invitations/{invitation_id}/accept"),
+                Some(&bob.session_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(accepted.participants[1].display_name, "Bob");
+        assert_eq!(accepted.participants[1].player_id.as_deref(), Some(bob.player_id.as_str()));
     }
 
     #[tokio::test]
@@ -6316,6 +6866,137 @@ mod tests {
         )
         .await;
         assert_eq!(new_login.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn update_player_details_requires_auth() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let response = send_json(
+            app,
+            Method::POST,
+            "/auth/update-details",
+            &api::UpdatePlayerDetailsRequest {
+                display_name: Some("New Name".to_string()),
+                email: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn update_player_details_changes_display_name_and_email_without_touching_the_session() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            "/auth/update-details",
+            Some(&alice.session_token),
+            &api::UpdatePlayerDetailsRequest {
+                display_name: Some("Alicia".to_string()),
+                email: Some("alicia@example.com".to_string()),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: api::PlayerDto = read_json(response).await;
+        assert_eq!(updated.display_name, "Alicia");
+        assert_eq!(updated.email, "alicia@example.com");
+
+        // Unlike a password change, the session used to make the request
+        // stays valid — no re-login required.
+        let still_valid = send_empty_auth(app, Method::GET, "/games", Some(&alice.session_token)).await;
+        assert_eq!(still_valid.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn update_player_details_rejects_a_taken_display_name() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        register_player(app.clone(), "Bob").await;
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            "/auth/update-details",
+            Some(&alice.session_token),
+            &api::UpdatePlayerDetailsRequest {
+                display_name: Some("Bob".to_string()),
+                email: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn update_player_details_allows_keeping_your_own_display_name() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        // Setting display_name to the value it already is shouldn't trip
+        // the "taken" check against yourself.
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            "/auth/update-details",
+            Some(&alice.session_token),
+            &api::UpdatePlayerDetailsRequest {
+                display_name: Some("Alice".to_string()),
+                email: Some("alice-new@example.com".to_string()),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn update_player_details_rejects_a_blank_display_name_and_a_request_with_nothing_to_update() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+
+        let blank = send_json_auth(
+            app.clone(),
+            Method::POST,
+            "/auth/update-details",
+            Some(&alice.session_token),
+            &api::UpdatePlayerDetailsRequest {
+                display_name: Some("   ".to_string()),
+                email: None,
+            },
+        )
+        .await;
+        assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+
+        let empty = send_json_auth(
+            app,
+            Method::POST,
+            "/auth/update-details",
+            Some(&alice.session_token),
+            &api::UpdatePlayerDetailsRequest {
+                display_name: None,
+                email: None,
+            },
+        )
+        .await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

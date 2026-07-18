@@ -59,13 +59,15 @@ pub struct AddSeatSubmission {
 enum AdditionalSeatKind {
     Named,
     Open,
+    Email,
     Engine,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct AdditionalSeatDraft {
     kind: AdditionalSeatKind,
-    /// The invitee's display name for `Named` rows; ignored otherwise.
+    /// The invitee's display name for `Named` rows, or the join-link
+    /// address for `Email` rows; ignored otherwise.
     name: String,
 }
 
@@ -236,6 +238,14 @@ fn build_seats(
                 engine_id: None,
                 claim: Some(SeatClaim::Open),
             },
+            AdditionalSeatKind::Email => CreateSeatRequest {
+                kind: SeatKind::Human,
+                display_name: draft.name.trim().to_string(),
+                engine_id: None,
+                claim: Some(SeatClaim::Email {
+                    email: draft.name.trim().to_string(),
+                }),
+            },
             AdditionalSeatKind::Engine => {
                 engine_index += 1;
                 let label = if engine_count > 1 {
@@ -261,6 +271,8 @@ fn build_seats(
 #[component]
 #[allow(clippy::too_many_arguments)]
 pub fn GamesPanel(
+    server_url: String,
+    token: Option<String>,
     summaries: Vec<GameSummaryDto>,
     selected_id: Option<String>,
     current_game: Option<GameStateDto>,
@@ -325,6 +337,8 @@ pub fn GamesPanel(
         let current_game = current_game.clone();
         let viewer_player_id = viewer_player_id.clone();
         let chat_watermarks = chat_watermarks.clone();
+        let server_url = server_url.clone();
+        let token = token.clone();
         move |title: &'static str, rows: Vec<GameSummaryDto>, show_invite_actions: bool| {
             if rows.is_empty() {
                 return rsx! {};
@@ -340,6 +354,8 @@ pub fn GamesPanel(
                     viewer_player_id.as_deref(),
                     can_start,
                     is_loading,
+                    &server_url,
+                    token.as_deref(),
                     drafting,
                     chat_draft,
                     confirm_seat_action,
@@ -439,9 +455,24 @@ pub fn GamesPanel(
                     td {
                         {reorder}
                         if draft.kind == AdditionalSeatKind::Named {
+                            NameAutocompleteInput {
+                                value: draft.name.clone(),
+                                on_change: move |value| {
+                                    additional_seats.with_mut(|seats| {
+                                        if let Some(seat) = seats.get_mut(index) {
+                                            seat.name = value;
+                                        }
+                                    });
+                                },
+                                server_url: server_url.clone(),
+                                token: token.clone(),
+                                placeholder: "Display name to invite".to_string(),
+                            }
+                        } else if draft.kind == AdditionalSeatKind::Email {
                             input {
                                 class: "seat-draft-name-input",
-                                placeholder: "Display name to invite",
+                                r#type: "email",
+                                placeholder: "Email to invite",
                                 value: "{draft.name}",
                                 oninput: move |event| {
                                     additional_seats.with_mut(|seats| {
@@ -476,15 +507,21 @@ pub fn GamesPanel(
 
     let can_submit_builder = additional_seats()
         .iter()
-        .all(|seat| seat.kind != AdditionalSeatKind::Named || !seat.name.trim().is_empty())
+        .all(|seat| {
+            !matches!(seat.kind, AdditionalSeatKind::Named | AdditionalSeatKind::Email)
+                || !seat.name.trim().is_empty()
+        })
         && (include_creator() || !additional_seats().is_empty());
 
     // A draft with only engine seats (plus optionally you) has nobody left
     // to hear from — creating it lands straight on "Ready to start" with
     // no invitation in flight, so the button says so instead of "Invite".
-    let needs_invitations = additional_seats()
-        .iter()
-        .any(|seat| matches!(seat.kind, AdditionalSeatKind::Named | AdditionalSeatKind::Open));
+    let needs_invitations = additional_seats().iter().any(|seat| {
+        matches!(
+            seat.kind,
+            AdditionalSeatKind::Named | AdditionalSeatKind::Open | AdditionalSeatKind::Email
+        )
+    });
     let submit_label = if needs_invitations { "Invite" } else { "Start" };
 
     rsx! {
@@ -572,6 +609,13 @@ pub fn GamesPanel(
                             button {
                                 class: "toggle-button toggle-button-muted",
                                 onclick: move |_| {
+                                    additional_seats.with_mut(|seats| seats.push(AdditionalSeatDraft { kind: AdditionalSeatKind::Email, name: String::new() }));
+                                },
+                                "+ Invite by email"
+                            }
+                            button {
+                                class: "toggle-button toggle-button-muted",
+                                onclick: move |_| {
                                     additional_seats.with_mut(|seats| seats.push(AdditionalSeatDraft { kind: AdditionalSeatKind::Engine, name: String::new() }));
                                 },
                                 "+ Engine"
@@ -653,6 +697,8 @@ fn game_row(
     viewer_player_id: Option<&str>,
     can_start: bool,
     is_loading: bool,
+    server_url: &str,
+    token: Option<&str>,
     mut drafting: Signal<bool>,
     mut chat_draft: Signal<String>,
     confirm_seat_action: Signal<Option<SeatConfirmAction>>,
@@ -778,7 +824,14 @@ fn game_row(
                         on_force_resign,
                     )}
                     if summary.status == GameStatus::Waiting && loaded_matches && viewer_is_creator {
-                        {add_seat_row(summary.id.clone(), add_seat_kind, add_seat_name, on_add_seat)}
+                        {add_seat_row(
+                            summary.id.clone(),
+                            server_url.to_string(),
+                            token.map(str::to_string),
+                            add_seat_kind,
+                            add_seat_name,
+                            on_add_seat,
+                        )}
                     }
                     if summary.status == GameStatus::Waiting {
                         div { class: "game-builder-add-row",
@@ -1132,8 +1185,11 @@ fn player_table(
 /// doesn't send an invitation itself (see `AddSeatSubmission`'s doc
 /// comment) — sending is a separate `player_table` "Send" button, once the
 /// new seat shows up there as `NotSent`.
+#[allow(clippy::too_many_arguments)]
 fn add_seat_row(
     game_id: String,
+    server_url: String,
+    token: Option<String>,
     // Owned by `GamesPanel`, same reasoning as `player_table`'s
     // `confirm_action` — this is called conditionally, so it can't safely
     // create its own signals.
@@ -1141,30 +1197,43 @@ fn add_seat_row(
     mut name: Signal<String>,
     on_add_seat: EventHandler<AddSeatSubmission>,
 ) -> Element {
-    let can_submit = kind() != AdditionalSeatKind::Named || !name().trim().is_empty();
+    let can_submit =
+        !matches!(kind(), AdditionalSeatKind::Named | AdditionalSeatKind::Email) || !name().trim().is_empty();
     rsx! {
         div { class: "game-builder-add-row",
             select {
                 value: match kind() {
                     AdditionalSeatKind::Named => "named",
                     AdditionalSeatKind::Open => "open",
+                    AdditionalSeatKind::Email => "email",
                     AdditionalSeatKind::Engine => "engine",
                 },
                 onchange: move |event| {
                     kind.set(match event.value().as_str() {
                         "open" => AdditionalSeatKind::Open,
+                        "email" => AdditionalSeatKind::Email,
                         "engine" => AdditionalSeatKind::Engine,
                         _ => AdditionalSeatKind::Named,
                     });
                 },
                 option { value: "named", "Invite by name" }
                 option { value: "open", "Open seat (any player may claim)" }
+                option { value: "email", "Invite by email" }
                 option { value: "engine", "Engine (Greedy)" }
             }
             if kind() == AdditionalSeatKind::Named {
+                NameAutocompleteInput {
+                    value: name(),
+                    on_change: move |value| name.set(value),
+                    server_url: server_url.clone(),
+                    token: token.clone(),
+                    placeholder: "Display name to invite".to_string(),
+                }
+            } else if kind() == AdditionalSeatKind::Email {
                 input {
                     class: "seat-draft-name-input",
-                    placeholder: "Display name to invite",
+                    r#type: "email",
+                    placeholder: "Email to invite",
                     value: "{name}",
                     oninput: move |event| name.set(event.value()),
                 }
@@ -1186,6 +1255,12 @@ fn add_seat_row(
                             None,
                             Some(SeatClaim::Open),
                         ),
+                        AdditionalSeatKind::Email => (
+                            SeatKind::Human,
+                            name().trim().to_string(),
+                            None,
+                            Some(SeatClaim::Email { email: name().trim().to_string() }),
+                        ),
                         AdditionalSeatKind::Engine => (
                             SeatKind::Engine,
                             "Engine".to_string(),
@@ -1203,6 +1278,91 @@ fn add_seat_row(
                     name.set(String::new());
                 },
                 "+ Add seat"
+            }
+        }
+    }
+}
+
+/// A "Named" seat's display-name input, with a live filtered dropdown of
+/// matching registered players (`GET /players/search`) — verifying the
+/// name actually exists is otherwise only enforced late, when the
+/// invitation is actually sent (a 404 from `invite_player_to_game`/
+/// `create_game`), which is a worse time to discover a typo than while
+/// still typing. A genuine `#[component]`, not a plain fn like
+/// `add_seat_row`/`player_table` — it owns real per-keystroke state
+/// (`suggestions`) that must survive across renders, which only a properly
+/// mounted/unmounted Dioxus component can safely do when it's rendered
+/// conditionally (see those two functions' own doc comments on why a bare
+/// fn calling `use_signal` can't).
+/// Controlled-input style (`value` + `on_change`), not a raw `Signal<String>`
+/// — the original pre-creation draft builder keeps its Named seat's name
+/// inside a `Vec<AdditionalSeatDraft>` element, which a plain `Signal`
+/// can't point into directly, so this needs to work through a callback
+/// either way (a signal-backed caller just does `move |v| signal.set(v)`).
+#[component]
+fn NameAutocompleteInput(
+    value: String,
+    on_change: EventHandler<String>,
+    server_url: String,
+    token: Option<String>,
+    placeholder: String,
+) -> Element {
+    let mut suggestions = use_signal(Vec::<String>::new);
+    let mut searched_and_empty = use_signal(|| false);
+
+    let trigger_search = move |query: String| {
+        let server_url = server_url.clone();
+        let token = token.clone();
+        spawn(async move {
+            let trimmed = query.trim();
+            if trimmed.len() < 2 {
+                suggestions.set(Vec::new());
+                searched_and_empty.set(false);
+                return;
+            }
+            if let Ok(names) = crate::app::search_players(&server_url, trimmed, token.as_deref()).await {
+                searched_and_empty.set(names.is_empty());
+                suggestions.set(names);
+            }
+        });
+    };
+
+    rsx! {
+        div { class: "name-autocomplete",
+            input {
+                class: "seat-draft-name-input",
+                placeholder: "{placeholder}",
+                value: "{value}",
+                oninput: move |event| {
+                    let query = event.value();
+                    on_change.call(query.clone());
+                    trigger_search(query);
+                },
+            }
+            if !suggestions().is_empty() {
+                div { class: "name-autocomplete-dropdown",
+                    for suggestion in suggestions() {
+                        button {
+                            class: "name-autocomplete-item",
+                            r#type: "button",
+                            // `onmousedown` (not `onclick`) so the
+                            // selection registers before the input's own
+                            // `onblur` would otherwise hide this dropdown
+                            // first — there is no `onblur` here today, but
+                            // this is the standard-enough pattern that
+                            // adding one later won't silently break
+                            // picking a suggestion.
+                            onmousedown: move |event| {
+                                event.prevent_default();
+                                on_change.call(suggestion.clone());
+                                suggestions.set(Vec::new());
+                            },
+                            "{suggestion}"
+                        }
+                    }
+                }
+            } else if searched_and_empty() {
+                span { class: "name-autocomplete-empty", "No matching player" }
             }
         }
     }
@@ -1293,6 +1453,7 @@ fn seat_draft_label(kind: AdditionalSeatKind) -> &'static str {
     match kind {
         AdditionalSeatKind::Named => "Invite by name",
         AdditionalSeatKind::Open => "Open seat (any player may claim)",
+        AdditionalSeatKind::Email => "Invite by email",
         AdditionalSeatKind::Engine => "Engine (Greedy)",
     }
 }
@@ -1300,7 +1461,7 @@ fn seat_draft_label(kind: AdditionalSeatKind) -> &'static str {
 fn seat_draft_kind_label(kind: AdditionalSeatKind) -> &'static str {
     match kind {
         AdditionalSeatKind::Engine => "Engine",
-        AdditionalSeatKind::Named | AdditionalSeatKind::Open => "Human",
+        AdditionalSeatKind::Named | AdditionalSeatKind::Open | AdditionalSeatKind::Email => "Human",
     }
 }
 
@@ -1535,6 +1696,7 @@ mod tests {
             engine_id: None,
             score: 0,
             invitation_status: None,
+            invited_email: None,
         }
     }
 
