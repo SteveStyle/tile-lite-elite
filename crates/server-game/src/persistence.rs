@@ -1119,6 +1119,25 @@ pub async fn get_invitations_for_player(
     Ok(rows.into_iter().map(invitation_from_row).collect())
 }
 
+/// Every invitation (any status) ever created for a game — used to compute
+/// each unclaimed seat's `api::SeatInvitationStatus` from its most recent
+/// row. Unlike `get_invitations_for_player`/`get_open_invitations`, this
+/// isn't filtered to `"pending"` — a rejected or cancelled row is exactly
+/// as relevant to "what's this seat's history" as a pending one.
+pub async fn get_invitations_for_game(
+    pool: &Pool<Sqlite>,
+    game_id: &str,
+) -> Result<Vec<InvitationRecord>, sqlx::Error> {
+    let rows = sqlx::query(&format!(
+        "select {INVITATION_COLUMNS} from game_invitations where game_id = ?1"
+    ))
+    .bind(game_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(invitation_from_row).collect())
+}
+
 /// Pending open/stranger invitations — visible to every logged-in player,
 /// not just one specific invitee.
 pub async fn get_open_invitations(pool: &Pool<Sqlite>) -> Result<Vec<InvitationRecord>, sqlx::Error> {
@@ -1164,6 +1183,29 @@ pub async fn update_invitation_status(
         .bind(id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Every seat after a removed one shifts down by one index (see
+/// `GameSession::remove_seat`'s doc comment on why seat numbers must stay
+/// contiguous) — this keeps every invitation row (`game_invitations.
+/// seat_number`, for *any* status, not just live ones, so history stays
+/// accurate too) pointing at the same seat it always did, under its new
+/// number. Called once per removal, right alongside `save_game`, inside
+/// the same handler that called `GameSession::remove_seat`.
+pub async fn shift_invitation_seat_numbers_down(
+    pool: &Pool<Sqlite>,
+    game_id: &str,
+    removed_seat_number: u8,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "update game_invitations set seat_number = seat_number - 1
+         where game_id = ?1 and seat_number > ?2",
+    )
+    .bind(game_id)
+    .bind(removed_seat_number as i64)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

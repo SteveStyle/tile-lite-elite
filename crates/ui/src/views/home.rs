@@ -514,6 +514,7 @@ mod tests {
             player_id: None,
             engine_id: None,
             score,
+            invitation_status: None,
         }
     }
 
@@ -526,6 +527,7 @@ mod tests {
         GameStateDto {
             id: "game-1".to_string(),
             status: GameStatus::Finished,
+            creator_player_id: None,
             variant: "official".to_string(),
             language: "sowpods".to_string(),
             board_layout: "official".to_string(),

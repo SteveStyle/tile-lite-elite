@@ -25,8 +25,8 @@ use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
 use crate::game_state::{
-    EngineRegistry, GameSession, ParticipantState, ViewerAccess, move_candidate_from_dto,
-    redact_game_state, resolve_viewer_access, tile_from_dto,
+    EngineRegistry, GameSession, ParticipantState, ViewerAccess, attach_invitation_status,
+    move_candidate_from_dto, redact_game_state, resolve_viewer_access, tile_from_dto,
 };
 use crate::persistence;
 use rules_shared::format_move_error;
@@ -111,6 +111,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/games/{game_id}", get(get_game))
         .route("/games/{game_id}/start", post(start_game))
         .route("/games/{game_id}/reorder-seats", post(swap_seats))
+        .route("/games/{game_id}/seats", post(add_seat_to_game))
+        .route(
+            "/games/{game_id}/seats/{seat_number}/remove",
+            post(remove_seat_from_game),
+        )
+        .route(
+            "/games/{game_id}/seats/{seat_number}/withdraw",
+            post(withdraw_from_seat),
+        )
+        .route(
+            "/games/{game_id}/seats/{seat_number}/force-resign",
+            post(force_resign_seat),
+        )
         .route("/games/{game_id}/actions", post(submit_action))
         .route("/games/{game_id}/chat", post(post_chat_message))
         .route("/games/{game_id}/remove", post(remove_game_for_player))
@@ -370,7 +383,6 @@ async fn create_game(
         move_time_limit_seconds,
     );
     let access = resolve_viewer_access(&game, Some(&creator_player_id));
-    let dto = redact_game_state(game.to_dto(), &access);
 
     persistence::save_game(&state.db, &game)
         .await
@@ -428,6 +440,10 @@ async fn create_game(
         "game created"
     );
 
+    // Built after the invitation-creation loop above, not before — an
+    // early `to_dto()` would show every seat as not-yet-sent even though
+    // their invitations (and this response) go out together.
+    let dto = redact_game_state(game_dto_with_invitation_status(&state, &game).await?, &access);
     state.games.write().await.insert(game.id.clone(), game);
     Ok(Json(dto))
 }
@@ -451,7 +467,8 @@ async fn get_game(
             "Sign in and be part of this game to view it",
         ));
     }
-    Ok(Json(redact_game_state(game.to_dto(), &access)))
+    let dto = game_dto_with_invitation_status(&state, game).await?;
+    Ok(Json(redact_game_state(dto, &access)))
 }
 
 async fn start_game(
@@ -481,20 +498,9 @@ async fn start_game(
             ));
         }
 
-        // A game with no human seats at all (engine vs engine) has no
-        // meaningful owner, so any signed-in caller may start it. Otherwise
-        // only a player seated in the game can.
-        let claimed_owners: Vec<&str> = game
-            .participants
-            .iter()
-            .filter_map(|participant| participant.player_id.as_deref())
-            .collect();
-        let caller_owns_a_seat = caller_player_id
-            .as_deref()
-            .is_some_and(|id| claimed_owners.contains(&id));
-        if !claimed_owners.is_empty() && !caller_owns_a_seat {
+        if !caller_may_manage_game(game, caller_player_id.as_deref()) {
             return Err(ApiProblem::unauthorized(
-                "Only a player with a claimed seat in this game can start it",
+                "Only the game's creator can start it",
             ));
         }
 
@@ -527,12 +533,9 @@ async fn start_game(
     Ok(Json(redact_game_state(dto, &access)))
 }
 
-/// Reorders two seats before the game starts — see
-/// `GameSession::swap_seats` for why this is only ever offered once every
-/// seat is filled. Ownership check is identical to `start_game`'s: a game
-/// with no claimed seats at all (engine vs engine) has no meaningful owner,
-/// so any signed-in caller may reorder it; otherwise only a player already
-/// seated in the game can.
+/// Reorders two seats before the game starts — see `GameSession::
+/// swap_seats` for why this is only ever offered once every seat is
+/// filled. Only the creator may reorder (`caller_may_manage_game`).
 async fn swap_seats(
     Path(game_id): Path<String>,
     State(state): State<AppState>,
@@ -547,17 +550,9 @@ async fn swap_seats(
             .get_mut(&game_id)
             .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
 
-        let claimed_owners: Vec<&str> = game
-            .participants
-            .iter()
-            .filter_map(|participant| participant.player_id.as_deref())
-            .collect();
-        let caller_owns_a_seat = caller_player_id
-            .as_deref()
-            .is_some_and(|id| claimed_owners.contains(&id));
-        if !claimed_owners.is_empty() && !caller_owns_a_seat {
+        if !caller_may_manage_game(game, caller_player_id.as_deref()) {
             return Err(ApiProblem::unauthorized(
-                "Only a player with a claimed seat in this game can reorder seats",
+                "Only the game's creator can reorder seats",
             ));
         }
 
@@ -576,6 +571,245 @@ async fn swap_seats(
     let _ = state
         .events
         .send(GameEventDto::StateUpdated { game: dto.clone() });
+    Ok(Json(redact_game_state(dto, &access)))
+}
+
+/// Adds a new seat to an already-created `Waiting` game — creator-only.
+/// Reuses `api::CreateSeatRequest`, the same shape `create_game` takes per
+/// seat, rather than a bespoke request type. Doesn't send an invitation —
+/// that's a separate, explicit follow-up call to `invite_player_to_game`,
+/// so the creator can stage several additions before sending any of them.
+async fn add_seat_to_game(
+    Path(game_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<api::CreateSeatRequest>,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to add a seat"))?;
+
+    if matches!(request.claim, Some(api::SeatClaim::Creator)) {
+        return Err(ApiProblem::bad_request(
+            "Only the original creator seat may use the Creator claim",
+        ));
+    }
+    if request.kind == api::SeatKind::Human && request.claim.is_none() {
+        return Err(ApiProblem::bad_request(
+            "A human seat needs a claim: named or open",
+        ));
+    }
+
+    let (dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+        if !caller_may_manage_game(game, Some(&caller_player_id)) {
+            return Err(ApiProblem::unauthorized(
+                "Only the game's creator can add a seat",
+            ));
+        }
+
+        let participant = ParticipantState {
+            seat_number: 0, // GameSession::add_seat assigns the real number
+            kind: request.kind,
+            display_name: request.display_name,
+            player_id: None,
+            engine_id: request.engine_id,
+            score: 0,
+            rack: rules_shared::Rack::default(),
+            resigned: false,
+            removed_by_player: false,
+        };
+        game.add_seat(participant).map_err(ApiProblem::bad_request)?;
+
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        let dto = game_dto_with_invitation_status(&state, game).await?;
+        let access = resolve_viewer_access(game, Some(&caller_player_id));
+        (dto, access)
+    };
+
+    tracing::info!(game_id, "seat added");
+
+    let _ = state
+        .events
+        .send(GameEventDto::StateUpdated { game: dto.clone() });
+    Ok(Json(redact_game_state(dto, &access)))
+}
+
+/// Removes a seat entirely — creator-only, works on any non-creator seat
+/// regardless of claim status (this is also how the creator kicks a
+/// confirmed participant, not just cancels an outstanding invite). See
+/// `GameSession::remove_seat` for why every subsequent seat's number
+/// shifts down, and `persistence::shift_invitation_seat_numbers_down` for
+/// keeping invitation history in sync with that shift.
+async fn remove_seat_from_game(
+    Path((game_id, seat_number)): Path<(String, u8)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to remove a seat"))?;
+
+    let (dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+        if !caller_may_manage_game(game, Some(&caller_player_id)) {
+            return Err(ApiProblem::unauthorized(
+                "Only the game's creator can remove a seat",
+            ));
+        }
+
+        game.remove_seat(seat_number)
+            .map_err(ApiProblem::bad_request)?;
+
+        if let Some(pending) =
+            persistence::get_pending_invitation_for_seat(&state.db, &game_id, seat_number)
+                .await
+                .map_err(ApiProblem::from_sqlx)?
+        {
+            persistence::update_invitation_status(&state.db, &pending.id, "cancelled")
+                .await
+                .map_err(ApiProblem::from_sqlx)?;
+        }
+        persistence::shift_invitation_seat_numbers_down(&state.db, &game_id, seat_number)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        let dto = game_dto_with_invitation_status(&state, game).await?;
+        let access = resolve_viewer_access(game, Some(&caller_player_id));
+        (dto, access)
+    };
+
+    tracing::info!(game_id, seat_number, "seat removed");
+
+    let _ = state
+        .events
+        .send(GameEventDto::StateUpdated { game: dto.clone() });
+    Ok(Json(redact_game_state(dto, &access)))
+}
+
+/// Lets whoever holds a claimed non-creator seat give it back up before the
+/// game starts — see `GameSession::withdraw_seat`. Flips that seat's most
+/// recent invitation back to `"rejected"` (reusing the existing status
+/// rather than adding a new one — an accepted deliberate blur between
+/// "never said yes" and "said yes, then withdrew") so it behaves exactly
+/// like any other declined seat afterward: the creator can resend or
+/// remove it.
+async fn withdraw_from_seat(
+    Path((game_id, seat_number)): Path<(String, u8)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to withdraw from a seat"))?;
+
+    let (dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+        let holds_seat = game.participants.get(seat_number as usize).is_some_and(|p| {
+            p.player_id.as_deref() == Some(caller_player_id.as_str())
+        });
+        if !holds_seat {
+            return Err(ApiProblem::unauthorized(
+                "Only the player holding this seat can withdraw from it",
+            ));
+        }
+
+        game.withdraw_seat(seat_number)
+            .map_err(ApiProblem::bad_request)?;
+
+        let invitations = persistence::get_invitations_for_game(&state.db, &game_id)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        if let Some(accepted) = invitations
+            .iter()
+            .filter(|invitation| invitation.seat_number == seat_number && invitation.status == "accepted")
+            .max_by(|a, b| a.created_at.cmp(&b.created_at))
+        {
+            persistence::update_invitation_status(&state.db, &accepted.id, "rejected")
+                .await
+                .map_err(ApiProblem::from_sqlx)?;
+        }
+
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        let dto = game_dto_with_invitation_status(&state, game).await?;
+        let access = resolve_viewer_access(game, Some(&caller_player_id));
+        (dto, access)
+    };
+
+    tracing::info!(game_id, seat_number, player_id = %caller_player_id, "seat withdrawn");
+
+    let _ = state
+        .events
+        .send(GameEventDto::StateUpdated { game: dto.clone() });
+    Ok(Json(redact_game_state(dto, &access)))
+}
+
+/// The `Active`-game counterpart to remove/withdraw — creator-only, ends
+/// the game early on behalf of a seat that's gone unresponsive. See
+/// `GameSession::force_resign` for why this doesn't require it to be that
+/// seat's turn, unlike self-resign.
+async fn force_resign_seat(
+    Path((game_id, seat_number)): Path<(String, u8)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to force-resign a seat"))?;
+
+    let (dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+        if !caller_may_manage_game(game, Some(&caller_player_id)) {
+            return Err(ApiProblem::unauthorized(
+                "Only the game's creator can force-resign a seat",
+            ));
+        }
+
+        game.force_resign(seat_number)
+            .map_err(ApiProblem::bad_request)?;
+        let dto = game.to_dto();
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        let access = resolve_viewer_access(game, Some(&caller_player_id));
+        (dto, access)
+    };
+
+    // Same GameFinished-vs-StateUpdated broadcast pattern as submit_action —
+    // force_resign always finishes the game, but mirroring the conditional
+    // rather than hardcoding GameFinished keeps this consistent in case
+    // that invariant ever loosens.
+    let event = if dto.status == api::GameStatus::Finished {
+        tracing::info!(game_id, seat_number, winner_seat = ?dto.winner_seat, "seat force-resigned by creator; game finished");
+        GameEventDto::GameFinished { game: dto.clone() }
+    } else {
+        GameEventDto::StateUpdated { game: dto.clone() }
+    };
+    let _ = state.events.send(event);
+
     Ok(Json(redact_game_state(dto, &access)))
 }
 
@@ -1310,13 +1544,9 @@ async fn invite_player_to_game(
         ));
     }
 
-    let is_participant = game
-        .participants
-        .iter()
-        .any(|p| p.player_id.as_deref() == Some(inviting_player_id.as_str()));
-    if !is_participant {
+    if !caller_may_manage_game(game, Some(&inviting_player_id)) {
         return Err(ApiProblem::unauthorized(
-            "Only a player already seated in this game can invite others",
+            "Only the game's creator can invite players",
         ));
     }
 
@@ -1581,6 +1811,49 @@ fn hash_token(token: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(token.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+/// Whether `caller_player_id` may perform a game-*management* action —
+/// start, reorder, add/remove/invite a seat, force-resign. The creator is
+/// the game's manager; everyone else (including a seated participant) is
+/// not. A game persisted before `creator_player_id` existed (`None`) falls
+/// back to the old, more permissive rule instead of becoming permanently
+/// unmanageable: any claimed-seat owner, or (for an all-engine game, which
+/// has no claimed seats at all) any signed-in caller.
+fn caller_may_manage_game(game: &GameSession, caller_player_id: Option<&str>) -> bool {
+    match game.creator_player_id.as_deref() {
+        Some(creator_id) => caller_player_id == Some(creator_id),
+        None => {
+            let claimed_owners: Vec<&str> = game
+                .participants
+                .iter()
+                .filter_map(|participant| participant.player_id.as_deref())
+                .collect();
+            claimed_owners.is_empty() || caller_player_id.is_some_and(|id| claimed_owners.contains(&id))
+        }
+    }
+}
+
+/// `game.to_dto()`, plus each unclaimed seat's `invitation_status` filled
+/// in — but only when the game is `Waiting`, the only status where an
+/// unclaimed seat (and thus a meaningful status for it) can exist at all;
+/// skipping the extra `game_invitations` fetch otherwise isn't a shortcut,
+/// it's simply unnecessary work (see `attach_invitation_status`'s own doc
+/// comment). Use this instead of a bare `game.to_dto()` in any handler
+/// where a caller might reasonably want to see seat status: viewing a
+/// game, creating one, or any of the seat-management endpoints.
+async fn game_dto_with_invitation_status(
+    state: &AppState,
+    game: &GameSession,
+) -> Result<api::GameStateDto, ApiProblem> {
+    let mut dto = game.to_dto();
+    if dto.status == api::GameStatus::Waiting {
+        let invitations = persistence::get_invitations_for_game(&state.db, &game.id)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        attach_invitation_status(&mut dto, &invitations);
+    }
+    Ok(dto)
 }
 
 /// Resolves the `Authorization: Bearer <token>` header (if present and
@@ -1921,6 +2194,8 @@ async fn admin_list_games(
                     player_id: participant.player_id.clone(),
                     engine_id: participant.engine_id.clone(),
                     score: participant.score,
+                    // Not meaningful in an admin summary view.
+                    invitation_status: None,
                 })
                 .collect(),
         })
@@ -4464,6 +4739,7 @@ mod tests {
         GameStateDto {
             id: id.to_string(),
             status: api::GameStatus::Waiting,
+            creator_player_id: None,
             variant: "official".to_string(),
             language: "sowpods".to_string(),
             board_layout: "official".to_string(),
@@ -4770,6 +5046,332 @@ mod tests {
         .await;
         assert_eq!(started.current_seat, 0);
         assert_eq!(started.participants[0].display_name, "Open seat");
+    }
+
+    #[tokio::test]
+    async fn reorder_seats_is_rejected_for_a_seated_non_creator() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let waiting = create_two_human_game_waiting(app.clone()).await;
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/reorder-seats", waiting.game.id),
+            Some(&waiting.bob.session_token),
+            &api::SwapSeatsRequest { seat_a: 0, seat_b: 1 },
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "Bob holds a seat, but only the creator (Alice) may reorder"
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_a_game_is_rejected_for_a_seated_non_creator() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let waiting = create_two_human_game_waiting(app.clone()).await;
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/start", waiting.game.id),
+            Some(&waiting.bob.session_token),
+            &StartGameRequest::default(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn add_seat_appends_a_not_sent_seat_and_is_creator_only() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let waiting = create_two_human_game_waiting(app.clone()).await;
+        register_player(app.clone(), "Carol").await;
+
+        let non_creator = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/seats", waiting.game.id),
+            Some(&waiting.bob.session_token),
+            &api::CreateSeatRequest {
+                kind: SeatKind::Human,
+                display_name: "Carol".to_string(),
+                engine_id: None,
+                claim: Some(SeatClaim::Named { display_name: "Carol".to_string() }),
+            },
+        )
+        .await;
+        assert_eq!(non_creator.status(), StatusCode::UNAUTHORIZED);
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/seats", waiting.game.id),
+            Some(&waiting.alice.session_token),
+            &api::CreateSeatRequest {
+                kind: SeatKind::Human,
+                display_name: "Carol".to_string(),
+                engine_id: None,
+                claim: Some(SeatClaim::Named { display_name: "Carol".to_string() }),
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(response).await;
+        assert_eq!(updated.participants.len(), 3);
+        let new_seat = &updated.participants[2];
+        assert_eq!(new_seat.seat_number, 2);
+        assert_eq!(new_seat.display_name, "Carol");
+        assert_eq!(
+            new_seat.invitation_status,
+            Some(api::SeatInvitationStatus::NotSent),
+            "a freshly added seat has no invitation yet"
+        );
+    }
+
+    #[tokio::test]
+    async fn sending_the_invitation_for_an_added_seat_makes_it_pending_and_emails_them() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let waiting = create_two_human_game_waiting(app.clone()).await;
+        register_player(app.clone(), "Carol").await;
+        let added: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/seats", waiting.game.id),
+                Some(&waiting.alice.session_token),
+                &api::CreateSeatRequest {
+                    kind: SeatKind::Human,
+                    display_name: "Carol".to_string(),
+                    engine_id: None,
+                    claim: Some(SeatClaim::Named { display_name: "Carol".to_string() }),
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/invite", waiting.game.id),
+            Some(&waiting.alice.session_token),
+            &api::InvitePlayerRequest {
+                invited_display_name: Some("Carol".to_string()),
+                seat_number: added.participants[2].seat_number,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        drop(_guard);
+        let log_text = log.text();
+        assert!(
+            log_text.contains("carol@example.com"),
+            "expected an email addressed to carol@example.com, got log:\n{log_text}"
+        );
+
+        let fetched: GameStateDto = read_json(
+            send_empty_auth(
+                app,
+                Method::GET,
+                &format!("/games/{}", waiting.game.id),
+                Some(&waiting.alice.session_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(
+            fetched.participants[2].invitation_status,
+            Some(api::SeatInvitationStatus::Pending)
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_seat_deletes_an_unclaimed_seat_and_renumbers_the_rest() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let waiting = create_two_human_game_waiting(app.clone()).await;
+        register_player(app.clone(), "Carol").await;
+        // Alice(0, creator) / Bob(1, claimed) / Carol(2, not-sent) — remove
+        // seat 1 (Bob) and confirm Carol shifts down to seat 1.
+        send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/seats", waiting.game.id),
+            Some(&waiting.alice.session_token),
+            &api::CreateSeatRequest {
+                kind: SeatKind::Human,
+                display_name: "Carol".to_string(),
+                engine_id: None,
+                claim: Some(SeatClaim::Named { display_name: "Carol".to_string() }),
+            },
+        )
+        .await;
+
+        let response = send_empty_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/seats/1/remove", waiting.game.id),
+            Some(&waiting.alice.session_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(response).await;
+        assert_eq!(updated.participants.len(), 2);
+        assert_eq!(updated.participants[1].display_name, "Carol");
+        assert_eq!(updated.participants[1].seat_number, 1);
+    }
+
+    #[tokio::test]
+    async fn remove_seat_can_kick_an_already_claimed_seat_and_is_creator_only() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let waiting = create_two_human_game_waiting(app.clone()).await;
+
+        let non_creator = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/seats/1/remove", waiting.game.id),
+            Some(&waiting.bob.session_token),
+        )
+        .await;
+        assert_eq!(non_creator.status(), StatusCode::UNAUTHORIZED);
+
+        let response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/seats/1/remove", waiting.game.id),
+            Some(&waiting.alice.session_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(response).await;
+        assert_eq!(updated.participants.len(), 1, "Bob's claimed seat is gone entirely");
+
+        let creators_own_seat = send_empty_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/seats/0/remove", waiting.game.id),
+            Some(&waiting.alice.session_token),
+        )
+        .await;
+        assert_eq!(
+            creators_own_seat.status(),
+            StatusCode::BAD_REQUEST,
+            "the creator's own seat can't be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn withdraw_clears_the_claim_and_flips_the_invitation_to_rejected() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let waiting = create_two_human_game_waiting(app.clone()).await;
+
+        let not_the_seat_holder = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/seats/1/withdraw", waiting.game.id),
+            Some(&waiting.alice.session_token),
+        )
+        .await;
+        assert_eq!(not_the_seat_holder.status(), StatusCode::UNAUTHORIZED);
+
+        let response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/seats/1/withdraw", waiting.game.id),
+            Some(&waiting.bob.session_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(response).await;
+        assert_eq!(updated.participants[1].player_id, None);
+        assert_eq!(
+            updated.participants[1].invitation_status,
+            Some(api::SeatInvitationStatus::Rejected)
+        );
+
+        let creators_own_seat = send_empty_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/seats/0/withdraw", waiting.game.id),
+            Some(&waiting.alice.session_token),
+        )
+        .await;
+        assert_eq!(creators_own_seat.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn force_resign_ends_the_game_regardless_of_whose_turn_it_is() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        assert_eq!(started.game.current_seat, 0, "it's Alice's (seat 0) turn");
+
+        let non_creator = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/seats/1/force-resign", started.game.id),
+            Some(&started.bob.session_token),
+        )
+        .await;
+        assert_eq!(non_creator.status(), StatusCode::UNAUTHORIZED);
+
+        // Alice force-resigns Bob (seat 1) even though it's currently seat
+        // 0's turn — the whole point of force-resign over self-resign.
+        let response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/seats/1/force-resign", started.game.id),
+            Some(&started.alice.session_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let updated: GameStateDto = read_json(response).await;
+        assert_eq!(updated.status, api::GameStatus::Finished);
+        assert_eq!(updated.winner_seat, Some(0));
+
+        let already_finished = send_empty_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/seats/1/force-resign", started.game.id),
+            Some(&started.alice.session_token),
+        )
+        .await;
+        assert_eq!(
+            already_finished.status(),
+            StatusCode::BAD_REQUEST,
+            "the game is already finished"
+        );
     }
 
     #[tokio::test]

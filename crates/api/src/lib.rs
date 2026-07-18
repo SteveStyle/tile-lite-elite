@@ -41,7 +41,7 @@ pub enum SeatKind {
     Engine,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum GameStatus {
     Waiting,
@@ -180,6 +180,33 @@ pub struct ParticipantDto {
     pub player_id: Option<String>,
     pub engine_id: Option<String>,
     pub score: i32,
+    /// `None` for an Engine seat or any already-claimed Human seat (the
+    /// creator's own seat, or an accepted invitee) — there's no invitation
+    /// lifecycle left to report. `Some(...)` for an unclaimed Human seat,
+    /// reflecting its most recent invitation (or lack of one). Only
+    /// populated by handlers where it's meaningful (a `Waiting` game) —
+    /// see `attach_invitation_status` in `server-game`; elsewhere this is
+    /// always `None`, which is also correct there (every seat is claimed
+    /// once a game is `Active`, since `start_game` requires full seating).
+    pub invitation_status: Option<SeatInvitationStatus>,
+}
+
+/// A `Waiting` game's unclaimed-seat lifecycle, inferred from that seat's
+/// most recent `game_invitations` row (see `persistence::InvitationRecord`)
+/// — not stored redundantly on the seat itself, so there's exactly one
+/// source of truth. Deliberately excludes `Accepted`/`Cancelled`: an
+/// accepted invitation means the seat is claimed (`ParticipantDto.player_id`
+/// is `Some`, `invitation_status` is `None` instead), and a cancelled one
+/// means the seat no longer exists at all (removing a seat deletes it).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SeatInvitationStatus {
+    /// Seat exists (the creator added it) but no invitation has been sent.
+    NotSent,
+    /// Invitation sent, awaiting response.
+    Pending,
+    /// Invitee declined, or previously accepted and then withdrew.
+    Rejected,
 }
 
 /// Why a game appears in a particular caller's `GET /games` list — the
@@ -285,6 +312,12 @@ pub struct PostChatMessageRequest {
 pub struct GameStateDto {
     pub id: String,
     pub status: GameStatus,
+    /// `None` only for a game persisted before this field existed (see
+    /// `#[serde(default)]` on `PersistedGame.creator_player_id`) — every
+    /// game created since has one. Lets the client identify the creator
+    /// from the game-detail view itself, for gating the roster-management
+    /// controls (start/reorder/add/remove seat, force-resign) to them.
+    pub creator_player_id: Option<String>,
     pub variant: String,
     pub language: String,
     pub board_layout: String,

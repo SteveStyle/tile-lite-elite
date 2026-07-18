@@ -909,8 +909,50 @@ button:disabled {
 
 .player-table th:first-child,
 .player-table td:first-child {
-    width: 42%;
+    width: 38%;
     white-space: normal;
+}
+
+.player-table th:nth-child(2),
+.player-table td:nth-child(2) {
+    width: 10%;
+}
+
+.player-table th:nth-child(3),
+.player-table td:nth-child(3) {
+    width: 8%;
+}
+
+.player-table th:nth-child(4),
+.player-table td:nth-child(4) {
+    width: 24%;
+}
+
+/* The optional 5th column (seat status + Send/Remove/Withdraw/Force-resign
+   buttons) — only present for a Waiting or Active game (see
+   `player_table`'s `show_manage_column`). Given how much can stack up in
+   here (a status label plus up to two buttons), this overrides the base
+   `.player-table td` rule's `nowrap`/`hidden` — clipping a button's label
+   mid-word is worse than the row growing a little taller. */
+.player-table th.player-table-manage,
+.player-table td.player-table-manage {
+    width: 20%;
+    white-space: normal;
+    overflow: visible;
+    text-align: left;
+}
+
+.player-table-invitation-status {
+    display: block;
+    font-size: 0.72rem;
+    color: rgba(35, 25, 15, 0.6);
+    margin-bottom: 3px;
+}
+
+.player-table-manage .toggle-button {
+    font-size: 0.72rem;
+    padding: 3px 7px;
+    margin: 0 4px 3px 0;
 }
 
 .player-table-you {

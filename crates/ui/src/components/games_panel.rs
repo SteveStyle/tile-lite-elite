@@ -2,7 +2,7 @@ use crate::edition_label::edition_label;
 use crate::time_format::format_relative_time;
 use api::{
     ChatMessageDto, CreateSeatRequest, GameRelationship, GameStateDto, GameStatus, GameSummaryDto,
-    MoveRecordDto, ParticipantDto, SeatClaim, SeatKind,
+    MoveRecordDto, ParticipantDto, SeatClaim, SeatInvitationStatus, SeatKind,
 };
 use dioxus::prelude::*;
 use std::collections::HashMap;
@@ -41,6 +41,18 @@ pub struct CustomGameSubmission {
     /// than leaving the game sitting in `Waiting` behind a second,
     /// redundant "Start" click.
     pub start_immediately: bool,
+}
+
+/// Adding a seat to an already-created `Waiting` game — the post-creation
+/// counterpart to `CustomGameSubmission`, one seat at a time instead of a
+/// whole roster, and never sends an invitation itself (see `add_seat_row`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddSeatSubmission {
+    pub game_id: String,
+    pub kind: SeatKind,
+    pub display_name: String,
+    pub engine_id: Option<String>,
+    pub claim: Option<SeatClaim>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,6 +280,11 @@ pub fn GamesPanel(
     on_reject_invitation: EventHandler<String>,
     on_remove_game: EventHandler<String>,
     on_reorder_seats: EventHandler<(u8, u8)>,
+    on_send_invitation: EventHandler<u8>,
+    on_remove_seat: EventHandler<u8>,
+    on_withdraw_seat: EventHandler<u8>,
+    on_force_resign: EventHandler<u8>,
+    on_add_seat: EventHandler<AddSeatSubmission>,
     on_refresh: EventHandler<()>,
 ) -> Element {
     let mut drafting = use_signal(|| false);
@@ -277,6 +294,13 @@ pub fn GamesPanel(
     let mut additional_seats = use_signal(Vec::<AdditionalSeatDraft>::new);
     let mut time_limit_hours = use_signal(|| DEFAULT_TIME_LIMIT_HOURS);
     let mut variant = use_signal(|| "official".to_string());
+    // Owned here (see `player_table`/`add_seat_row`'s own doc comments on
+    // why they can't create these themselves) — reset per `GamesPanel`
+    // render, not per row, but since only one row's detail view is ever
+    // shown at a time that's not observably different from being per-row.
+    let confirm_seat_action = use_signal(|| None::<SeatConfirmAction>);
+    let add_seat_kind = use_signal(|| AdditionalSeatKind::Named);
+    let add_seat_name = use_signal(String::new);
 
     let can_create = my_display_name.is_some();
 
@@ -318,6 +342,9 @@ pub fn GamesPanel(
                     is_loading,
                     drafting,
                     chat_draft,
+                    confirm_seat_action,
+                    add_seat_kind,
+                    add_seat_name,
                     on_select,
                     on_start,
                     on_send_chat,
@@ -325,6 +352,11 @@ pub fn GamesPanel(
                     on_reject_invitation,
                     on_remove_game,
                     on_reorder_seats,
+                    on_send_invitation,
+                    on_remove_seat,
+                    on_withdraw_seat,
+                    on_force_resign,
+                    on_add_seat,
                 )
             });
             rsx! {
@@ -623,6 +655,9 @@ fn game_row(
     is_loading: bool,
     mut drafting: Signal<bool>,
     mut chat_draft: Signal<String>,
+    confirm_seat_action: Signal<Option<SeatConfirmAction>>,
+    add_seat_kind: Signal<AdditionalSeatKind>,
+    add_seat_name: Signal<String>,
     on_select: EventHandler<String>,
     on_start: EventHandler<()>,
     on_send_chat: EventHandler<String>,
@@ -630,6 +665,11 @@ fn game_row(
     on_reject_invitation: EventHandler<String>,
     on_remove_game: EventHandler<String>,
     on_reorder_seats: EventHandler<(u8, u8)>,
+    on_send_invitation: EventHandler<u8>,
+    on_remove_seat: EventHandler<u8>,
+    on_withdraw_seat: EventHandler<u8>,
+    on_force_resign: EventHandler<u8>,
+    on_add_seat: EventHandler<AddSeatSubmission>,
 ) -> Element {
     let is_selected = selected_id == Some(summary.id.as_str());
     let row_class = if is_selected {
@@ -655,12 +695,25 @@ fn game_row(
     // it matches this row; fall back to the summary's participants (scores,
     // no history, no chat — the summary never carries messages) while the
     // full load is still in flight.
-    let (participants, moves, messages): (Vec<ParticipantDto>, Vec<MoveRecordDto>, Vec<ChatMessageDto>) =
-        match current_game.filter(|g| g.id == summary.id) {
-            Some(g) => (g.participants.clone(), g.moves.clone(), g.messages.clone()),
-            None => (summary.participants.clone(), Vec::new(), Vec::new()),
-        };
+    let (participants, moves, messages, creator_player_id): (
+        Vec<ParticipantDto>,
+        Vec<MoveRecordDto>,
+        Vec<ChatMessageDto>,
+        Option<String>,
+    ) = match current_game.filter(|g| g.id == summary.id) {
+        Some(g) => (
+            g.participants.clone(),
+            g.moves.clone(),
+            g.messages.clone(),
+            g.creator_player_id.clone(),
+        ),
+        None => (summary.participants.clone(), Vec::new(), Vec::new(), None),
+    };
     let loaded_matches = current_game.is_some_and(|g| g.id == summary.id);
+    // Only known once the full game (not just the list summary) has
+    // loaded — every management control below stays hidden until then,
+    // same as `can_reorder` already waits on `loaded_matches`.
+    let viewer_is_creator = viewer_player_id.is_some() && creator_player_id.as_deref() == viewer_player_id;
     // Mirrors the server's `resolve_viewer_access` `Participant` tier
     // exactly — a genuinely claimed seat. A creator watching their own game
     // (e.g. Bot Showdown) or a spectator never gets chat.
@@ -679,9 +732,10 @@ fn game_row(
     let can_remove = can_chat || summary.relationship == GameRelationship::Creator;
     let ready = is_ready_to_start(&participants);
     // Same enable condition as the Start button below — reordering and
-    // starting are both "this row's full state is loaded, every seat's
-    // filled, and we're online" operations.
-    let can_reorder = summary.status == GameStatus::Waiting && can_start && loaded_matches && ready;
+    // starting are both creator-only, "this row's full state is loaded,
+    // every seat's filled, and we're online" operations.
+    let can_reorder =
+        summary.status == GameStatus::Waiting && can_start && loaded_matches && ready && viewer_is_creator;
     let badge_class = format!(
         "game-status-badge game-status-{}",
         status_slug(&summary.status, ready)
@@ -707,17 +761,37 @@ fn game_row(
             }
             if is_selected {
                 div { class: "games-panel-detail",
-                    {player_table(&participants, &moves, viewer_player_id, &summary.variant, can_reorder, on_reorder_seats)}
+                    {player_table(
+                        &participants,
+                        &moves,
+                        viewer_player_id,
+                        creator_player_id.as_deref(),
+                        &summary.variant,
+                        summary.status,
+                        can_reorder,
+                        viewer_is_creator,
+                        confirm_seat_action,
+                        on_reorder_seats,
+                        on_send_invitation,
+                        on_remove_seat,
+                        on_withdraw_seat,
+                        on_force_resign,
+                    )}
+                    if summary.status == GameStatus::Waiting && loaded_matches && viewer_is_creator {
+                        {add_seat_row(summary.id.clone(), add_seat_kind, add_seat_name, on_add_seat)}
+                    }
                     if summary.status == GameStatus::Waiting {
                         div { class: "game-builder-add-row",
                             button {
                                 class: "toggle-button",
-                                disabled: is_loading || !(can_start && loaded_matches && ready),
+                                disabled: is_loading || !(can_start && loaded_matches && ready && viewer_is_creator),
                                 onclick: move |_| on_start.call(()),
                                 "Start"
                             }
                             if !ready {
                                 span { class: "games-panel-hint", "Waiting for every seat to be filled" }
+                            } else if !viewer_is_creator {
+                                span { class: "games-panel-hint", "Only the creator can start" }
                             }
                         }
                     }
@@ -831,25 +905,123 @@ fn is_english_dictionary(variant: &str) -> bool {
         .is_some_and(|rules| matches!(rules.language.as_str(), "sowpods" | "enable2k"))
 }
 
+/// A seat-management action awaiting user confirmation before it's actually
+/// dispatched — see `player_table`'s confirmation modal. Only the actions
+/// with real consequences (kicking someone already confirmed, giving up a
+/// seat, ending a game early) go through this; sending a fresh invitation
+/// or removing a not-yet-accepted seat fire immediately, matching the
+/// plan's "nothing's lost" reasoning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SeatConfirmAction {
+    RemoveClaimedSeat(u8),
+    Withdraw(u8),
+    ForceResign(u8),
+}
+
+fn seat_invitation_status_label(status: SeatInvitationStatus) -> &'static str {
+    match status {
+        SeatInvitationStatus::NotSent => "Not sent yet",
+        SeatInvitationStatus::Pending => "Invited — awaiting response",
+        SeatInvitationStatus::Rejected => "Declined",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn player_table(
     participants: &[ParticipantDto],
     moves: &[MoveRecordDto],
     viewer_player_id: Option<&str>,
+    creator_player_id: Option<&str>,
     variant: &str,
+    game_status: GameStatus,
     // Turn order is just seat position (see `GameSession::swap_seats`), so
     // reordering only makes sense — and is only offered — before the game
     // starts, once every seat is filled (matching the server's own gate).
     can_reorder: bool,
+    // The single gate on every management control below (send/resend an
+    // invitation, add/remove a seat, force-resign) — the creator is this
+    // game's manager, nobody else. Doesn't affect what a seated participant
+    // can already do on their own behalf (chat, play, withdraw their own
+    // claim), none of which ever needed creator permission.
+    viewer_is_creator: bool,
+    // Created once, unconditionally, in `GamesPanel` — `player_table` is
+    // itself only ever called conditionally (`if is_selected`), so it can't
+    // safely call `use_signal` itself without risking hook-order drift
+    // across renders; taking the signal as a plain parameter sidesteps
+    // that entirely, same reasoning as `drafting`/`chat_draft` above.
+    mut confirm_action: Signal<Option<SeatConfirmAction>>,
     on_reorder_seats: EventHandler<(u8, u8)>,
+    on_send_invitation: EventHandler<u8>,
+    on_remove_seat: EventHandler<u8>,
+    on_withdraw_seat: EventHandler<u8>,
+    on_force_resign: EventHandler<u8>,
 ) -> Element {
     let link_words = is_english_dictionary(variant);
     let last_seat = participants.len().saturating_sub(1) as u8;
+    let show_manage_column = game_status == GameStatus::Waiting || game_status == GameStatus::Active;
+
     let rows = participants.iter().map(|participant| {
         let is_you = viewer_player_id.is_some() && participant.player_id.as_deref() == viewer_player_id;
+        let is_creators_seat = creator_player_id.is_some() && participant.player_id.as_deref() == creator_player_id;
         let row_class = if is_you { "player-table-you" } else { "" };
         let cell = last_move_cell(moves, participant.seat_number);
         let seat_number = participant.seat_number;
+        let is_claimed = participant.player_id.is_some();
+
+        let manage_cell = if game_status == GameStatus::Waiting {
+            let status_label = participant.invitation_status.map(seat_invitation_status_label);
+            rsx! {
+                if let Some(label) = status_label {
+                    span { class: "player-table-invitation-status", "{label}" }
+                }
+                if viewer_is_creator && !is_creators_seat {
+                    if matches!(participant.invitation_status, Some(SeatInvitationStatus::NotSent) | Some(SeatInvitationStatus::Rejected)) {
+                        button {
+                            class: "toggle-button toggle-button-muted",
+                            onclick: move |_| on_send_invitation.call(seat_number),
+                            "Send"
+                        }
+                    }
+                    button {
+                        class: "toggle-button toggle-button-muted seat-draft-remove",
+                        onclick: move |_| {
+                            if is_claimed {
+                                confirm_action.set(Some(SeatConfirmAction::RemoveClaimedSeat(seat_number)));
+                            } else {
+                                on_remove_seat.call(seat_number);
+                            }
+                        },
+                        "Remove"
+                    }
+                }
+                if is_you && !is_creators_seat {
+                    button {
+                        class: "toggle-button toggle-button-muted",
+                        onclick: move |_| confirm_action.set(Some(SeatConfirmAction::Withdraw(seat_number))),
+                        "Withdraw"
+                    }
+                }
+            }
+        } else if game_status == GameStatus::Active {
+            // No need to also check "already resigned" — `ParticipantDto`
+            // doesn't even expose that, because it can't matter: resigning
+            // (self or forced) ends the *whole* game immediately (see
+            // `GameSession::finish_via_resignation`), so the moment any
+            // seat resigns, `game_status` stops being `Active` for
+            // everyone and this whole branch stops rendering at all.
+            rsx! {
+                if viewer_is_creator && !is_creators_seat {
+                    button {
+                        class: "toggle-button toggle-button-muted",
+                        onclick: move |_| confirm_action.set(Some(SeatConfirmAction::ForceResign(seat_number))),
+                        "Force-resign"
+                    }
+                }
+            }
+        } else {
+            rsx! {}
+        };
+
         rsx! {
             tr { key: "{participant.seat_number}", class: "{row_class}",
                 td {
@@ -881,9 +1053,31 @@ fn player_table(
                 td { "{seat_kind_label(&participant.kind)}" }
                 td { class: "player-table-score", "{participant.score}" }
                 td { {render_last_move(&cell, link_words)} }
+                if show_manage_column {
+                    td { class: "player-table-manage", {manage_cell} }
+                }
             }
         }
     });
+
+    let confirm_copy = confirm_action().map(|action| match action {
+        SeatConfirmAction::RemoveClaimedSeat(seat) => (
+            "Remove this player?",
+            "They've already claimed this seat — removing it takes them out of the game entirely.".to_string(),
+            seat,
+        ),
+        SeatConfirmAction::Withdraw(seat) => (
+            "Withdraw from this seat?",
+            "You'll give up your claim — the creator can invite someone else, or you back in, afterward.".to_string(),
+            seat,
+        ),
+        SeatConfirmAction::ForceResign(seat) => (
+            "End the game and resign this player?",
+            "This finishes the game immediately in favor of whoever's left — there's no undoing it.".to_string(),
+            seat,
+        ),
+    });
+
     rsx! {
         table { class: "player-table",
             thead {
@@ -892,9 +1086,124 @@ fn player_table(
                     th { "Kind" }
                     th { "Score" }
                     th { "Last move" }
+                    if show_manage_column {
+                        th { class: "player-table-manage" }
+                    }
                 }
             }
             tbody { {rows} }
+        }
+        if let Some((title, copy, seat)) = confirm_copy {
+            div { class: "modal-backdrop",
+                div { class: "modal-card",
+                    h2 { class: "modal-title", "{title}" }
+                    p { class: "modal-copy", "{copy}" }
+                    div { class: "modal-actions",
+                        button {
+                            class: "toggle-button toggle-button-muted",
+                            onclick: move |_| confirm_action.set(None),
+                            "Cancel"
+                        }
+                        button {
+                            class: "toggle-button",
+                            onclick: move |_| {
+                                let action = confirm_action();
+                                confirm_action.set(None);
+                                match action {
+                                    Some(SeatConfirmAction::RemoveClaimedSeat(_)) => on_remove_seat.call(seat),
+                                    Some(SeatConfirmAction::Withdraw(_)) => on_withdraw_seat.call(seat),
+                                    Some(SeatConfirmAction::ForceResign(_)) => on_force_resign.call(seat),
+                                    None => {}
+                                }
+                            },
+                            "Confirm"
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Lets the creator add a new seat to an already-created `Waiting` game —
+/// the post-creation counterpart to the pre-creation draft builder's own
+/// "+ Invite by name"/"+ Open seat"/"+ Engine" row, reusing the same
+/// `AdditionalSeatKind` vocabulary for a consistent picker. Deliberately
+/// doesn't send an invitation itself (see `AddSeatSubmission`'s doc
+/// comment) — sending is a separate `player_table` "Send" button, once the
+/// new seat shows up there as `NotSent`.
+fn add_seat_row(
+    game_id: String,
+    // Owned by `GamesPanel`, same reasoning as `player_table`'s
+    // `confirm_action` — this is called conditionally, so it can't safely
+    // create its own signals.
+    mut kind: Signal<AdditionalSeatKind>,
+    mut name: Signal<String>,
+    on_add_seat: EventHandler<AddSeatSubmission>,
+) -> Element {
+    let can_submit = kind() != AdditionalSeatKind::Named || !name().trim().is_empty();
+    rsx! {
+        div { class: "game-builder-add-row",
+            select {
+                value: match kind() {
+                    AdditionalSeatKind::Named => "named",
+                    AdditionalSeatKind::Open => "open",
+                    AdditionalSeatKind::Engine => "engine",
+                },
+                onchange: move |event| {
+                    kind.set(match event.value().as_str() {
+                        "open" => AdditionalSeatKind::Open,
+                        "engine" => AdditionalSeatKind::Engine,
+                        _ => AdditionalSeatKind::Named,
+                    });
+                },
+                option { value: "named", "Invite by name" }
+                option { value: "open", "Open seat (any player may claim)" }
+                option { value: "engine", "Engine (Greedy)" }
+            }
+            if kind() == AdditionalSeatKind::Named {
+                input {
+                    class: "seat-draft-name-input",
+                    placeholder: "Display name to invite",
+                    value: "{name}",
+                    oninput: move |event| name.set(event.value()),
+                }
+            }
+            button {
+                class: "toggle-button toggle-button-muted",
+                disabled: !can_submit,
+                onclick: move |_| {
+                    let (seat_kind, display_name, engine_id, claim) = match kind() {
+                        AdditionalSeatKind::Named => (
+                            SeatKind::Human,
+                            name().trim().to_string(),
+                            None,
+                            Some(SeatClaim::Named { display_name: name().trim().to_string() }),
+                        ),
+                        AdditionalSeatKind::Open => (
+                            SeatKind::Human,
+                            "Open seat".to_string(),
+                            None,
+                            Some(SeatClaim::Open),
+                        ),
+                        AdditionalSeatKind::Engine => (
+                            SeatKind::Engine,
+                            "Engine".to_string(),
+                            Some(DEFAULT_ENGINE_ID.to_string()),
+                            None,
+                        ),
+                    };
+                    on_add_seat.call(AddSeatSubmission {
+                        game_id: game_id.clone(),
+                        kind: seat_kind,
+                        display_name,
+                        engine_id,
+                        claim,
+                    });
+                    name.set(String::new());
+                },
+                "+ Add seat"
+            }
         }
     }
 }
@@ -1225,6 +1534,7 @@ mod tests {
             player_id: player_id.map(str::to_string),
             engine_id: None,
             score: 0,
+            invitation_status: None,
         }
     }
 

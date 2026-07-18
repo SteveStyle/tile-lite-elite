@@ -1,7 +1,8 @@
 use api::{
-    BoardCellDto, CreateGameRequest, DirectionDto, GameActionRequest, GameEventDto, GameStateDto,
-    GameStatus, MoveCandidateDto, ParticipantDto, PositionDto, PremiumDto, RackDto, SeatKind,
-    StartGameRequest, TileDto, TilePlacementDto,
+    BoardCellDto, CreateGameRequest, CreateSeatRequest, DirectionDto, GameActionRequest,
+    GameEventDto, GameStateDto, GameStatus, InvitePlayerRequest, MoveCandidateDto, ParticipantDto,
+    PositionDto, PremiumDto, RackDto, SeatClaim, SeatKind, StartGameRequest, TileDto,
+    TilePlacementDto,
 };
 use dioxus::prelude::*;
 use futures_util::StreamExt;
@@ -427,6 +428,11 @@ pub fn RootApp() -> Element {
     let server_url_for_chat = server_url.clone();
     let server_url_for_remove = server_url.clone();
     let server_url_for_reorder = server_url.clone();
+    let server_url_for_send_invitation = server_url.clone();
+    let server_url_for_add_seat = server_url.clone();
+    let server_url_for_remove_seat = server_url.clone();
+    let server_url_for_withdraw_seat = server_url.clone();
+    let server_url_for_force_resign = server_url.clone();
     let server_url_for_resign = server_url.clone();
     let server_url_for_manual = server_url.clone();
     let game_for_home = game_for_view.clone();
@@ -751,6 +757,118 @@ pub fn RootApp() -> Element {
                                     .await
                                 {
                                     Ok(updated) => game.set(Some(updated)),
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    // "Open seat" is the exact placeholder `add_seat_row`
+                    // (and the original pre-creation draft builder,
+                    // `build_seats`) both use for an Open-claim seat's
+                    // `display_name` — there's no dedicated field on
+                    // `ParticipantDto` recording which kind of claim a seat
+                    // was created with, so this reuses that same
+                    // already-established convention to tell "resend to
+                    // this named person" from "this is an open invitation"
+                    // apart, rather than introducing a second way to
+                    // encode it.
+                    on_send_invitation: move |seat_number: u8| {
+                        let server_url = server_url_for_send_invitation.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            let invited_display_name = current_game
+                                .participants
+                                .iter()
+                                .find(|participant| participant.seat_number == seat_number)
+                                .filter(|participant| participant.display_name != "Open seat")
+                                .map(|participant| participant.display_name.clone());
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match invite_player(&server_url, &current_game.id, seat_number, invited_display_name, token.as_deref()).await {
+                                    Ok(_) => {
+                                        if let Ok(loaded) = load_game_by_id(&server_url, &current_game.id, token.as_deref()).await {
+                                            game.set(Some(loaded));
+                                        }
+                                    }
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    on_add_seat: move |submission: crate::components::games_panel::AddSeatSubmission| {
+                        let server_url = server_url_for_add_seat.clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        spawn(async move {
+                            is_loading.set(true);
+                            error_message.set(None);
+                            match add_seat(
+                                &server_url,
+                                &submission.game_id,
+                                submission.kind,
+                                submission.display_name,
+                                submission.claim,
+                                token.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(updated) => game.set(Some(updated)),
+                                Err(error) => error_message.set(Some(error)),
+                            }
+                            is_loading.set(false);
+                        });
+                    },
+                    on_remove_seat: move |seat_number: u8| {
+                        let server_url = server_url_for_remove_seat.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match remove_seat(&server_url, &current_game.id, seat_number, token.as_deref()).await {
+                                    Ok(updated) => game.set(Some(updated)),
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    on_withdraw_seat: move |seat_number: u8| {
+                        let server_url = server_url_for_withdraw_seat.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match withdraw_from_seat(&server_url, &current_game.id, seat_number, token.as_deref()).await {
+                                    Ok(updated) => game.set(Some(updated)),
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    on_force_resign: move |seat_number: u8| {
+                        let server_url = server_url_for_force_resign.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match force_resign_seat(&server_url, &current_game.id, seat_number, token.as_deref()).await {
+                                    Ok(updated) => {
+                                        info_message.set(None);
+                                        game.set(Some(updated));
+                                        if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                            game_summaries.set(summaries);
+                                        }
+                                    }
                                     Err(error) => error_message.set(Some(error)),
                                 }
                                 is_loading.set(false);
@@ -1350,6 +1468,7 @@ fn empty_live_game() -> GameStateDto {
     GameStateDto {
         id: "not-connected".to_string(),
         status: GameStatus::Waiting,
+        creator_player_id: None,
         variant: "official".to_string(),
         language: "sowpods".to_string(),
         board_layout: "official".to_string(),
@@ -1368,6 +1487,7 @@ fn empty_live_game() -> GameStateDto {
             player_id: None,
             engine_id: None,
             score: 0,
+            invitation_status: None,
         }],
         board: empty_board(),
         racks: vec![RackDto {
@@ -1694,6 +1814,93 @@ async fn swap_seats(
         &format!("{server_url}/games/{game_id}/reorder-seats"),
         token,
         &api::SwapSeatsRequest { seat_a, seat_b },
+    )
+    .await
+}
+
+/// Sends (or resends, after a decline) the invitation for a seat that
+/// already exists in the roster — creator-only server-side. `None` invites
+/// any logged-in player (an `Open` seat); `Some(name)` targets one specific
+/// person (a `Named` seat).
+async fn invite_player(
+    server_url: &str,
+    game_id: &str,
+    seat_number: u8,
+    invited_display_name: Option<String>,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    post_json(
+        &format!("{server_url}/games/{game_id}/invite"),
+        token,
+        &InvitePlayerRequest { invited_display_name, seat_number },
+    )
+    .await
+}
+
+/// Adds a new seat to an already-created `Waiting` game — creator-only.
+/// Doesn't send its invitation; that's a separate `invite_player` call, so
+/// several additions can be staged before any of them go out.
+async fn add_seat(
+    server_url: &str,
+    game_id: &str,
+    kind: SeatKind,
+    display_name: String,
+    claim: Option<SeatClaim>,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    post_json(
+        &format!("{server_url}/games/{game_id}/seats"),
+        token,
+        &CreateSeatRequest { kind, display_name, engine_id: None, claim },
+    )
+    .await
+}
+
+/// Removes a seat entirely — creator-only, works whether or not it's
+/// claimed (this is also how the creator kicks a confirmed participant).
+async fn remove_seat(
+    server_url: &str,
+    game_id: &str,
+    seat_number: u8,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    post_json(
+        &format!("{server_url}/games/{game_id}/seats/{seat_number}/remove"),
+        token,
+        &(),
+    )
+    .await
+}
+
+/// Gives back a claimed seat voluntarily, before the game starts — only
+/// the seat's own holder may call this (not the creator, and not for the
+/// creator's own seat).
+async fn withdraw_from_seat(
+    server_url: &str,
+    game_id: &str,
+    seat_number: u8,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    post_json(
+        &format!("{server_url}/games/{game_id}/seats/{seat_number}/withdraw"),
+        token,
+        &(),
+    )
+    .await
+}
+
+/// The `Active`-game escape hatch for a seat that's gone unresponsive —
+/// creator-only, ends the game immediately in favor of whoever's left.
+async fn force_resign_seat(
+    server_url: &str,
+    game_id: &str,
+    seat_number: u8,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    post_json(
+        &format!("{server_url}/games/{game_id}/seats/{seat_number}/force-resign"),
+        token,
+        &(),
     )
     .await
 }
@@ -3293,6 +3500,7 @@ mod tests {
             player_id: player_id.map(str::to_string),
             engine_id: None,
             score: 0,
+            invitation_status: None,
         }
     }
 

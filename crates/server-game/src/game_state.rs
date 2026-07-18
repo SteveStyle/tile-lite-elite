@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use api::{
     BoardCellDto, ChatMessageDto, DirectionDto, EngineProfileDto, GameStateDto, GameStatus,
-    MoveCandidateDto, MoveRecordDto, ParticipantDto, PositionDto, PremiumDto, RackDto, SeatKind,
-    TileDto, TilePlacementDto,
+    MoveCandidateDto, MoveRecordDto, ParticipantDto, PositionDto, PremiumDto, RackDto,
+    SeatInvitationStatus, SeatKind, TileDto, TilePlacementDto,
 };
 use engine_core::{EngineAction, EngineMetadata, EngineRequest, GreedyEngine, GameEngine};
 use rand::rngs::StdRng;
@@ -14,6 +14,8 @@ use rules_shared::{
     RulesEngine, Tile, TilePlacement, VariantRules, format_move_error,
 };
 use serde::{Deserialize, Serialize};
+
+use crate::persistence::InvitationRecord;
 
 #[derive(Clone)]
 pub struct EngineRegistry {
@@ -147,6 +149,41 @@ pub fn redact_game_state(mut dto: GameStateDto, access: &ViewerAccess) -> GameSt
         dto.messages.clear();
     }
     dto
+}
+
+/// Fills in each unclaimed Human seat's `invitation_status` from that
+/// seat's invitation history. Deliberately a separate post-processing step
+/// from `to_dto()` itself, same reasoning as `redact_game_state` — `to_dto`
+/// is synchronous and has no database access, while invitation records
+/// live in SQLite, so only the handlers where this is actually meaningful
+/// (a `Waiting` game) fetch `invitations` (via
+/// `persistence::get_invitations_for_game`) and call this; everywhere else
+/// every seat is already claimed by the time it matters (`start_game`
+/// requires full seating), so `invitation_status: None` from `to_dto()`
+/// is already correct and this call is skipped entirely.
+pub fn attach_invitation_status(dto: &mut GameStateDto, invitations: &[InvitationRecord]) {
+    for participant in &mut dto.participants {
+        if participant.kind != SeatKind::Human || participant.player_id.is_some() {
+            continue;
+        }
+        // A seat can accumulate more than one invitation over time (sent,
+        // rejected, resent) — the most recent one is what's live, matching
+        // how `invite_player_to_game` itself only ever blocks on a
+        // *pending* one existing already, not on history.
+        let latest = invitations
+            .iter()
+            .filter(|invitation| invitation.seat_number == participant.seat_number)
+            .max_by(|a, b| a.created_at.cmp(&b.created_at));
+        participant.invitation_status = Some(match latest.map(|i| i.status.as_str()) {
+            Some("pending") => SeatInvitationStatus::Pending,
+            Some("rejected") => SeatInvitationStatus::Rejected,
+            // "accepted" can't happen here (player_id would be Some, we'd
+            // have `continue`d above) and "cancelled" means a past
+            // invitation was superseded/withdrawn — both, plus no
+            // invitation at all, mean this seat hasn't been (re)sent yet.
+            _ => SeatInvitationStatus::NotSent,
+        });
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -303,6 +340,77 @@ impl GameSession {
         Ok(())
     }
 
+    /// Adds a new seat to the roster — appended at the end regardless of
+    /// whatever `seat.seat_number` the caller set, since `GameSession`
+    /// alone owns seat numbering (see `swap_seats`'s doc comment on why
+    /// every other seat-touching method treats it as authoritative). A
+    /// fresh Human seat starts unclaimed with no invitation of its own —
+    /// sending one is a separate, explicit follow-up call (see
+    /// `invite_player_to_game` in app.rs), not part of adding the seat.
+    pub fn add_seat(&mut self, mut seat: ParticipantState) -> Result<(), String> {
+        if self.status != GameStatus::Waiting {
+            return Err("Seats can only be added before the game starts".to_string());
+        }
+        seat.seat_number = self.participants.len() as u8;
+        self.participants.push(seat);
+        Ok(())
+    }
+
+    /// Removes a seat entirely — never the creator's own, and only before
+    /// the game starts (once `Active`, `force_resign` is the equivalent
+    /// action for an unresponsive seat; removing one mid-game would break
+    /// move history/scoring that already depends on it existing). Works
+    /// regardless of claim status — this is also how the creator kicks a
+    /// confirmed participant, not just cancels an outstanding invite.
+    /// Renumbers every subsequent seat to keep `participants[i].seat_number
+    /// == i`, an invariant relied on throughout (`apply_place_move`,
+    /// `apply_resign`, etc. all index straight into `participants` by seat
+    /// number). The caller is responsible for keeping any `game_invitations`
+    /// rows for those renumbered seats in sync — `GameSession` has no
+    /// notion of invitations at all, that's a persistence-layer concern.
+    pub fn remove_seat(&mut self, seat_number: u8) -> Result<(), String> {
+        if self.status != GameStatus::Waiting {
+            return Err("Seats can only be removed before the game starts".to_string());
+        }
+        let index = seat_number as usize;
+        let participant = self
+            .participants
+            .get(index)
+            .ok_or_else(|| "Unknown seat".to_string())?;
+        if participant.player_id.is_some() && participant.player_id == self.creator_player_id {
+            return Err("The creator's own seat can't be removed".to_string());
+        }
+        self.participants.remove(index);
+        for (new_index, participant) in self.participants.iter_mut().enumerate() {
+            participant.seat_number = new_index as u8;
+        }
+        Ok(())
+    }
+
+    /// Lets whoever holds a claimed non-creator seat give it back up before
+    /// the game starts — the seat stays in the roster (same `seat_number`,
+    /// still `Human`), just unclaimed again, unlike `remove_seat` which
+    /// deletes it outright. The caller is responsible for flipping that
+    /// seat's invitation back to `"rejected"`, same
+    /// persistence-is-a-separate-concern reasoning as `remove_seat`.
+    pub fn withdraw_seat(&mut self, seat_number: u8) -> Result<(), String> {
+        if self.status != GameStatus::Waiting {
+            return Err("A seat can only be withdrawn before the game starts".to_string());
+        }
+        let participant = self
+            .participants
+            .get_mut(seat_number as usize)
+            .ok_or_else(|| "Unknown seat".to_string())?;
+        if participant.player_id.is_none() {
+            return Err("That seat isn't claimed".to_string());
+        }
+        if participant.player_id == self.creator_player_id {
+            return Err("The creator's own seat can't be withdrawn".to_string());
+        }
+        participant.player_id = None;
+        Ok(())
+    }
+
     pub fn start(&mut self) {
         if self.status != GameStatus::Waiting {
             return;
@@ -381,6 +489,8 @@ impl GameSession {
                     player_id: participant.player_id.clone(),
                     engine_id: participant.engine_id.clone(),
                     score: participant.score,
+                    // Not meaningful in a list-view summary.
+                    invitation_status: None,
                 })
                 .collect(),
             last_activity_at,
@@ -399,6 +509,7 @@ impl GameSession {
         GameStateDto {
             id: self.id.clone(),
             status: self.status.clone(),
+            creator_player_id: self.creator_player_id.clone(),
             variant: self.variant.clone(),
             language: self.language.clone(),
             board_layout: self.board_layout.clone(),
@@ -420,6 +531,10 @@ impl GameSession {
                     player_id: participant.player_id.clone(),
                     engine_id: participant.engine_id.clone(),
                     score: participant.score,
+                    // Populated afterward, only by handlers where it's
+                    // meaningful — see `attach_invitation_status` in app.rs
+                    // and `ParticipantDto::invitation_status`'s doc comment.
+                    invitation_status: None,
                 })
                 .collect(),
             board: board_to_dto(&self.state.board, &self.rules.alphabet),
@@ -629,6 +744,37 @@ impl GameSession {
 
     pub fn apply_resign(&mut self, seat_number: u8) -> Result<(), String> {
         ensure_active_turn(self, seat_number)?;
+        self.finish_via_resignation(seat_number, "resigned")
+    }
+
+    /// The game manager's override: ends the game on behalf of a seat that
+    /// isn't necessarily on turn — unlike self-`apply_resign` (which
+    /// requires it to be exactly that seat's turn, since a player resigns
+    /// *in place of* taking their move), a creator dealing with a player
+    /// who's gone quiet needs to act regardless of whose turn it currently
+    /// is. Same effect otherwise: this codebase's `resign` has always meant
+    /// "end the game now, remaining player(s) win," not "this seat drops
+    /// out and play continues" — see `finish_via_resignation`.
+    pub fn force_resign(&mut self, seat_number: u8) -> Result<(), String> {
+        if self.status != GameStatus::Active {
+            return Err("The game must be active to force-resign a seat".to_string());
+        }
+        let participant = self
+            .participants
+            .get(seat_number as usize)
+            .ok_or_else(|| format!("Unknown seat {seat_number}"))?;
+        if participant.player_id.as_deref() == self.creator_player_id.as_deref()
+            && participant.player_id.is_some()
+        {
+            return Err("The creator's own seat can't be force-resigned".to_string());
+        }
+        if participant.resigned {
+            return Err("That seat has already resigned".to_string());
+        }
+        self.finish_via_resignation(seat_number, "resigned (by the game creator)")
+    }
+
+    fn finish_via_resignation(&mut self, seat_number: u8, reason: &str) -> Result<(), String> {
         let participant = self
             .participants
             .get_mut(seat_number as usize)
@@ -641,7 +787,7 @@ impl GameSession {
             main_word: None,
             score_delta: 0,
             positions: Vec::new(),
-            description: format!("{} resigned", participant.display_name),
+            description: format!("{} {reason}", participant.display_name),
         });
         self.winner_seat = self
             .participants
