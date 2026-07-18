@@ -1155,6 +1155,53 @@ button:disabled {
 .auth-panel-actions {
     display: flex;
     gap: 6px;
+    justify-content: flex-end;
+}
+
+/* The logged-in "Edit user details" dialog — a single form with two
+   visually separated sections (display name/email, then password
+   change) rather than the pill-shaped `.auth-panel` used for the
+   compact login/register widgets, since this one is taller and has
+   two independently-submittable parts. */
+.edit-details-form {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    background: var(--panel);
+    border: 1px solid rgba(111, 75, 44, 0.12);
+    border-radius: 16px;
+    box-shadow: var(--shadow);
+    width: 100%;
+    /* Matches `.modal-card`'s max-width and left/right padding so this
+       form's fields end up the same physical size as the login/register
+       dialog's, per the user's request to use those as the sizing guide. */
+    max-width: 380px;
+    padding: 20px 32px;
+}
+
+.edit-details-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.edit-details-section .auth-input {
+    width: 100%;
+    border-radius: 12px;
+}
+
+.edit-details-divider {
+    border: none;
+    border-top: 1px solid rgba(111, 75, 44, 0.15);
+    margin: 0;
+}
+
+.edit-details-section-title {
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: rgba(35, 25, 15, 0.6);
 }
 
 /* Generic blocking-modal shell — used both for the auth gate (nothing in
