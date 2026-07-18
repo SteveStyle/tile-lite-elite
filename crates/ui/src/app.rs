@@ -1740,11 +1740,13 @@ pub(crate) async fn register_player(
     display_name: &str,
     email: &str,
     password: &str,
+    stay_logged_in: bool,
 ) -> Result<api::PlayerSessionDto, String> {
     let request = api::RegisterPlayerRequest {
         display_name: display_name.to_string(),
         email: email.to_string(),
         password: password.to_string(),
+        stay_logged_in,
     };
     post_json(&format!("{server_url}/auth/register"), None, &request).await
 }
@@ -1753,10 +1755,12 @@ pub(crate) async fn login_player(
     server_url: &str,
     display_name: &str,
     password: &str,
+    stay_logged_in: bool,
 ) -> Result<api::PlayerSessionDto, String> {
     let request = api::LoginPlayerRequest {
         display_name: display_name.to_string(),
         password: password.to_string(),
+        stay_logged_in,
     };
     post_json(&format!("{server_url}/auth/login"), None, &request).await
 }

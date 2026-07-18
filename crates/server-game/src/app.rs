@@ -209,6 +209,9 @@ async fn list_games(
 
     expire_overdue_turns(&state).await;
     expire_old_finished_games(&state).await;
+    if let Err(error) = persistence::delete_expired_sessions(&state.db).await {
+        tracing::error!(%error, "failed to delete expired sessions");
+    }
 
     let last_activity = persistence::last_activity_by_game(&state.db)
         .await
@@ -1295,12 +1298,14 @@ async fn register_player(
         .map_err(ApiProblem::from_sqlx)?;
 
     let session_token = Uuid::new_v4().to_string();
+    let expires_at = session_expiry(request.stay_logged_in);
     persistence::create_session(
         &state.db,
         &Uuid::new_v4().to_string(),
         &player_id,
         &hash_token(&session_token),
-        None,
+        request.stay_logged_in,
+        expires_at.as_deref(),
     )
     .await
     .map_err(ApiProblem::from_sqlx)?;
@@ -1345,12 +1350,14 @@ async fn login_player(
     tracing::info!(player_id = %player.id, display_name = %display_name, "player logged in");
 
     let session_token = Uuid::new_v4().to_string();
+    let expires_at = session_expiry(request.stay_logged_in);
     persistence::create_session(
         &state.db,
         &Uuid::new_v4().to_string(),
         &player.id,
         &hash_token(&session_token),
-        None,
+        request.stay_logged_in,
+        expires_at.as_deref(),
     )
     .await
     .map_err(ApiProblem::from_sqlx)?;
@@ -2065,6 +2072,26 @@ fn now_iso() -> String {
 /// enough that a link sitting unread in an inbox for days can't be used,
 /// long enough that it isn't a race against actually receiving the email.
 const PASSWORD_RESET_TOKEN_TTL_SECS: u64 = 60 * 60;
+
+/// How long an ordinary (not "stay logged in") session stays valid. Most
+/// logins never check that box, so without a real expiry every one of
+/// them leaves a permanent row — this is what actually bounds the
+/// `sessions` table's growth; a `stay_logged_in` session gets no expiry
+/// at all (see `session_expiry`), since that's the whole point of the box.
+const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// `None` for a `stay_logged_in` session (no expiry); otherwise
+/// `SESSION_TTL_SECS` out from now. Shared by `register_player` and
+/// `login_player` so both compute it identically.
+fn session_expiry(stay_logged_in: bool) -> Option<String> {
+    if stay_logged_in {
+        return None;
+    }
+    now_iso()
+        .parse::<u64>()
+        .map(|now| (now + SESSION_TTL_SECS).to_string())
+        .ok()
+}
 
 /// How long an engine gets to choose an action before the seat auto-passes.
 /// Hobby-project default; not yet configurable per engine or per game.
@@ -3896,6 +3923,7 @@ mod tests {
                     display_name: display_name.to_string(),
                     email: format!("{}@example.com", display_name.to_lowercase()),
                     password: "correct horse battery staple".to_string(),
+                    stay_logged_in: false,
                 },
             )
             .await,
@@ -4307,6 +4335,7 @@ mod tests {
                     display_name: "Alice".to_string(),
                     email: "alice@example.com".to_string(),
                     password: "correct horse battery staple".to_string(),
+                    stay_logged_in: false,
                 },
             )
             .await,
@@ -4322,6 +4351,7 @@ mod tests {
                     display_name: "Mallory".to_string(),
                     email: "mallory@example.com".to_string(),
                     password: "another password entirely".to_string(),
+                    stay_logged_in: false,
                 },
             )
             .await,
@@ -4420,6 +4450,7 @@ mod tests {
                     display_name: "Alice".to_string(),
                     email: "alice@example.com".to_string(),
                     password: "correct horse battery staple".to_string(),
+                    stay_logged_in: false,
                 },
             )
             .await,
@@ -4435,6 +4466,7 @@ mod tests {
                     display_name: "Mallory".to_string(),
                     email: "mallory@example.com".to_string(),
                     password: "another password entirely".to_string(),
+                    stay_logged_in: false,
                 },
             )
             .await,
@@ -4935,6 +4967,7 @@ mod tests {
                 display_name: "John".to_string(),
                 email: "john1@example.com".to_string(),
                 password: "first-password".to_string(),
+                stay_logged_in: false,
             },
         )
         .await;
@@ -4950,10 +4983,180 @@ mod tests {
                 display_name: "John".to_string(),
                 email: "john2@example.com".to_string(),
                 password: "second-password".to_string(),
+                stay_logged_in: false,
             },
         )
         .await;
         assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn registering_without_stay_logged_in_gets_a_session_that_expires() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let db = state.db.clone();
+        let app = build_router(state);
+
+        let response = send_json(
+            app,
+            Method::POST,
+            "/auth/register",
+            &RegisterPlayerRequest {
+                display_name: "Alice".to_string(),
+                email: "alice@example.com".to_string(),
+                password: "correct horse battery staple".to_string(),
+                stay_logged_in: false,
+            },
+        )
+        .await;
+        let session: PlayerSessionDto = read_json(response).await;
+
+        let record = persistence::get_session_by_token_hash(&db, &hash_token(&session.session_token))
+            .await
+            .expect("query should succeed")
+            .expect("session should exist");
+        assert!(!record.stay_logged_in);
+        let expires_at: u64 = record.expires_at.expect("should have an expiry").parse().unwrap();
+        let now: u64 = super::now_iso().parse().unwrap();
+        // Should be ~7 days out — just confirm it's in the right ballpark
+        // rather than pinning an exact second.
+        assert!(expires_at > now + 6 * 24 * 60 * 60);
+        assert!(expires_at < now + 8 * 24 * 60 * 60);
+    }
+
+    #[tokio::test]
+    async fn logging_in_with_stay_logged_in_gets_a_session_that_never_expires() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let db = state.db.clone();
+        let app = build_router(state);
+
+        register_player(app.clone(), "Alice").await;
+        let response = send_json(
+            app,
+            Method::POST,
+            "/auth/login",
+            &LoginPlayerRequest {
+                display_name: "Alice".to_string(),
+                password: "correct horse battery staple".to_string(),
+                stay_logged_in: true,
+            },
+        )
+        .await;
+        let session: PlayerSessionDto = read_json(response).await;
+
+        let record = persistence::get_session_by_token_hash(&db, &hash_token(&session.session_token))
+            .await
+            .expect("query should succeed")
+            .expect("session should exist");
+        assert!(record.stay_logged_in);
+        assert_eq!(record.expires_at, None);
+    }
+
+    #[tokio::test]
+    async fn expired_session_token_is_rejected_and_a_stay_logged_in_one_is_not() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let expired_token = "expired-token";
+        persistence::create_session(
+            &state.db,
+            &Uuid::new_v4().to_string(),
+            &register_player(app.clone(), "Alice").await.player_id,
+            &hash_token(expired_token),
+            false,
+            Some("0"), // already expired (epoch second 0)
+        )
+        .await
+        .expect("session should be created");
+
+        let never_expires_token = "never-expires-token";
+        persistence::create_session(
+            &state.db,
+            &Uuid::new_v4().to_string(),
+            &register_player(app.clone(), "Bob").await.player_id,
+            &hash_token(never_expires_token),
+            true,
+            None,
+        )
+        .await
+        .expect("session should be created");
+
+        let expired_response = send_empty_auth(app.clone(), Method::GET, "/games", Some(expired_token)).await;
+        assert_eq!(expired_response.status(), StatusCode::UNAUTHORIZED);
+
+        let stay_logged_in_response =
+            send_empty_auth(app, Method::GET, "/games", Some(never_expires_token)).await;
+        assert_eq!(stay_logged_in_response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn delete_expired_sessions_removes_only_past_expiry_ones() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+        let db = state.db.clone();
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let bob = register_player(app.clone(), "Bob").await;
+        let carol = register_player(app.clone(), "Carol").await;
+
+        // alice: already expired; bob: expires far in the future; carol:
+        // stay_logged_in, no expiry at all. Only alice's should be deleted.
+        persistence::create_session(
+            &db,
+            &Uuid::new_v4().to_string(),
+            &alice.player_id,
+            &hash_token("alice-expired"),
+            false,
+            Some("0"),
+        )
+        .await
+        .expect("session should be created");
+        persistence::create_session(
+            &db,
+            &Uuid::new_v4().to_string(),
+            &bob.player_id,
+            &hash_token("bob-future"),
+            false,
+            Some("9999999999"),
+        )
+        .await
+        .expect("session should be created");
+        persistence::create_session(
+            &db,
+            &Uuid::new_v4().to_string(),
+            &carol.player_id,
+            &hash_token("carol-forever"),
+            true,
+            None,
+        )
+        .await
+        .expect("session should be created");
+
+        persistence::delete_expired_sessions(&db)
+            .await
+            .expect("cleanup should succeed");
+
+        assert!(
+            persistence::get_session_by_token_hash(&db, &hash_token("alice-expired"))
+                .await
+                .expect("query should succeed")
+                .is_none()
+        );
+        assert!(
+            persistence::get_session_by_token_hash(&db, &hash_token("bob-future"))
+                .await
+                .expect("query should succeed")
+                .is_some()
+        );
+        assert!(
+            persistence::get_session_by_token_hash(&db, &hash_token("carol-forever"))
+                .await
+                .expect("query should succeed")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -5618,6 +5821,7 @@ mod tests {
                     display_name: "Alice".to_string(),
                     email: "alice@example.com".to_string(),
                     password: "correct horse battery staple".to_string(),
+                    stay_logged_in: false,
                 },
             )
             .await,
@@ -5662,6 +5866,7 @@ mod tests {
                     display_name: "Alice".to_string(),
                     email: "alice@example.com".to_string(),
                     password: "correct horse battery staple".to_string(),
+                    stay_logged_in: false,
                 },
             )
             .await,
@@ -5742,6 +5947,7 @@ mod tests {
                     display_name: "Alice".to_string(),
                     email: "alice@example.com".to_string(),
                     password: "original-password".to_string(),
+                    stay_logged_in: false,
                 },
             )
             .await,
@@ -5793,6 +5999,7 @@ mod tests {
             &LoginPlayerRequest {
                 display_name: "Alice".to_string(),
                 password: "original-password".to_string(),
+                stay_logged_in: false,
             },
         )
         .await;
@@ -5805,6 +6012,7 @@ mod tests {
             &LoginPlayerRequest {
                 display_name: "Alice".to_string(),
                 password: "brand-new-password".to_string(),
+                stay_logged_in: false,
             },
         )
         .await;
@@ -6849,6 +7057,7 @@ mod tests {
             &LoginPlayerRequest {
                 display_name: "Alice".to_string(),
                 password: "correct horse battery staple".to_string(),
+                stay_logged_in: false,
             },
         )
         .await;
@@ -6862,6 +7071,7 @@ mod tests {
             &LoginPlayerRequest {
                 display_name: "Alice".to_string(),
                 password: "a brand new password".to_string(),
+                stay_logged_in: false,
             },
         )
         .await;
@@ -7235,6 +7445,7 @@ mod tests {
             &LoginPlayerRequest {
                 display_name: "Alice".to_string(),
                 password: "correct horse battery staple".to_string(),
+                stay_logged_in: false,
             },
         )
         .await;
@@ -7247,6 +7458,7 @@ mod tests {
             &LoginPlayerRequest {
                 display_name: "Alice".to_string(),
                 password: "reset via emailed token".to_string(),
+                stay_logged_in: false,
             },
         )
         .await;

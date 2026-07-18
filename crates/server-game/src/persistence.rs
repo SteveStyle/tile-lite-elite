@@ -279,7 +279,8 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
             token_hash text,
             created_at text not null,
             last_seen_at text not null,
-            expires_at text
+            expires_at text,
+            stay_logged_in integer not null default 0
         )",
     )
     .execute(pool)
@@ -320,6 +321,43 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
+
+    // Unlike `create table if not exists` (only takes effect on a brand-new
+    // database — see the migration-limitation note in `docs/schema.md`),
+    // `create index if not exists` is genuinely additive: it applies
+    // cleanly to an existing table with existing rows on the very next
+    // startup, no wipe required. None of these existed before — every
+    // lookup below was a full table scan, harmless at today's row counts
+    // but each one is a real hot path that wouldn't stay that way at scale.
+    //
+    // `sessions.token_hash` is checked on every authenticated request
+    // (`get_session_by_token_hash`) — by far the hottest of these.
+    sqlx::query("create index if not exists idx_sessions_token_hash on sessions(token_hash)")
+        .execute(pool)
+        .await?;
+    // `expire_old_finished_games` runs this filter on every `GET /games`.
+    sqlx::query("create index if not exists idx_games_status_ended_at on games(status, ended_at)")
+        .execute(pool)
+        .await?;
+    // `delete_expired_sessions` runs this filter on every `GET /games` too.
+    sqlx::query("create index if not exists idx_sessions_expires_at on sessions(expires_at)")
+        .execute(pool)
+        .await?;
+    // Several invitation lookups filter by one or the other of these
+    // (`get_invitations_for_game`, `get_pending_invitation_for_seat`,
+    // `shift_invitation_seat_numbers_down`, `get_invitations_for_player`).
+    sqlx::query("create index if not exists idx_game_invitations_game_id on game_invitations(game_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "create index if not exists idx_game_invitations_invited_player_id on game_invitations(invited_player_id)",
+    )
+    .execute(pool)
+    .await?;
+    // Chat retrieval is per-game.
+    sqlx::query("create index if not exists idx_game_messages_game_id on game_messages(game_id)")
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
@@ -923,6 +961,11 @@ pub struct SessionRecord {
     pub created_at: String,
     pub last_seen_at: String,
     pub expires_at: Option<String>,
+    /// Captured from `RegisterPlayerRequest`/`LoginPlayerRequest` at
+    /// creation time — stored explicitly (not just inferred from
+    /// `expires_at` being `None`) so it's a readable record of intent
+    /// rather than something reconstructed from another field's absence.
+    pub stay_logged_in: bool,
 }
 
 pub async fn create_session(
@@ -930,12 +973,13 @@ pub async fn create_session(
     id: &str,
     player_id: &str,
     token_hash: &str,
+    stay_logged_in: bool,
     expires_at: Option<&str>,
 ) -> Result<SessionRecord, sqlx::Error> {
     let now = now_iso();
     sqlx::query(
-        "insert into sessions (id, player_id, token_hash, created_at, last_seen_at, expires_at)
-         values (?1, ?2, ?3, ?4, ?5, ?6)",
+        "insert into sessions (id, player_id, token_hash, created_at, last_seen_at, expires_at, stay_logged_in)
+         values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )
     .bind(id)
     .bind(player_id)
@@ -943,6 +987,7 @@ pub async fn create_session(
     .bind(&now)
     .bind(&now)
     .bind(expires_at)
+    .bind(stay_logged_in)
     .execute(pool)
     .await?;
 
@@ -953,6 +998,7 @@ pub async fn create_session(
         created_at: now.clone(),
         last_seen_at: now,
         expires_at: expires_at.map(|s| s.to_string()),
+        stay_logged_in,
     })
 }
 
@@ -961,7 +1007,7 @@ pub async fn get_session_by_token_hash(
     token_hash: &str,
 ) -> Result<Option<SessionRecord>, sqlx::Error> {
     let row = sqlx::query(
-        "select id, player_id, token_hash, created_at, last_seen_at, expires_at
+        "select id, player_id, token_hash, created_at, last_seen_at, expires_at, stay_logged_in
          from sessions where token_hash = ?1",
     )
     .bind(token_hash)
@@ -975,6 +1021,7 @@ pub async fn get_session_by_token_hash(
         created_at: r.get(3),
         last_seen_at: r.get(4),
         expires_at: r.get(5),
+        stay_logged_in: r.get(6),
     }))
 }
 
@@ -983,7 +1030,7 @@ pub async fn get_session_by_id(
     id: &str,
 ) -> Result<Option<SessionRecord>, sqlx::Error> {
     let row = sqlx::query(
-        "select id, player_id, token_hash, created_at, last_seen_at, expires_at
+        "select id, player_id, token_hash, created_at, last_seen_at, expires_at, stay_logged_in
          from sessions where id = ?1",
     )
     .bind(id)
@@ -997,7 +1044,23 @@ pub async fn get_session_by_id(
         created_at: r.get(3),
         last_seen_at: r.get(4),
         expires_at: r.get(5),
+        stay_logged_in: r.get(6),
     }))
+}
+
+/// Lazy cleanup, same pattern as `expire_old_finished_games`/the
+/// move-time-limit retirement — checked whenever something relevant is
+/// touched (see the `list_games` call site), not a background scheduler.
+/// A `stay_logged_in` session has `expires_at is null` (see
+/// `register_player`/`login_player`), so it's never touched here
+/// regardless of age — that's the entire point of the checkbox.
+pub async fn delete_expired_sessions(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
+    let now = now_iso();
+    sqlx::query("delete from sessions where expires_at is not null and expires_at < ?1")
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn update_session_last_seen(pool: &Pool<Sqlite>, id: &str) -> Result<(), sqlx::Error> {

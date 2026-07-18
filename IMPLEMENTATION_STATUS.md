@@ -184,7 +184,8 @@ The project has successfully implemented the core MVP architecture: a server-aut
 
 - [x] Migrations create schema
   - tables: schema_migrations (dead scaffolding — nothing inserts/reads it), players, engine_profiles, games, game_participants, game_moves, game_messages, sessions, game_invitations, password_reset_tokens — see `docs/schema.md` for the full field-by-field breakdown
-  - Auto-created on server startup via persistence::migrate() — there's no real migration system beyond "create table if not exists", so a schema change (most recently `game_invitations.invited_email`, added for email invitations) only takes effect on a fresh database; hit again this round of work, both local dev and production DBs were wiped — see the reset procedure in `docs/operations.md`. Still an open gap, not a one-time cost — see Code Quality Notes below.
+  - Auto-created on server startup via persistence::migrate() — there's no real migration system beyond "create table if not exists", so a schema change (most recently `game_invitations.invited_email` and `sessions.stay_logged_in`) only takes effect on a fresh database; hit twice now, local dev and production DBs wiped both times — see the reset procedure in `docs/operations.md`. Still an open gap, not a one-time cost — see Code Quality Notes below.
+  - Also creates six indexes beyond the automatic primary-key/unique ones (`sessions(token_hash)`, `sessions(expires_at)`, `games(status, ended_at)`, `game_invitations(game_id)`, `game_invitations(invited_player_id)`, `game_messages(game_id)`) — added once real usage made clear which lookups were hot paths, not present from the start. Unlike a table/column addition, `create index if not exists` applies cleanly to an existing database, no wipe needed.
 
 - [x] Durable game and platform data
   - games table: id, status, variant, language, board_layout, turn_number, current_seat, winner_seat, random_seed, snapshot_json (the actual authoritative state — full board/racks/bag/move-history/per-seat `resigned`/`removed_by_player`/`invited_email`; `game_participants`/`game_moves` below are denormalized read-optimizations derived from it, not a second source of truth)
@@ -192,6 +193,7 @@ The project has successfully implemented the core MVP architecture: a server-aut
   - game_moves: move_number, seat_number, move_type, main_word, score_delta, description
   - game_messages: player_id, display_name, body, created_at (in-game chat)
   - players: display_name (unique), email, password_hash (argon2)
+  - sessions: player_id, token_hash, expires_at (7 days, or null if `stay_logged_in`), stay_logged_in — expired rows deleted lazily on every `GET /games`
   - game_invitations: id, game_id, invited_player_id (nullable — null means open/stranger, or an email invitation before it's claimed), inviting_player_id, seat_number, status, created_at, responded_at, invited_email (nullable — set only for an email invitation; excluded from the generic open-invitations query)
   - password_reset_tokens: player_id, token_hash, expires_at (1 hour), consumed_at
 

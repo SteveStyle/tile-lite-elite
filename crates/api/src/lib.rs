@@ -397,6 +397,10 @@ pub struct RegisterPlayerRequest {
     pub display_name: String,
     pub email: String,
     pub password: String,
+    /// Mirrors the "Stay logged in" checkbox — determines how long the
+    /// issued session lives server-side (see `LoginPlayerRequest`'s doc
+    /// comment on the same field for why this matters).
+    pub stay_logged_in: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -411,6 +415,15 @@ pub struct PlayerSessionDto {
 pub struct LoginPlayerRequest {
     pub display_name: String,
     pub password: String,
+    /// The server has no other way to know whether this login should
+    /// outlive a short-lived session — the checkbox only decides, client
+    /// side, whether the token gets persisted to local storage at all, so
+    /// without this the server can't tell "abandoned the moment this tab
+    /// closes" apart from "meant to last." `false` gets a short server-side
+    /// expiry (so an ordinary sign-in doesn't linger in the sessions table
+    /// forever); `true` gets none, matching how long "stay logged in" is
+    /// meant to actually mean.
+    pub stay_logged_in: bool,
 }
 
 /// Self-service — the caller proves they know the current password rather

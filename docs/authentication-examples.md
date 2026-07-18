@@ -22,7 +22,8 @@ curl -X POST http://127.0.0.1:3000/auth/register \
   -d '{
     "display_name": "Alice",
     "email": "alice@example.com",
-    "password": "alice-secret-phrase-123"
+    "password": "alice-secret-phrase-123",
+    "stay_logged_in": false
   }'
 ```
 
@@ -47,7 +48,8 @@ curl -X POST http://127.0.0.1:3000/auth/register \
   -d '{
     "display_name": "Bob",
     "email": "bob@example.com",
-    "password": "bob-secret-phrase-456"
+    "password": "bob-secret-phrase-456",
+    "stay_logged_in": false
   }'
 ```
 
@@ -226,7 +228,8 @@ curl -X POST http://127.0.0.1:3000/auth/login \
   -H "Content-Type: application/json" \
   -d '{
     "display_name": "Alice",
-    "password": "alice-secret-phrase-123"
+    "password": "alice-secret-phrase-123",
+    "stay_logged_in": true
   }'
 ```
 
@@ -241,7 +244,7 @@ curl -X POST http://127.0.0.1:3000/auth/login \
 }
 ```
 
-Note: The `player_id` is the same, but the `session_token` is new — and the old one is *not* invalidated by logging in elsewhere (sessions don't currently expire, and there's no "log out other devices" concept beyond a self-service password change, which invalidates all of them). Store the new token securely.
+Note: The `player_id` is the same, but the `session_token` is new — and the old one is *not* invalidated by logging in elsewhere (there's no "log out other devices" concept beyond a self-service password change, which invalidates all of them). This example sets `stay_logged_in: true`, so the new session never expires; the earlier registration examples set it `false`, so those sessions expire after 7 days and get cleaned up automatically — see `authentication-and-invitations.md`'s login notes for the full reasoning. Store the new token securely.
 
 ## Example 4: Bob Rejects an Invitation
 
@@ -342,7 +345,8 @@ curl -X POST http://127.0.0.1:3000/auth/login \
   -H "Content-Type: application/json" \
   -d '{
     "display_name": "Alice",
-    "password": "wrong-secret"
+    "password": "wrong-secret",
+    "stay_logged_in": false
   }'
 ```
 
@@ -401,5 +405,5 @@ The web client's equivalent uses real browser `localStorage` (via `gloo-storage`
 Everything this document used to list under "Next Steps" as unbuilt is now done: session validation, auth UI, automatic seat-assignment on accept, seat-ownership checks on every action-capable endpoint (not just `submit_action`), player search/discovery (`GET /players/search?q=`), and an email provider wired up for `/auth/forgot-password` and invitations alike (see `authentication.md`'s status section). What's actually still open:
 
 - Email verification flow with short codes (addresses are captured but never confirmed).
-- Session expiration and refresh tokens (sessions don't currently expire; only a password change invalidates them).
+- Refresh tokens / rotating long-lived credentials (session expiration itself is now handled — see `POST /auth/login`'s notes above — but there's no concept of refreshing a session as it nears expiry, or of a "stay logged in" token ever needing to rotate).
 - Invitation timeout / auto-cancellation (a `pending` invitation sits forever until the creator resends, removes the seat, or the invitee responds).

@@ -21,7 +21,8 @@ Create a new player account.
 {
   "display_name": "Alice",
   "email": "alice@example.com",
-  "password": "my-secret-phrase"
+  "password": "my-secret-phrase",
+  "stay_logged_in": false
 }
 ```
 
@@ -46,6 +47,7 @@ Create a new player account.
 - The `password` is hashed with argon2 server-side; use it to log back in on another device.
 - Email is captured for future account recovery; no verification required. `players.email` has *deliberately* no uniqueness constraint — one person running several identities under the same email is an accepted use case (see `get_player_by_email`'s doc comment in `persistence.rs`).
 - Sends a welcome email (see `authentication.md`'s status section for the transactional-email setup).
+- `stay_logged_in` sets how long the issued session lives server-side, not just whether the client happens to persist the token — see `LoginPlayerRequest`'s notes below for the full reasoning.
 
 ### Login with Password
 
@@ -58,7 +60,8 @@ Restore an existing player account using display name + password.
 ```json
 {
   "display_name": "Alice",
-  "password": "my-secret-phrase"
+  "password": "my-secret-phrase",
+  "stay_logged_in": false
 }
 ```
 
@@ -80,7 +83,8 @@ Restore an existing player account using display name + password.
 **Notes:**
 
 - Use this endpoint when opening the app on a new device.
-- Each login generates a fresh session token; old ones stay valid (sessions don't currently expire, and logging in on a second device doesn't invalidate the first).
+- Each login generates a fresh session token; old ones stay valid until they expire (or are all invalidated together by a password change) — logging in on a second device doesn't invalidate the first.
+- `stay_logged_in: false` (the common case — most logins don't check the box) gets a 7-day server-side expiry, cleaned up lazily whenever `GET /games` runs (`persistence::delete_expired_sessions`, same "checked on ordinary traffic, no background scheduler" pattern as the move-time-limit and finished-game cleanup). `stay_logged_in: true` gets no expiry at all. The server has no other way to know which is which — the checkbox only controls, client-side, whether the token gets persisted to local storage — so without this field every login (checked or not) would leave a permanent row, which is exactly what used to happen before this field existed.
 
 ### Validate Session
 
@@ -341,7 +345,7 @@ See `schema.md` for the authoritative field-by-field breakdown of `players`, `se
 
 - `players.display_name` is unique at the DB level; `players.email` deliberately is not.
 - `game_invitations` keeps a full history per seat (send, decline, resend all append rather than overwrite) and carries `invited_email` for `Email`-claim invitations — the column `get_open_invitations` excludes on, so an email invite doesn't leak into the generic open-invitations list.
-- `sessions.expires_at` exists in the schema but nothing currently sets it — sessions don't expire.
+- `sessions.expires_at` is set at login/register time based on `stay_logged_in` (7 days if not checked, `null`/no expiry if checked — see `POST /auth/login`'s notes above); expired rows are deleted lazily whenever `GET /games` runs.
 
 ## Security Notes
 

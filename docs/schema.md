@@ -191,7 +191,8 @@ Fields:
 - `token_hash` text null
 - `created_at` text not null
 - `last_seen_at` text not null
-- `expires_at` text null
+- `expires_at` text null — set at login/register time: 7 days out if `stay_logged_in` was `false`, `null` (no expiry) if `true`. Expired rows are deleted lazily whenever `GET /games` runs (`persistence::delete_expired_sessions`) — this is what actually bounds the table's size, since most logins don't check "stay logged in" and would otherwise leave a permanent row per login.
+- `stay_logged_in` integer not null default 0 — captured explicitly from the request rather than only inferred from `expires_at is null`, so it reads as a record of intent, not a reconstruction.
 
 ## Suggested Relationships
 
@@ -205,6 +206,8 @@ Fields:
 ## Actual Current Shape
 
 What `persistence::migrate()` actually creates, in order: `schema_migrations` (dead scaffolding), `players`, `engine_profiles`, `games`, `game_participants`, `game_moves`, `game_messages`, `sessions`, `game_invitations`, `password_reset_tokens`. `game_state_snapshots` and `saved_games` remain proposals, not implemented.
+
+Beyond the automatic indexes SQLite creates for every `primary key`/`unique` column above, `migrate()` also explicitly creates a handful more, on columns that are looked up often enough to matter once row counts grow past what's convenient to full-scan: `sessions(token_hash)` (checked on every authenticated request), `sessions(expires_at)` and `games(status, ended_at)` (both scanned by the lazy cleanup jobs on every `GET /games`), and `game_invitations(game_id)` / `game_invitations(invited_player_id)` / `game_messages(game_id)` (per-game and per-player lookups). Unlike `create table if not exists`, `create index if not exists` applies cleanly to an existing database with existing rows — no wipe needed to pick these up.
 
 ## Notes
 
