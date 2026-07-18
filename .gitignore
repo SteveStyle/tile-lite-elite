@@ -46,3 +46,14 @@ node_modules/
 # PID files written by scripts/services.sh
 .pid.server
 .pid.web
+
+# Local dev SQLite database — recreated fresh by persistence::migrate()
+# on server startup (create_if_missing). Tracking this in git meant a
+# `git checkout`/`git reset` on it silently reverted both data *and*
+# schema together (no real migration system — see docs/operations.md),
+# which twice caused "no such column" errors after an innocuous-looking
+# checkout. Local dev data is disposable; there's nothing here worth
+# committing.
+data/*.sqlite3
+data/*.sqlite3-wal
+data/*.sqlite3-shm
