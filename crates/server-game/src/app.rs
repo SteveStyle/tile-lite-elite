@@ -376,25 +376,48 @@ async fn create_game(
         .await
         .map_err(ApiProblem::from_sqlx)?;
 
+    // Only fetched if there's at least one named invitee to notify — the
+    // common case (no invitees, or open-only invitations) shouldn't pay for
+    // a lookup nothing will use.
+    let creator_display_name = if named_invitees.is_empty() {
+        None
+    } else {
+        persistence::get_player_by_id(&state.db, &creator_player_id)
+            .await
+            .map_err(ApiProblem::from_sqlx)?
+            .map(|player| player.display_name)
+    };
+
     // Every Human seat that isn't the creator's needs a pending invitation:
-    // named if a specific invitee was resolved above, open otherwise.
+    // named if a specific invitee was resolved above, open otherwise. Only
+    // named invitations have a specific person to email — matches
+    // invite_player_to_game's identical reasoning for the same case.
     for participant in &game.participants {
         if participant.kind != api::SeatKind::Human || participant.player_id.is_some() {
             continue;
         }
-        let invited_player_id = named_invitees
-            .get(&participant.seat_number)
-            .map(|player| player.id.as_str());
+        let invited_player = named_invitees.get(&participant.seat_number);
         persistence::create_invitation(
             &state.db,
             &Uuid::new_v4().to_string(),
             &game.id,
-            invited_player_id,
+            invited_player.map(|player| player.id.as_str()),
             &creator_player_id,
             participant.seat_number,
         )
         .await
         .map_err(ApiProblem::from_sqlx)?;
+
+        if let (Some(invited_player), Some(creator_display_name)) = (invited_player, &creator_display_name) {
+            crate::email::send_invitation(
+                &state.email,
+                &invited_player.email,
+                &invited_player.display_name,
+                creator_display_name,
+                &state.public_base_url,
+            )
+            .await;
+        }
     }
 
     tracing::info!(
@@ -5118,6 +5141,104 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Captures everything logged via `tracing` while `_guard` is alive.
+    /// Used to verify `crate::email::send_*` actually fired — with no
+    /// `RESEND_API_KEY` configured in tests, a send logs the full message
+    /// (see `EmailConfig`'s doc comment) instead of calling out over the
+    /// network, which this reads back instead of standing up a mock server.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("log output should be utf8")
+        }
+    }
+
+    /// This is a regression test for a real bug found in production
+    /// 2026-07-18: `invite_player_to_game` had email wiring, but
+    /// `create_game` — the *only* path the UI's initial draft builder
+    /// actually calls, and so the only place a named invitation is created
+    /// in practice — didn't, so nobody who got invited into a brand-new
+    /// game ever received an email, only someone invited into an
+    /// already-existing one (a code path the UI doesn't expose at all).
+    #[tokio::test]
+    async fn creating_a_game_with_a_named_invitee_emails_them() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state);
+
+        let alice = register_player(app.clone(), "Alice").await;
+        register_player(app.clone(), "Bob").await;
+
+        let log = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            "/games",
+            Some(&alice.session_token),
+            &CreateGameRequest {
+                seats: vec![
+                    CreateSeatRequest {
+                        kind: SeatKind::Human,
+                        display_name: "Alice".to_string(),
+                        engine_id: None,
+                        claim: Some(SeatClaim::Creator),
+                    },
+                    CreateSeatRequest {
+                        kind: SeatKind::Human,
+                        display_name: "Bob".to_string(),
+                        engine_id: None,
+                        claim: Some(SeatClaim::Named {
+                            display_name: "Bob".to_string(),
+                        }),
+                    },
+                ],
+                seed: Some(1),
+                variant: None,
+                language: None,
+                board_layout: None,
+                move_time_limit_seconds: None,
+            },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        drop(_guard);
+        let log_text = log.text();
+        assert!(
+            log_text.contains("bob@example.com"),
+            "expected an email addressed to bob@example.com, got log:\n{log_text}"
+        );
+        assert!(
+            log_text.contains("invited you"),
+            "expected the invitation email's subject/body, got log:\n{log_text}"
+        );
     }
 
     #[tokio::test]
