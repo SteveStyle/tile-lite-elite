@@ -6,9 +6,13 @@ set -euo pipefail
 # just without the ssh/scp hop to the real VM. See docs/3.3-testing-and-staging.md's
 # "Staging Environment" section for why this exists and how to use it.
 #
+# Every mode builds from a committed HEAD, never a dirty working tree — see
+# the "no uncommitted changes" check near the bottom. Commit first (a WIP
+# commit is fine, nothing here gets pushed).
+#
 # Usage:
 #   ./scripts/deploy-staging.sh              # build + (re)start the staging
-#                                             # stack from the current working tree
+#                                             # stack from the current HEAD
 #   ./scripts/deploy-staging.sh down         # stop the staging stack, keep its data
 #   ./scripts/deploy-staging.sh reset        # stop the staging stack and wipe its data
 #   ./scripts/deploy-staging.sh at <git-ref> # wipe staging, then build + start
@@ -156,6 +160,17 @@ if [[ "$MODE" == "at" ]]; then
   echo "    Back to the current working tree: ./scripts/deploy-staging.sh"
   echo "    Verify it matches production:     ./scripts/deploy-staging.sh verify"
   exit 0
+fi
+
+# Staging only ever deploys a real commit too, same reasoning as deploy.sh
+# — otherwise "staging is running X" is only true by coincidence (whatever
+# was on disk at build time), not something `at <ref>`/`verify` can actually
+# trust later. Commit first (a WIP commit is fine — this is local, nothing
+# is pushed) rather than testing uncommitted changes here.
+if [[ -n "$(git status --porcelain)" ]]; then
+  echo "error: working tree has uncommitted changes — deploy-staging.sh only builds from a committed HEAD. Commit (even a WIP one) or stash first:" >&2
+  git status --short >&2
+  exit 1
 fi
 
 # Same build-metadata wiring as scripts/deploy.sh — see
