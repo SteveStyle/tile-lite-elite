@@ -1,6 +1,9 @@
 use api::{BoardCellDto, GameStatus, SeatKind};
 use serde::{Deserialize, Serialize};
-use sqlx::{Pool, Row, Sqlite, sqlite::SqliteConnectOptions, sqlite::SqlitePoolOptions};
+use sqlx::{
+    Pool, Row, Sqlite,
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+};
 use std::str::FromStr;
 
 use crate::game_state::{ChatMessageRecord, GameSession, MoveRecord, ParticipantState, board_from_dto};
@@ -149,7 +152,15 @@ fn default_move_time_limit_seconds() -> u64 {
 }
 
 pub async fn connect(database_url: &str) -> Result<Pool<Sqlite>, sqlx::Error> {
-    let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+    // WAL rather than the default rollback-journal mode: readers (game
+    // fetches, the games list, WebSocket state pushes) no longer block
+    // behind a writer's transaction, which matters once more than a
+    // handful of players are active concurrently. Persists in the database
+    // file itself once set — see docs/4.1-configuration.md's "Infrastructure
+    // Configuration" section for the pragma verification this replaced.
+    let options = SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
         .connect_with(options)

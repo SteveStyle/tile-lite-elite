@@ -68,7 +68,9 @@ RUN cd crates/ui && CARGO_INCREMENTAL=0 TILE_LITE_ELITE_API_BASE_URL="" dx build
 # ---------------------------------------------------------------------------
 
 FROM debian:bookworm-slim AS runtime-server
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# curl is otherwise unused here — pulled in solely so HEALTHCHECK below has
+# something to hit /health with, without reaching for a heavier base image.
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data
 
@@ -81,6 +83,11 @@ COPY --from=builder /workspace/target/release/tile-lite-elite-admin /usr/local/b
 # loopback connection from inside this container, satisfying the server's
 # existing loopback-only guard on /admin/* without weakening it.
 EXPOSE 3000
+# Gives `docker compose ps`/orchestration a real "unhealthy" signal instead
+# of only "still running" — a hung server (e.g. deadlocked on the DB pool)
+# would otherwise look identical to a working one until a request failed.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
+    CMD curl -f http://localhost:3000/health || exit 1
 ENTRYPOINT ["/usr/local/bin/server-game"]
 
 # ---------------------------------------------------------------------------
@@ -89,3 +96,8 @@ FROM caddy:2-alpine AS runtime-web
 COPY --from=builder /workspace/target/dx/tile-lite-elite-ui/release/web/public /srv
 COPY Caddyfile /etc/caddy/Caddyfile
 EXPOSE 80
+# Goes through the same reverse-proxy path a real client uses, so this
+# checks both "Caddy is up" and "Caddy can actually reach the server" —
+# alpine's busybox wget is already present, no extra package needed.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
+    CMD wget --no-verbose --tries=1 --spider http://localhost/health || exit 1
