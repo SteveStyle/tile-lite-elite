@@ -391,6 +391,13 @@ button:disabled {
        just at two discrete values, not a continuously shrinking one.
     */
     border-radius: 28%;
+    /* Lets `.tile-face` below size its font off *this* element's actual
+       rendered width (cqw) instead of viewport width -- a cell's own
+       size already varies continuously with viewport (see below), and
+       vw doesn't track that at all once other layout (side panels,
+       padding, gaps) eats into how much of the viewport the board
+       itself actually gets. */
+    container-type: inline-size;
     /* Deliberately no min-height: `.board-grid`'s matching
        grid-template-rows/-columns (both `repeat(15, minmax(0, 1fr))`)
        plus its aspect-ratio already guarantee every cell is a true square
@@ -514,7 +521,16 @@ button:disabled {
     display: flex;
     justify-content: center;
     align-items: center;
-    font-size: clamp(1rem, 2vw, 1.45rem);
+    /* `cqw` (of `.board-cell`'s own inline-size, via its container-type
+       above), not `vw`: on essentially every phone width, `2vw` computes
+       well under 1rem, so the *floor* of the old clamp(1rem, 2vw, 1.45rem)
+       was what actually rendered nearly everywhere on mobile -- a fixed
+       16px letter regardless of how small the cell really was. Against a
+       realistic ~20px mobile cell that's 80% of the box on the letter
+       alone, leaving `.tile-value` nowhere real to sit. cqw tracks the
+       cell's *actual* rendered size directly, so the letter now
+       genuinely shrinks on a small cell instead of floor-clamping. */
+    font-size: clamp(0.5rem, 70cqw, 1.45rem);
 }
 
 /* The rack's `.tile-face` exists purely to give `.tile-value` the same
@@ -534,6 +550,18 @@ button:disabled {
     font-weight: 700;
     line-height: 1;
     opacity: 0.7;
+}
+
+/* Queries `.board-cell`'s own inline-size (its nearest `container-type`
+   ancestor, unqualified so this doesn't need to name it) — below this,
+   even a proportionally scaled value has nowhere legible left to sit
+   next to the letter, so it's better dropped than crammed in illegibly.
+   The rack's tiles are unaffected: `.rack-tile` isn't a query container,
+   so this can't match a `.tile-value` there regardless of rack size. */
+@container (max-width: 20px) {
+    .tile-value {
+        display: none;
+    }
 }
 
 .rack-strip {
