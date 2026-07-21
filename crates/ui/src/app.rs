@@ -35,6 +35,12 @@ const WEBSOCKET_RETRY_MS: u64 = 3000;
 /// message, an opponent's move — wouldn't otherwise show up until the
 /// player manually hits Refresh.
 const GAME_LIST_POLL_MS: u64 = 10_000;
+/// Extra attempts `with_network_retry` makes after an initial failed one —
+/// covers a single dropped mobile-network request without the user having
+/// to notice a "Can't reach the server" message and retry by hand.
+const NETWORK_RETRY_ATTEMPTS: u32 = 2;
+/// Delay before each retry in `with_network_retry`.
+const NETWORK_RETRY_DELAY_MS: u64 = 700;
 
 /// Whether the app can currently reach the backend at all — set by the
 /// HTTP helpers (`get_json`/`post_json`) and the WebSocket subscription the
@@ -1741,6 +1747,7 @@ pub(crate) async fn register_player(
     email: &str,
     password: &str,
     stay_logged_in: bool,
+    retry_message: Signal<Option<String>>,
 ) -> Result<api::PlayerSessionDto, String> {
     let request = api::RegisterPlayerRequest {
         display_name: display_name.to_string(),
@@ -1748,7 +1755,8 @@ pub(crate) async fn register_player(
         password: password.to_string(),
         stay_logged_in,
     };
-    post_json(&format!("{server_url}/auth/register"), None, &request).await
+    let url = format!("{server_url}/auth/register");
+    with_network_retry(retry_message, || post_json(&url, None, &request)).await
 }
 
 pub(crate) async fn login_player(
@@ -1756,13 +1764,15 @@ pub(crate) async fn login_player(
     display_name: &str,
     password: &str,
     stay_logged_in: bool,
+    retry_message: Signal<Option<String>>,
 ) -> Result<api::PlayerSessionDto, String> {
     let request = api::LoginPlayerRequest {
         display_name: display_name.to_string(),
         password: password.to_string(),
         stay_logged_in,
     };
-    post_json(&format!("{server_url}/auth/login"), None, &request).await
+    let url = format!("{server_url}/auth/login");
+    with_network_retry(retry_message, || post_json(&url, None, &request)).await
 }
 
 pub(crate) async fn change_password(
@@ -2228,6 +2238,61 @@ fn mark_online() {
     if !*IS_ONLINE.read() {
         *IS_ONLINE.write() = true;
     }
+}
+
+/// Caps how long a single attempt inside `with_network_retry` can take. A
+/// dropped-then-suspended mobile request (backgrounded tab) can otherwise
+/// sit forever without either resolving or rejecting, which would leave
+/// `is_submitting` stuck `true` — and the submit button disabled — with no
+/// error ever arriving to trigger a retry.
+const NETWORK_ATTEMPT_TIMEOUT_MS: u64 = 8_000;
+
+async fn with_attempt_timeout<T>(
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    use futures_util::future::{Either, select};
+    futures_util::pin_mut!(fut);
+    let timeout = sleep_ms(NETWORK_ATTEMPT_TIMEOUT_MS);
+    futures_util::pin_mut!(timeout);
+    match select(fut, timeout).await {
+        Either::Left((result, _)) => result,
+        Either::Right(_) => Err(mark_offline()),
+    }
+}
+
+/// Retries `attempt` a few times, but only while it keeps failing with
+/// `UNREACHABLE_MESSAGE` — a single dropped request (a mobile network blip
+/// mid-flight) shouldn't leave the caller stuck with nothing to do but
+/// notice a small error message and retry by hand. A genuine rejection
+/// (wrong password, taken email, ...) comes back as a different message and
+/// is returned immediately, since trying again can't change that outcome.
+/// Each attempt is individually time-capped (see `with_attempt_timeout`) so
+/// a hung request can't keep this — and the caller's "submitting" state —
+/// stuck indefinitely. `retry_message` is set to a user-visible status
+/// between attempts and always cleared before returning, so the caller
+/// doesn't need its own bookkeeping to know when retrying has stopped.
+async fn with_network_retry<T, F, Fut>(
+    mut retry_message: Signal<Option<String>>,
+    mut attempt: F,
+) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    retry_message.set(None);
+    let mut result = with_attempt_timeout(attempt()).await;
+    for attempt_number in 1..=NETWORK_RETRY_ATTEMPTS {
+        if !matches!(&result, Err(error) if error == UNREACHABLE_MESSAGE) {
+            break;
+        }
+        retry_message.set(Some(format!(
+            "Having trouble reaching the server — retrying ({attempt_number}/{NETWORK_RETRY_ATTEMPTS})…"
+        )));
+        sleep_ms(NETWORK_RETRY_DELAY_MS).await;
+        result = with_attempt_timeout(attempt()).await;
+    }
+    retry_message.set(None);
+    result
 }
 
 #[cfg(not(target_arch = "wasm32"))]

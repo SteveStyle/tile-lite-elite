@@ -22,6 +22,7 @@ fn submit_login_or_register(
     stay_logged_in: Signal<bool>,
     mut is_submitting: Signal<bool>,
     mut error_message: Signal<Option<String>>,
+    retry_message: Signal<Option<String>>,
     on_authenticated: EventHandler<(api::PlayerSessionDto, bool, bool)>,
 ) {
     let name = display_name().trim().to_string();
@@ -43,9 +44,19 @@ fn submit_login_or_register(
         is_submitting.set(true);
         error_message.set(None);
         let outcome = match mode {
-            AuthMode::Login => crate::app::login_player(&server_url, &name, &password_value, stay).await,
+            AuthMode::Login => {
+                crate::app::login_player(&server_url, &name, &password_value, stay, retry_message).await
+            }
             AuthMode::Register => {
-                crate::app::register_player(&server_url, &name, &email_value, &password_value, stay).await
+                crate::app::register_player(
+                    &server_url,
+                    &name,
+                    &email_value,
+                    &password_value,
+                    stay,
+                    retry_message,
+                )
+                .await
             }
         };
         match outcome {
@@ -86,6 +97,7 @@ pub fn AuthPanel(
     let mut remember_me = use_signal(move || has_remembered_name);
     let mut stay_logged_in = use_signal(|| false);
     let mut error_message = use_signal(|| None::<String>);
+    let retry_message = use_signal(|| None::<String>);
     let is_submitting = use_signal(|| false);
 
     let mut show_edit_details = use_signal(|| false);
@@ -400,6 +412,7 @@ pub fn AuthPanel(
                             stay_logged_in,
                             is_submitting,
                             error_message,
+                            retry_message,
                             on_authenticated,
                         );
                     }
@@ -423,6 +436,7 @@ pub fn AuthPanel(
                                 stay_logged_in,
                                 is_submitting,
                                 error_message,
+                                retry_message,
                                 on_authenticated,
                             );
                         }
@@ -447,6 +461,7 @@ pub fn AuthPanel(
                             stay_logged_in,
                             is_submitting,
                             error_message,
+                            retry_message,
                             on_authenticated,
                         );
                     }
@@ -474,6 +489,9 @@ pub fn AuthPanel(
                 "Stay logged in"
             }
 
+            if let Some(message) = retry_message() {
+                p { class: "status-banner", "{message}" }
+            }
             if let Some(error) = error_message() {
                 p { class: "error-banner", "{error}" }
             }
@@ -557,6 +575,7 @@ pub fn AuthPanel(
                             stay_logged_in,
                             is_submitting,
                             error_message,
+                            retry_message,
                             on_authenticated,
                         );
                     },
