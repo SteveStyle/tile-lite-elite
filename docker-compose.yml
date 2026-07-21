@@ -10,6 +10,12 @@ services:
     build:
       context: .
       target: runtime-server
+      args:
+        # Git short SHA, set by scripts/deploy.sh — see docs/operations.md's
+        # "Versioning" section. Empty when built by hand (`docker compose
+        # build` directly), which is fine: it just means no `+build`
+        # suffix on the reported app version.
+        TILE_LITE_ELITE_BUILD_ID: ${TILE_LITE_ELITE_BUILD_ID:-}
     environment:
       TILE_LITE_ELITE_BIND: 0.0.0.0:3000
       TILE_LITE_ELITE_DATABASE_URL: sqlite:///data/tile-lite-elite.sqlite3
@@ -40,6 +46,8 @@ services:
     build:
       context: .
       target: runtime-web
+      args:
+        TILE_LITE_ELITE_BUILD_ID: ${TILE_LITE_ELITE_BUILD_ID:-}
     ports:
       - "80:80"
       - "443:443"

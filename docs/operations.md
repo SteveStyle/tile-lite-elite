@@ -288,22 +288,49 @@ patch/build component here — those never change the wire contract, so
 including them would make the check fire on every routine bugfix deploy.
 
 **App/build version** (`Major.Minor.Patch[+build]`) — `Major.Minor.Patch`
-comes straight from each crate's `Cargo.toml` `version` (currently `0.1.0`
-everywhere). An optional `+<build>` suffix (standard SemVer build
-metadata) is appended when `TILE_LITE_ELITE_BUILD_ID` is set at compile time —
-e.g. a git short SHA or CI run number, for telling internal/test builds
-apart:
+comes straight from each crate's `Cargo.toml` `version` (currently `0.2.0`
+everywhere — bumped 2026-07-21, the first bump since the project started;
+not touched routinely before that). Bump it by hand as part of any session
+that ships a meaningful chunk of work — patch for fixes, minor for new
+functionality, same convention as the API contract version below. An
+optional `+<build>` suffix (standard SemVer build metadata) is appended
+when `TILE_LITE_ELITE_BUILD_ID` is set at compile time — e.g. a git short
+SHA or CI run number, for telling internal/test builds apart:
 
 ```bash
 # Internal/test build with a build id
 TILE_LITE_ELITE_BUILD_ID=$(git rev-parse --short HEAD) cargo build -p server-game --release
 
-# Production release — no build id set, shows "0.1.0" not "0.1.0+..."
+# Production release — no build id set, shows "0.2.0" not "0.2.0+..."
 cargo build -p server-game --release
 ```
 
-`server-game` logs its app version alongside the API version at startup;
-the desktop client puts its app version in the window title.
+Both `scripts/deploy.sh` and `scripts/deploy-staging.sh` (see [Staging
+Environment](#staging-environment)) set `TILE_LITE_ELITE_BUILD_ID`
+automatically from `git rev-parse --short HEAD` and pass it through to
+`docker compose build` as a build arg (`docker-compose.yml`'s
+`build.args`, plumbed into the image in `Dockerfile`) — every image built
+through either script carries the exact commit it came from without any
+manual step. Building by hand (`docker compose build` directly) is still
+supported and just omits the suffix.
+
+`server-game` logs its app version alongside the API version at startup,
+and also serves it in the `app_version` field of `GET /health`'s response
+body (`api::HealthDto`); the desktop client puts its app version in the
+window title. All three are visible at a glance without needing to
+cross-reference git history against deploy timestamps — and `/health`
+specifically is what [Staging Environment](#staging-environment)'s
+`deploy-staging.sh at prod`/`verify` read to find out which commit is
+actually live.
+
+**A reminder for the API contract version specifically**: the only
+production client today is the wasm build shipped in the same image as
+the server, so it's always in step and a mismatch has never actually been
+observed. That won't stay true forever (a desktop build lagging behind a
+server redeploy, for instance), so the discipline of actually bumping
+`api::API_VERSION` when a route or DTO changes — not just leaving it at
+`1.0` because nothing's failed yet — is worth building as a habit now,
+before there's a client old enough for it to matter.
 
 ## Logging
 
@@ -412,6 +439,109 @@ docker run --rm -v tile-lite-elite-data:/data -v "$PWD":/backup debian \
 docker run --rm -v tile-lite-elite-data:/data debian \
   sh -c 'rm -f /data/tile-lite-elite.sqlite3 /data/tile-lite-elite.sqlite3-wal /data/tile-lite-elite.sqlite3-shm'
 ```
+
+### Staging Environment
+
+`docker-compose.staging.yml`, `Caddyfile.staging`, and
+`scripts/deploy-staging.sh` run the exact same images `scripts/deploy.sh`
+would ship to production, but locally (e.g. inside WSL) instead of on the
+Oracle VM. The point: catch "does this migration actually apply, does the
+server boot" before either ever reaches the real VM, rather than finding
+out live. It's a standalone compose file rather than a `docker-compose.yml`
+*override* — Compose's default merge behavior concatenates list fields
+like `ports`/`volumes` instead of replacing them, which is an easy way to
+silently end up trying to bind host ports 80/443 anyway; a full copy is
+clearer given how much of the shape (no TLS, no domain, different host
+port, no cert volumes) already diverges from production.
+
+```bash
+./scripts/deploy-staging.sh              # build + (re)start the staging stack
+./scripts/deploy-staging.sh down         # stop it, keep its data
+./scripts/deploy-staging.sh reset        # stop it and wipe its data
+./scripts/deploy-staging.sh at <git-ref> # wipe + deploy a specific commit/tag/branch
+./scripts/deploy-staging.sh at prod      # wipe + deploy whatever commit production is running
+./scripts/deploy-staging.sh verify       # confirm staging is running the same version as production
+```
+
+Staging is then reachable at `http://localhost:8081` — deliberately not
+`8080`, which is the local dev web server's port (`TILE_LITE_ELITE_UI_PORT`
+above / `scripts/services.sh`'s `dx serve --port 8080`), so staging can run
+alongside routine dev work without a clash. Plain HTTP, no domain, since
+there's nothing to provision a Let's Encrypt certificate against locally
+(`Caddyfile.staging` is `Caddyfile`'s same routing on a bare `:80` block
+instead). Its SQLite database lives on its own named
+volume (`tile-lite-elite-staging-data`), entirely separate from
+production's — nothing this script does can touch real data.
+
+**This is what actually makes it useful for testing a migration**: the
+staging volume persists across ordinary runs, the same way production's
+does. Running `deploy-staging.sh` again against an already-seeded staging
+database is what exercises "does a new migration apply cleanly to an
+*existing* database" — the exact failure mode that bit production three
+times before real migrations existed (see `schema.md`'s "Schema
+migrations" note). A fresh `docker compose up` on an empty volume would
+only ever apply every migration to nothing, which proves much less.
+`reset` wipes it deliberately, for those times a clean slate actually is
+what's wanted (or after a deliberate schema-breaking experiment during
+development).
+
+To test against a realistic copy of production data rather than whatever
+staging has organically accumulated, restore a production backup into
+`tile-lite-elite-staging-data` first, using the same volume backup/restore
+approach as ["Resetting the Database"](#resetting-the-database) above,
+just naming the staging volume instead of `tile-lite-elite-data`.
+
+**Deploying a specific version** (`./scripts/deploy-staging.sh at <git-ref>`):
+wipes the staging volume, then builds from that ref instead of the current
+working tree, via a throwaway `git worktree` (`git worktree add --detach`
+into a `mktemp -d` directory, always removed again on exit, success or
+failure — this never touches the actual repo's branch or any
+staged/uncommitted changes). Because `sqlx::migrate!("./migrations")` is a
+compile-time macro (`persistence.rs`), the resulting image only knows
+about whatever migration files existed in the repo *at that commit* — so
+this genuinely replays "start from empty, apply each migration up to this
+point," not just a relabeled current build. Useful for checking out an
+old release's actual behavior, or for bisecting when in a chain of
+migrations something started going wrong.
+
+This is also the practical answer to "can a bad migration be reverted":
+not in place — `sqlx::migrate!` only ever applies pending "up" migrations
+(see the migrations `README.md`), there's no `down.sql`/`sqlx migrate
+revert` wired in here, and per that README's own rule, editing or deleting
+an already-applied migration file makes the server **refuse to boot**
+(checksum mismatch) rather than undo anything. The real revert is at the
+volume level: wipe and redeploy at the last known-good ref (`at
+<git-ref>`), or restore a pre-migration volume snapshot per the paragraph
+above. Both discard the attempted migration's effects entirely rather than
+trying to reverse its SQL.
+
+**Matching staging to production exactly** (`./scripts/deploy-staging.sh
+at prod`): a plain `at <git-ref>` still needs you to already know which
+commit production is on. `at prod` finds that out itself — it reads
+`app_version` off `https://tileliteelite.com/health` (`Major.Minor.Patch+<short-sha>`,
+the same format `scripts/deploy.sh` bakes in on every deploy — see
+[Versioning](#versioning)), pulls the commit out of the `+<short-sha>`
+suffix, and deploys exactly that, same as passing it explicitly. Fails
+loudly rather than guessing if the suffix is missing (a server that was
+built without going through `deploy.sh`/`deploy-staging.sh`, so it never
+got a build id — this is also, incidentally, why `app_version` is worth
+checking rather than assuming: it's the one place that distinguishes "the
+image `deploy.sh` produced" from "someone built and ran the container by
+hand"). `./scripts/deploy-staging.sh verify` does the read-only half of
+the same check on its own — fetches both `/health` endpoints and confirms
+staging's `app_version` matches production's, without touching anything —
+useful as a quick sanity check right before trusting staging as a stand-in
+for prod, in case it's quietly drifted since the last `at prod`. Both read
+`https://tileliteelite.com` by default; override with `PROD_URL` if that
+ever needs to point elsewhere.
+
+Workflow for a schema change: write the migration, verify it locally
+against the dev DB (`cargo run -p server-game`, per the migrations
+`README.md`'s rules), `./scripts/deploy-staging.sh at prod` to bring
+staging to exactly what's live right now, `./scripts/deploy-staging.sh`
+(no argument) to redeploy the new migration from the current working tree
+on top of that — the realistic "existing database gets a new migration"
+case — then `./scripts/deploy.sh` once that's confirmed clean.
 
 ### Oracle Cloud VM setup
 

@@ -1,0 +1,64 @@
+# Local staging stack — builds and runs the exact same images
+# scripts/deploy.sh would ship to production, but on this machine (e.g.
+# inside WSL) instead of the Oracle VM, against its own persistent data
+# volume. The point: catch "does this migration actually apply, does the
+# server boot" before either ever reaches the real VM. See
+# docs/operations.md's "Staging Environment" section for the full workflow.
+#
+# A standalone file rather than a docker-compose.yml *override*: Compose's
+# merge rules for list fields (ports, volumes) concatenate rather than
+# replace by default, which is an easy way to silently end up trying to
+# bind host ports 80/443 anyway. This stack's shape (no TLS, no domain,
+# different host port, no cert volumes) diverges enough from production
+# that a full copy is clearer and less fragile than a partial one.
+name: tile-lite-elite-staging
+
+services:
+  server:
+    build:
+      context: .
+      target: runtime-server
+      args:
+        TILE_LITE_ELITE_BUILD_ID: ${TILE_LITE_ELITE_BUILD_ID:-}
+    environment:
+      TILE_LITE_ELITE_BIND: 0.0.0.0:3000
+      TILE_LITE_ELITE_DATABASE_URL: sqlite:///data/tile-lite-elite.sqlite3
+      TILE_LITE_ELITE_PUBLIC_BASE_URL: http://localhost:8081
+      # Same fallback behavior as local dev: unset means every
+      # email-triggering flow still works, it just logs the message
+      # instead of sending it (crates/server-game/src/email.rs).
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM_ADDRESS: ${RESEND_FROM_ADDRESS:-Tile Lite Elite <noreply@mail.tileliteelite.com>}
+    volumes:
+      - tile-lite-elite-staging-data:/data
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      target: runtime-web
+      args:
+        TILE_LITE_ELITE_BUILD_ID: ${TILE_LITE_ELITE_BUILD_ID:-}
+    ports:
+      # 8081, not 8080 — 8080 is the local dev web server's port
+      # (scripts/services.sh's `dx serve --port 8080`), so staging needs a
+      # different one to run alongside routine dev work without a clash.
+      - "8081:80"
+    volumes:
+      # Swaps out the image's baked-in production Caddyfile (real domain,
+      # automatic HTTPS) for a plain-HTTP one — there's no domain to
+      # provision a Let's Encrypt cert for on a local machine.
+      - ./Caddyfile.staging:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  # Deliberately persists across `docker compose down` / re-runs, same as
+  # production's tile-lite-elite-data — running deploy-staging.sh again
+  # against an already-seeded staging DB is what actually exercises "does a
+  # new migration apply to an existing database", not just a fresh one.
+  # `./scripts/deploy-staging.sh reset` wipes it on purpose when you want a
+  # clean slate.
+  tile-lite-elite-staging-data:
+    name: tile-lite-elite-staging-data

@@ -46,6 +46,16 @@ RUN mkdir -p /utils/src \
     && printf '[package]\nname = "srm-utils"\nversion = "0.2.3"\nedition = "2021"\n' > /utils/Cargo.toml \
     && touch /utils/src/lib.rs
 
+# Baked into both binaries via `option_env!` (see each crate's
+# `app_version()`) as SemVer build metadata, e.g. `0.2.0+a1c9f02`. Passed
+# through from docker-compose.yml's `build.args`, which scripts/deploy.sh
+# sets to the current git short SHA — see docs/operations.md's
+# "Versioning" section. Placed just before the two build steps below
+# rather than at the top of the stage, so a rebuild of the same commit
+# (same ARG value) still hits Docker's layer cache.
+ARG TILE_LITE_ELITE_BUILD_ID
+ENV TILE_LITE_ELITE_BUILD_ID=${TILE_LITE_ELITE_BUILD_ID}
+
 RUN cargo build --release -p server-game -p admin-cli
 
 # Built with an empty API base URL baked in — the client then talks to

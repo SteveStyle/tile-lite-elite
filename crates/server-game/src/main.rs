@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use server_game::email::EmailConfig;
-use server_game::{AppState, build_router};
+use server_game::{AppState, app_version, build_router};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,45 +50,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     Ok(())
-}
-
-/// The `Major.Minor.Patch` release version from Cargo.toml, plus an
-/// optional build identifier appended as SemVer build metadata (`+<id>`)
-/// when `TILE_LITE_ELITE_BUILD_ID` is set at compile time — e.g. a git short
-/// SHA or CI run number, for telling internal/test builds apart. A
-/// production release simply doesn't set that var, so it shows only the
-/// three numbers. Distinct from `api::API_VERSION`: this is the build
-/// identity, not the wire-contract version clients check on connect.
-fn app_version() -> String {
-    format_app_version(env!("CARGO_PKG_VERSION"), option_env!("TILE_LITE_ELITE_BUILD_ID"))
-}
-
-fn format_app_version(pkg_version: &str, build_id: Option<&str>) -> String {
-    match build_id {
-        Some(id) if !id.is_empty() => format!("{pkg_version}+{id}"),
-        _ => pkg_version.to_string(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_build_id_is_three_numbers_only() {
-        assert_eq!(format_app_version("0.1.0", None), "0.1.0");
-    }
-
-    #[test]
-    fn empty_build_id_is_treated_as_absent() {
-        assert_eq!(format_app_version("0.1.0", Some("")), "0.1.0");
-    }
-
-    #[test]
-    fn build_id_appends_as_semver_build_metadata() {
-        assert_eq!(
-            format_app_version("0.1.0", Some("a1c9f02")),
-            "0.1.0+a1c9f02"
-        );
-    }
 }

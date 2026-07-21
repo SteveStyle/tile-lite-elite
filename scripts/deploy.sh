@@ -32,7 +32,13 @@ REMOTE="$DEPLOY_USER@$DEPLOY_HOST"
 
 cd "$REPO_DIR"
 
-echo "==> Building images locally (this is the slow step, ~2-3 min)"
+# Baked into both binaries as SemVer build metadata (e.g. `0.2.0+a1c9f02`) —
+# see docs/operations.md's "Versioning" section. A dirty working tree still
+# builds (this only tags *which commit*, it doesn't block on uncommitted
+# changes), but the SHA won't reflect uncommitted edits.
+export TILE_LITE_ELITE_BUILD_ID="$(git rev-parse --short HEAD)"
+
+echo "==> Building images locally (this is the slow step, ~2-3 min) [build $TILE_LITE_ELITE_BUILD_ID]"
 docker compose build
 
 echo "==> Exporting images"

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// compatibility check fire on every routine bugfix deploy. Release/build
 /// numbering for display purposes is a separate concern — see each
 /// binary's own `app_version()`.
-pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 0 };
+pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 1 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiVersion {
@@ -32,6 +32,12 @@ impl std::fmt::Display for ApiVersion {
 pub struct HealthDto {
     pub status: String,
     pub api_version: ApiVersion,
+    /// `Major.Minor.Patch[+build]` — see `server-game`'s `app_version()`.
+    /// Lets anything that can reach `/health` (a human with `curl`, a
+    /// deploy script) find out exactly which commit is live without SSHing
+    /// in to grep startup logs — e.g. `scripts/deploy-staging.sh at prod`
+    /// reads this to bring staging to the same version as production.
+    pub app_version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
