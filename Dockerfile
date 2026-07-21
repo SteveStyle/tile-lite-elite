@@ -96,8 +96,17 @@ FROM caddy:2-alpine AS runtime-web
 COPY --from=builder /workspace/target/dx/tile-lite-elite-ui/release/web/public /srv
 COPY Caddyfile /etc/caddy/Caddyfile
 EXPOSE 80
-# Goes through the same reverse-proxy path a real client uses, so this
-# checks both "Caddy is up" and "Caddy can actually reach the server" —
-# alpine's busybox wget is already present, no extra package needed.
+# NOT going through the public :80/:443 site — verified live against
+# production that a bare loopback probe there fails: Caddy's global
+# HTTP->HTTPS auto-redirect fires for any Host on :80, including one that
+# matches none of the configured hostnames, and the TLS handshake on :443
+# then fails (no cert for that SNI). Staging's Caddyfile.staging has no
+# TLS/redirect at all, so this bug only showed up once actually deployed
+# to production — a real lesson in why "verified" means checked against
+# the environment that actually differs, not just checked anywhere.
+# Caddy's admin API is the reliable signal instead: alive + config loaded.
+# Must be 127.0.0.1, not localhost — the admin listener is IPv4-only, and
+# busybox wget resolves "localhost" to the IPv6 loopback first, which
+# gets a misleading "connection refused" instead of actually probing it.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD wget --no-verbose --tries=1 --spider http://localhost/health || exit 1
+    CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:2019/config/ || exit 1
