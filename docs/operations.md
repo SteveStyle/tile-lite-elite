@@ -326,7 +326,7 @@ In the container deployment, this all goes to `docker compose logs server` (or `
 
 ## Resetting the Database
 
-Occasionally useful during development — for example, after a schema change that only takes effect on a fresh database (see the migration limitation note in `schema.md`), or just to clear out test data.
+Ordinary schema changes no longer need this — real, versioned migrations (`crates/server-game/migrations/`, see `schema.md`'s "Schema migrations" note) apply automatically to an existing database on next startup. This is still occasionally useful during development for other reasons: clearing out test/dev data entirely, or resetting local state after experimenting with a migration.
 
 ```bash
 ./scripts/services.sh stop
@@ -388,7 +388,7 @@ This builds both images locally, `docker save`s and gzips them, `scp`s them plus
 
 There's no CI and no registry involved — this is a manual, on-demand push from a developer machine, appropriate for a hobby project's actual deploy frequency. Worth revisiting (e.g. push to a registry, `docker compose pull` on the VM instead of scp/load) if that ever changes.
 
-If the change involves schema changes then the database should be backed up and then removed.  It will be recreated when the updated server starts to run.
+Schema changes ship via real, versioned migrations (`crates/server-game/migrations/`, see `schema.md`) that apply automatically to the existing production database the moment the new server starts — **wiping the database is no longer a normal part of shipping a schema change**, and doing it destroys real data once there is any. This is the actual fix for a recurring incident: an earlier ad-hoc `create table if not exists` scheme silently failed to alter an already-existing table, which broke production three times before real migrations existed — see `schema.md`'s "Schema migrations" note for the full history. The only remaining case for wiping production is a genuine "start over" decision (e.g. pre-launch testing, as opposed to an ordinary schema change), and even then, back up first:
 
 ```bash
 ssh tile-lite-elite
@@ -405,8 +405,8 @@ docker compose down
 docker run --rm -v tile-lite-elite-data:/data -v "$PWD":/backup debian \
   tar czf /backup/tile-lite-elite-data-$(date +%Y%m%d).tgz -C /data .
 
-# 3. Clear the old DB from the volume so the new server starts fresh
-#    (create_if_missing(true) recreates it with the new schema on next
+# 3. Clear the DB from the volume so the new server starts fresh
+#    (create_if_missing(true) recreates it, migrations included, on next
 #    start). Renaming aside instead of deleting, if you'd rather keep a
 #    copy in place as well as the tarball:
 docker run --rm -v tile-lite-elite-data:/data debian \
