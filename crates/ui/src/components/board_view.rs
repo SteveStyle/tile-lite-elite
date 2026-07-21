@@ -97,7 +97,16 @@ pub fn BoardView(
                     }
                 },
                 onclick: move |_| {
-                    if is_selectable {
+                    // A tap has no equivalent to a desktop right-click, so a
+                    // staged (not-yet-submitted) tile is picked back up on a
+                    // plain tap instead — the only way to undo a single
+                    // misplaced tile on a touch device would otherwise be
+                    // "Clear" (which drops the whole staged word). Mirrors
+                    // `oncontextmenu` below, including re-selecting the
+                    // freed cell (see `on_remove_staged` in app.rs).
+                    if is_staged {
+                        on_remove_staged.call(index);
+                    } else if is_selectable {
                         on_select_cell.call(index);
                     }
                 },
