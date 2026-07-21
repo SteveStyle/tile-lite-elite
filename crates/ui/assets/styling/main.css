@@ -379,7 +379,18 @@ button:disabled {
 
 .board-cell {
     border: none;
-    border-radius: 14px;
+    /* Percentage, not a fixed px value: a board-cell's own size isn't
+       fixed either (it's whatever 1/15th of the square board computes to
+       at the current viewport width, per the grid-template-rows/-columns
+       note below) — a fixed border-radius that looked right against a
+       ~49px desktop cell (14px, ~29% of the box) is wildly oversized
+       against a ~13-16px mobile one, rounding the corners into a full
+       circle instead of a subtly-rounded square. `.rack-tile` doesn't
+       have this problem and stays on a fixed px radius deliberately —
+       its own size *is* fixed (52px/44px via the mobile media query),
+       just at two discrete values, not a continuously shrinking one.
+    */
+    border-radius: 28%;
     /* Deliberately no min-height: `.board-grid`'s matching
        grid-template-rows/-columns (both `repeat(15, minmax(0, 1fr))`)
        plus its aspect-ratio already guarantee every cell is a true square
@@ -1323,10 +1334,6 @@ button:disabled {
 
     .board-grid {
         gap: 4px;
-    }
-
-    .board-cell {
-        border-radius: 10px;
     }
 
     .premium-label {
