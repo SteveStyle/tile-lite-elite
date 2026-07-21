@@ -523,7 +523,7 @@ async fn start_game(
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
     let caller_player_id = authenticated_player_id(&state, &headers).await;
 
-    let (dto, access) = {
+    {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -549,7 +549,19 @@ async fn start_game(
         }
 
         game.start();
-        run_engine_turns(game, &state.engines, &state.events).await?;
+    }
+
+    // Deliberately released before this — see `run_engine_turns`'s own doc
+    // comment for why holding the lock across the whole multi-turn loop
+    // would starve a WebSocket connection's own read lock for the entire
+    // duration of an all-engine game.
+    run_engine_turns(&state, &game_id).await?;
+
+    let (dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
@@ -872,7 +884,7 @@ async fn submit_action(
 
     expire_overdue_turn(&state, &game_id).await;
 
-    let (dto, access) = {
+    {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -920,8 +932,18 @@ async fn submit_action(
                 .apply_resign(request.seat_number)
                 .map_err(ApiProblem::bad_request)?,
         }
+    }
 
-        run_engine_turns(game, &state.engines, &state.events).await?;
+    // Deliberately released before this — see `run_engine_turns`'s own doc
+    // comment for why holding the lock across the whole multi-turn loop
+    // would starve a WebSocket connection's own read lock.
+    run_engine_turns(&state, &game_id).await?;
+
+    let (dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
@@ -1109,7 +1131,7 @@ async fn suggest_move(
 
     expire_overdue_turn(&state, &game_id).await;
 
-    let (dto, access) = {
+    {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -1160,8 +1182,18 @@ async fn suggest_move(
                 .map_err(ApiProblem::bad_request)?,
             None => game.apply_pass(seat).map_err(ApiProblem::bad_request)?,
         }
+    }
 
-        run_engine_turns(game, &state.engines, &state.events).await?;
+    // Deliberately released before this — see `run_engine_turns`'s own doc
+    // comment for why holding the lock across the whole multi-turn loop
+    // would starve a WebSocket connection's own read lock.
+    run_engine_turns(&state, &game_id).await?;
+
+    let (dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
@@ -2148,27 +2180,47 @@ const ENGINE_TURN_BROADCAST_DELAY: Duration = Duration::from_millis(120);
 /// issuing that request still receives every intermediate move as it's
 /// computed, even though the request itself won't resolve until the whole
 /// game is done.
-async fn run_engine_turns(
-    game: &mut GameSession,
-    engines: &EngineRegistry,
-    events: &broadcast::Sender<GameEventDto>,
-) -> Result<(), ApiProblem> {
+///
+/// Takes `&AppState`/`game_id` and reacquires `state.games`'s write lock
+/// fresh each turn, rather than taking an already-locked `&mut GameSession`
+/// and holding that one lock for the whole loop — holding it continuously
+/// starved every other request needing this lock (most importantly a
+/// WebSocket connection's own read lock in `game_events`) for the entire
+/// multi-turn duration, silently defeating the "subscribe before
+/// triggering" design above: the socket's `state.games.read()` would block
+/// until the whole game had already finished and every broadcast already
+/// sent to nobody. A turn is single-digit milliseconds against the 120ms
+/// pacing gap below, so releasing the lock between turns (before that sleep
+/// and before the broadcast send, both lock-free) still leaves plenty of
+/// room for a pending reader to get in.
+async fn run_engine_turns(state: &AppState, game_id: &str) -> Result<(), ApiProblem> {
     for _ in 0..MAX_ENGINE_TURNS_PER_TRIGGER {
-        let advanced = game
-            .maybe_run_engine_turn(engines, ENGINE_TURN_TIMEOUT)
-            .await
-            .map_err(ApiProblem::bad_request)?;
-        if !advanced {
+        let outcome = {
+            let mut games = state.games.write().await;
+            let Some(game) = games.get_mut(game_id) else {
+                // Game vanished from under us (e.g. deleted concurrently) —
+                // nothing left to advance.
+                return Ok(());
+            };
+            let advanced = game
+                .maybe_run_engine_turn(&state.engines, ENGINE_TURN_TIMEOUT)
+                .await
+                .map_err(ApiProblem::bad_request)?;
+            advanced.then(|| {
+                let dto = game.to_dto();
+                let finished = game.status == api::GameStatus::Finished;
+                (dto, finished)
+            })
+        };
+        let Some((dto, finished)) = outcome else {
             break;
-        }
-        let dto = game.to_dto();
-        let finished = game.status == api::GameStatus::Finished;
+        };
         let event = if finished {
             GameEventDto::GameFinished { game: dto }
         } else {
             GameEventDto::StateUpdated { game: dto }
         };
-        let _ = events.send(event);
+        let _ = state.events.send(event);
         if finished {
             break;
         }
