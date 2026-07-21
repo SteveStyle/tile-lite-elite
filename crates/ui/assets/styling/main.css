@@ -356,6 +356,23 @@ button:disabled {
 .board-grid {
     display: grid;
     grid-template-columns: repeat(15, minmax(0, 1fr));
+    /* Without this, rows are sized purely by `.board-cell`'s `min-height`
+       (the only sizing hint Grid has for them, since nothing else sets
+       `grid-auto-rows`), completely independent of column width — so
+       `aspect-ratio: 1` below only keeps the *overall* grid square, not
+       each individual cell. At any viewport narrow enough that 15 columns
+       divide down below the cell's `min-height`, cells become tall,
+       narrow rectangles instead of squares (confirmed measuring an actual
+       mobile-width render: 16px wide × 28px tall) — the oversized letter
+       glyph then has nowhere to go but the cell's full width, leaving the
+       point-value's corner offset with no real corner to sit in, so it
+       reads as overlapping the letter instead of tucked beside it.
+       Matching `grid-template-rows` to the columns makes both dimensions
+       divide the (square, by `aspect-ratio`) grid identically, so every
+       cell is a true square at any viewport width — `.board-cell`'s own
+       `min-height` becomes a rarely-binding safety floor rather than the
+       primary row-sizing mechanism. */
+    grid-template-rows: repeat(15, minmax(0, 1fr));
     gap: 6px;
     aspect-ratio: 1;
 }
@@ -363,7 +380,16 @@ button:disabled {
 .board-cell {
     border: none;
     border-radius: 14px;
-    min-height: 42px;
+    /* Deliberately no min-height: `.board-grid`'s matching
+       grid-template-rows/-columns (both `repeat(15, minmax(0, 1fr))`)
+       plus its aspect-ratio already guarantee every cell is a true square
+       at any viewport width. An explicit min-height here would still win
+       over that — minmax(0, 1fr) only suppresses the row track's own
+       *automatic* content-based minimum, not an item's own explicit
+       min-height — forcing rows taller than columns are wide the moment
+       the viewport got narrow enough for 1fr to compute below the old
+       fixed value, which is exactly the non-square-cell bug this
+       comment's neighbors describe. */
     display: flex;
     justify-content: center;
     align-items: center;
@@ -1300,7 +1326,6 @@ button:disabled {
     }
 
     .board-cell {
-        min-height: 28px;
         border-radius: 10px;
     }
 
