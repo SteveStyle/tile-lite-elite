@@ -12,7 +12,7 @@ set -euo pipefail
 #
 # What this does NOT do, on purpose:
 #   - Restore the Oracle deploy SSH key. That's a secret; copy it back in
-#     by hand (see docs/operations.md's "Development Environment Setup").
+#     by hand (see docs/3.1-setup.md's "Development Environment Setup").
 #   - Enable systemd in WSL. That's a Windows-side /etc/wsl.conf edit
 #     needing a `wsl --shutdown`, which a script running inside the distro
 #     can't safely trigger on itself. This script checks and warns instead.
@@ -100,7 +100,7 @@ fi
 
 cat <<EOF
 
-==> Tooling setup done. Two manual steps left (see docs/operations.md):
+==> Tooling setup done. Two manual steps left (see docs/3.1-setup.md):
     1. Copy your Oracle deploy SSH key back in:
          ~/.ssh/oracle_tile_lite_elite (private) and .pub — from your Windows backup.
     2. Start a new shell (for the docker group to take effect), then verify:

@@ -41,7 +41,7 @@ pub struct AppState {
     /// only for building an absolute link into a password-reset email
     /// (`{public_base_url}/reset-password?token=...`). Everything else the
     /// server does is host-agnostic (see `TILE_LITE_ELITE_API_BASE_URL`'s
-    /// own doc comment in `docs/operations.md` for why the *client* doesn't
+    /// own doc comment in `docs/4.1-configuration.md` for why the *client* doesn't
     /// need this baked in), so this field exists solely for that one link.
     pub public_base_url: String,
     pub email: crate::email::EmailConfig,
@@ -81,7 +81,7 @@ pub fn build_router(state: AppState) -> Router {
     // Admin routes are for operating the server, not for players — no
     // token or account, just "you're on the same machine as the server."
     // The guard below enforces that regardless of what TILE_LITE_ELITE_BIND is
-    // set to (docs/operations.md documents binding to 0.0.0.0 for LAN
+    // set to (docs/3.2-development.md documents binding to 0.0.0.0 for LAN
     // play, which would otherwise expose these to the whole LAN too).
     let admin_routes = Router::new()
         .route("/admin/users", get(admin_list_users))

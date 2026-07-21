@@ -8,7 +8,7 @@ set -euo pipefail
 # (VM.Standard.E2.1.Micro) has 1GB RAM, which isn't enough to compile the
 # Rust/wasm workspace. So this always builds locally (where there's room)
 # and transfers the finished images instead of the source — `docker save`,
-# scp, `docker load`, `docker compose up`. See docs/operations.md's
+# scp, `docker load`, `docker compose up`. See docs/3.4-deployment.md's
 # "Container Deployment" section for the full story, including the Oracle
 # Cloud networking setup this assumes is already in place.
 #
@@ -33,7 +33,7 @@ REMOTE="$DEPLOY_USER@$DEPLOY_HOST"
 cd "$REPO_DIR"
 
 # Baked into both binaries as SemVer build metadata (e.g. `0.2.0+a1c9f02`) —
-# see docs/operations.md's "Versioning" section. A dirty working tree still
+# see docs/4.1-configuration.md's "Versioning" section. A dirty working tree still
 # builds (this only tags *which commit*, it doesn't block on uncommitted
 # changes), but the SHA won't reflect uncommitted edits.
 export TILE_LITE_ELITE_BUILD_ID="$(git rev-parse --short HEAD)"

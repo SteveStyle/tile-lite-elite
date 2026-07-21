@@ -3,7 +3,7 @@ set -euo pipefail
 
 # deploy-staging.sh — Build and run the staging stack locally (e.g. inside
 # WSL), using the exact same Dockerfile/build process as scripts/deploy.sh,
-# just without the ssh/scp hop to the real VM. See docs/operations.md's
+# just without the ssh/scp hop to the real VM. See docs/3.3-testing-and-staging.md's
 # "Staging Environment" section for why this exists and how to use it.
 #
 # Usage:
@@ -32,7 +32,7 @@ set -euo pipefail
 #
 # To test against a realistic copy of production data rather than whatever
 # staging has accumulated on its own, restore a production backup
-# (docs/operations.md's "Resetting the Database" / backup commands) into
+# (docs/3.5-production-support.md's Backups section) into
 # tile-lite-elite-staging-data before running this.
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -159,7 +159,7 @@ if [[ "$MODE" == "at" ]]; then
 fi
 
 # Same build-metadata wiring as scripts/deploy.sh — see
-# docs/operations.md's "Versioning" section.
+# docs/4.1-configuration.md's "Versioning" section.
 export TILE_LITE_ELITE_BUILD_ID="$(git rev-parse --short HEAD)"
 
 echo "==> Building staging images (build $TILE_LITE_ELITE_BUILD_ID)"

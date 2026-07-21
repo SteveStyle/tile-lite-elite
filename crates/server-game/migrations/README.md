@@ -4,7 +4,7 @@ Real, versioned schema migrations, run automatically at server startup via
 sqlx's `Migrator` (`persistence::migrate`, which just wraps
 `sqlx::migrate!("migrations")`). This replaced an ad-hoc `create table if not
 exists` scheme that looked fine but silently failed to apply to an existing
-database three separate times — see `docs/schema.md`'s migration section for
+database three separate times — see `docs/4.2-database-schema.md`'s migration section for
 the full history.
 
 ## Rules

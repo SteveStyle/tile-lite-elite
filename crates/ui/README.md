@@ -2,7 +2,7 @@
 
 Dioxus-based client for the Tile Lite Elite server. Compiles to both a web WASM app and a native desktop app from the same source.
 
-See [docs/operations.md](../../docs/operations.md) for full setup instructions.
+See [docs/3.1-setup.md](../../docs/3.1-setup.md) for dev environment setup and [docs/3.2-development.md](../../docs/3.2-development.md) for day-to-day commands.
 
 ## Quick Start
 
