@@ -1020,30 +1020,78 @@ button:disabled {
     vertical-align: middle;
 }
 
-.player-table td:last-child {
-    text-align: right;
-    white-space: normal;
-}
-
 .player-table th:first-child,
 .player-table td:first-child {
-    width: 38%;
+    width: 24%;
     white-space: normal;
 }
 
-.player-table th:nth-child(2),
-.player-table td:nth-child(2) {
-    width: 10%;
+/* These column-position rules describe the real in-game roster table
+   (Player/Kind/Score/Last move[/Manage]) — the pre-creation draft
+   builder reuses the base `.player-table` class for its own, structurally
+   different 3-column table (Player/Kind/[Remove button]) via the extra
+   `.player-table-draft` class below, so it's deliberately excluded here:
+   applying a Score-column's width/alignment to a Remove *button*'s column
+   squeezed it down to an 11%-wide cell and clipped its own label. */
+
+/* Kind ("Human"/"Bot") and Score (up to 3 digits, bold) both need more
+   room than an even split gives them — narrower than this and the base
+   `.player-table td` rule's `nowrap`/`ellipsis` silently clips real
+   digits/letters off the end instead of just looking a little cramped.
+   Fixed `em` widths rather than `%`, same reasoning as the draft table's
+   own columns below: this table's real container is the ~280-290px-wide
+   in-game roster card (measured live), not the full board-panel width —
+   a `%` tuned by eye against a wider mockup silently clips "Human" to
+   "H…" the moment it renders inside its actual, narrower card. */
+.player-table:not(.player-table-draft) th:nth-child(2),
+.player-table:not(.player-table-draft) td:nth-child(2) {
+    width: 4.2em;
 }
 
-.player-table th:nth-child(3),
-.player-table td:nth-child(3) {
-    width: 8%;
+.player-table:not(.player-table-draft) th:nth-child(3),
+.player-table:not(.player-table-draft) td:nth-child(3) {
+    width: 2.8em;
+    text-align: right;
 }
 
-.player-table th:nth-child(4),
-.player-table td:nth-child(4) {
-    width: 24%;
+/* Right-aligned to match `.player-table-score`/the word+score spans
+   `render_last_move` actually renders — a plain `td:last-child` rule
+   used to cover this, but that only worked by accident (right-aligning
+   whichever column happened to be last), and silently stopped matching
+   Last Move at all once the optional Manage column made it 5th instead
+   of 4th. Targeting the column by position keeps header and values
+   aligned regardless of whether Manage is present. */
+.player-table:not(.player-table-draft) th:nth-child(4),
+.player-table:not(.player-table-draft) td:nth-child(4) {
+    width: 22%;
+    text-align: right;
+}
+
+.player-table:not(.player-table-draft) td:nth-child(4) {
+    white-space: normal;
+}
+
+/* Draft builder's own 3rd column (a Remove button, no header text) — needs
+   room for the button's real rendered width, not a fraction tuned for a
+   Score digit. Leaving it unconstrained (table-layout: fixed gives an
+   unspecified column whatever's left after the other two) is enough,
+   but overflow/white-space are relaxed too so a button never gets clipped
+   again if a future label runs longer than "Remove". */
+/* A fixed `em` width rather than a `%` — this table lives inside the
+   narrow, left-bordered `.game-builder` card, not the full panel width
+   the roster table's percentages were tuned against (measured ~266px vs
+   the roster table's ~390px), so the same 13%/20% that fit "Human" there
+   clipped it to "Hu…" here. `em` sizes off "Human"/"Bot"'s own text
+   directly, so it stays correct regardless of the surrounding card's width. */
+.player-table-draft th:nth-child(2),
+.player-table-draft td:nth-child(2) {
+    width: 5em;
+}
+
+.player-table-draft td:nth-child(3) {
+    overflow: visible;
+    white-space: normal;
+    text-align: right;
 }
 
 /* The optional 5th column (seat status + Send/Remove/Withdraw/Force-resign
@@ -1158,6 +1206,15 @@ button:disabled {
     display: flex;
     align-items: center;
     gap: 12px;
+    /* Without wrap, a narrow viewport has nowhere to put the overflow
+       except into the buttons themselves — flexbox shrinks each button's
+       own width to fit the row, and its label wraps to two lines inside
+       a still fully-rounded (border-radius: 999px) pill, which reads as
+       a distorted blob rather than a normal button. Wrapping the row lets
+       "Log out" drop to its own line instead, each button keeping its
+       natural one-line shape. */
+    flex-wrap: wrap;
+    justify-content: flex-end;
 }
 
 .auth-status {
@@ -1371,5 +1428,26 @@ button:disabled {
     .rack-tile {
         width: 44px;
         height: 44px;
+    }
+
+    /* `.turn-actions`'s desktop layout is a single row of three flex
+       groups (Shuffle/Clear/direction-toggle, then Pass/Exchange/Play,
+       then Resign) that only wraps *within* each group, never between
+       them — there's room for that on desktop, but on a narrow phone the
+       three groups still fight for the same row, each wrapping its own
+       buttons independently. The result reads as one scrambled cluster:
+       e.g. Pass stranded alone above Shuffle/Exchange/Resign sharing a
+       row, with Play on a third line — buttons that belong together end
+       up on different lines and buttons from different groups share one.
+       Stacking the three groups as their own full-width rows keeps each
+       one's buttons together and wrapping only within itself. */
+    .turn-actions {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 10px;
+    }
+
+    .turn-actions-buttons {
+        justify-content: flex-start;
     }
 }

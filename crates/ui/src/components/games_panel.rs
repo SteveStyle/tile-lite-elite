@@ -574,7 +574,7 @@ pub fn GamesPanel(
                         div { class: "game-row-top",
                             span { class: "game-status-badge game-status-new", "New" }
                         }
-                        table { class: "player-table",
+                        table { class: "player-table player-table-draft",
                             thead {
                                 tr {
                                     th { "Player" }
@@ -618,7 +618,7 @@ pub fn GamesPanel(
                                 onclick: move |_| {
                                     additional_seats.with_mut(|seats| seats.push(AdditionalSeatDraft { kind: AdditionalSeatKind::Engine, name: String::new() }));
                                 },
-                                "+ Engine"
+                                "+ Bot"
                             }
                         }
                         div { class: "game-builder-variant",
@@ -1180,7 +1180,7 @@ fn player_table(
 
 /// Lets the creator add a new seat to an already-created `Waiting` game —
 /// the post-creation counterpart to the pre-creation draft builder's own
-/// "+ Invite by name"/"+ Open seat"/"+ Engine" row, reusing the same
+/// "+ Invite by name"/"+ Open seat"/"+ Bot" row, reusing the same
 /// `AdditionalSeatKind` vocabulary for a consistent picker. Deliberately
 /// doesn't send an invitation itself (see `AddSeatSubmission`'s doc
 /// comment) — sending is a separate `player_table` "Send" button, once the
@@ -1219,7 +1219,7 @@ fn add_seat_row(
                 option { value: "named", "Invite by name" }
                 option { value: "open", "Open seat (any player may claim)" }
                 option { value: "email", "Invite by email" }
-                option { value: "engine", "Engine (Greedy)" }
+                option { value: "engine", "Bot (Greedy)" }
             }
             if kind() == AdditionalSeatKind::Named {
                 NameAutocompleteInput {
@@ -1263,7 +1263,7 @@ fn add_seat_row(
                         ),
                         AdditionalSeatKind::Engine => (
                             SeatKind::Engine,
-                            "Engine".to_string(),
+                            "Bot".to_string(),
                             Some(DEFAULT_ENGINE_ID.to_string()),
                             None,
                         ),
@@ -1445,7 +1445,7 @@ fn action_note(record: &MoveRecordDto) -> String {
 fn seat_kind_label(kind: &SeatKind) -> &'static str {
     match kind {
         SeatKind::Human => "Human",
-        SeatKind::Engine => "Engine",
+        SeatKind::Engine => "Bot",
     }
 }
 
@@ -1454,13 +1454,13 @@ fn seat_draft_label(kind: AdditionalSeatKind) -> &'static str {
         AdditionalSeatKind::Named => "Invite by name",
         AdditionalSeatKind::Open => "Open seat (any player may claim)",
         AdditionalSeatKind::Email => "Invite by email",
-        AdditionalSeatKind::Engine => "Engine (Greedy)",
+        AdditionalSeatKind::Engine => "Bot (Greedy)",
     }
 }
 
 fn seat_draft_kind_label(kind: AdditionalSeatKind) -> &'static str {
     match kind {
-        AdditionalSeatKind::Engine => "Engine",
+        AdditionalSeatKind::Engine => "Bot",
         AdditionalSeatKind::Named | AdditionalSeatKind::Open | AdditionalSeatKind::Email => "Human",
     }
 }
