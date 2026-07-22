@@ -495,6 +495,7 @@ impl GameSession {
                     invited_email: participant.invited_email.clone(),
                     rating_before: None,
                     rating_after: None,
+                    current_rating: None,
                     resigned: participant.resigned,
                 })
                 .collect(),
@@ -541,11 +542,13 @@ impl GameSession {
                     // and `ParticipantDto::invitation_status`'s doc comment.
                     invitation_status: None,
                     invited_email: participant.invited_email.clone(),
-                    // Filled in afterward, only for a Finished game whose
-                    // ending actually moved rating — see
-                    // `stats::attach_rating_deltas`.
+                    // Filled in afterward — see `stats::attach_current_ratings`
+                    // (always, any status) and `stats::attach_rating_deltas`
+                    // (only for a Finished game whose ending actually moved
+                    // rating).
                     rating_before: None,
                     rating_after: None,
+                    current_rating: None,
                     resigned: participant.resigned,
                 })
                 .collect(),

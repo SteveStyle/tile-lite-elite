@@ -499,7 +499,11 @@ async fn create_game(
     // Built after the invitation-creation loop above, not before — an
     // early `to_dto()` would show every seat as not-yet-sent even though
     // their invitations (and this response) go out together.
-    let dto = redact_game_state(game_dto_with_invitation_status(&state, &game).await?, &access);
+    let mut dto = game_dto_with_invitation_status(&state, &game).await?;
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    let dto = redact_game_state(dto, &access);
     state.games.write().await.insert(game.id.clone(), game);
     Ok(Json(dto))
 }
@@ -525,6 +529,9 @@ async fn get_game(
     }
     let mut dto = game_dto_with_invitation_status(&state, game).await?;
     drop(games);
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
     // Not just for the moment a game finishes — reopening an old finished
     // game later should still show what it did to your rating, not only
     // the one-time broadcast at the moment it happened. A no-op query
@@ -595,6 +602,9 @@ async fn start_game(
         let access = resolve_viewer_access(game, caller_player_id.as_deref());
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
     // An all-engine game (e.g. Bot Showdown) can finish entirely within
     // `run_engine_turns` above, before this handler ever gets to broadcast
     // anything — so `dto.status` may already be `Finished` here, and a
@@ -627,7 +637,7 @@ async fn swap_seats(
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
     let caller_player_id = authenticated_player_id(&state, &headers).await;
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -648,6 +658,9 @@ async fn swap_seats(
         let access = resolve_viewer_access(game, caller_player_id.as_deref());
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     // Broadcast the unredacted dto — per-connection redaction happens in
     // `stream_events`, not here (see the identical note in `start_game`).
@@ -683,7 +696,7 @@ async fn add_seat_to_game(
         ));
     }
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -720,6 +733,9 @@ async fn add_seat_to_game(
         let access = resolve_viewer_access(game, Some(&caller_player_id));
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     tracing::info!(game_id, "seat added");
 
@@ -744,7 +760,7 @@ async fn remove_seat_from_game(
         .await
         .ok_or_else(|| ApiProblem::unauthorized("Sign in to remove a seat"))?;
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -779,6 +795,9 @@ async fn remove_seat_from_game(
         let access = resolve_viewer_access(game, Some(&caller_player_id));
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     tracing::info!(game_id, seat_number, "seat removed");
 
@@ -804,7 +823,7 @@ async fn withdraw_from_seat(
         .await
         .ok_or_else(|| ApiProblem::unauthorized("Sign in to withdraw from a seat"))?;
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -842,6 +861,9 @@ async fn withdraw_from_seat(
         let access = resolve_viewer_access(game, Some(&caller_player_id));
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     tracing::info!(game_id, seat_number, player_id = %caller_player_id, "seat withdrawn");
 
@@ -885,6 +907,9 @@ async fn force_resign_seat(
         let access = resolve_viewer_access(game, Some(&caller_player_id));
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
     // Always a no-op — a creator-forced resignation never moves rating
     // (see `stats::settle_ratings`) — kept for consistency with every
     // other place a Finished game's DTO goes out.
@@ -893,9 +918,10 @@ async fn force_resign_seat(
         .map_err(ApiProblem::from_sqlx)?;
 
     // Same GameFinished-vs-StateUpdated broadcast pattern as submit_action —
-    // force_resign always finishes the game, but mirroring the conditional
-    // rather than hardcoding GameFinished keeps this consistent in case
-    // that invariant ever loosens.
+    // a force-resignation only finishes the whole game once at most one
+    // active seat remains (see `GameSession::handle_seat_exit`); mirroring
+    // the conditional rather than hardcoding GameFinished handles both
+    // that case and a multi-player game simply continuing.
     let event = if dto.status == api::GameStatus::Finished {
         tracing::info!(game_id, seat_number, winner_seat = ?dto.winner_seat, "seat force-resigned by creator; game finished");
         GameEventDto::GameFinished { game: dto.clone() }
@@ -984,6 +1010,9 @@ async fn submit_action(
         let access = resolve_viewer_access(game, caller_player_id.as_deref());
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
     // A no-op unless this move (or a follow-on engine turn triggered by
     // `run_engine_turns` above) just finished the game via a normal
     // ending or a voluntary resignation — the only endings that move
@@ -1020,7 +1049,7 @@ async fn post_chat_message(
         .await
         .ok_or_else(|| ApiProblem::unauthorized("Sign in to chat"))?;
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -1043,6 +1072,9 @@ async fn post_chat_message(
         let access = resolve_viewer_access(game, Some(&caller_player_id));
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     // Broadcast the unredacted dto — per-connection redaction happens in
     // `stream_events`, not here (see the identical note in `start_game`).
@@ -1241,6 +1273,9 @@ async fn suggest_move(
         let access = resolve_viewer_access(game, caller_player_id.as_deref());
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
     // A no-op unless this move (or a follow-on engine turn triggered by
     // `run_engine_turns` above) just finished the game via a normal
     // ending or a voluntary resignation — the only endings that move
@@ -2037,7 +2072,7 @@ async fn accept_invitation(
         .map_err(ApiProblem::from_sqlx)?
         .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&record.game_id)
@@ -2057,6 +2092,9 @@ async fn accept_invitation(
         let access = resolve_viewer_access(game, Some(&caller_player_id));
         (dto, access)
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     tracing::info!(
         invitation_id,
@@ -2360,6 +2398,11 @@ async fn expire_overdue_turns(state: &AppState) {
             }
         }
     }
+    for dto in &mut finished {
+        if let Err(error) = stats::attach_current_ratings(&state.db, dto).await {
+            tracing::error!(game_id = %dto.id, %error, "failed to read current ratings after timeout retirement");
+        }
+    }
     // Always a no-op — a timeout never moves rating (see
     // `stats::settle_ratings`) — kept for consistency with every other
     // place a Finished game's DTO goes out.
@@ -2433,6 +2476,9 @@ async fn expire_overdue_turn(state: &AppState, game_id: &str) {
         }
         game.to_dto()
     };
+    if let Err(error) = stats::attach_current_ratings(&state.db, &mut finished).await {
+        tracing::error!(game_id, %error, "failed to read current ratings after timeout retirement");
+    }
     // Always a no-op — a timeout never moves rating (see
     // `stats::settle_ratings`) — kept for consistency with every other
     // place a Finished game's DTO goes out.
@@ -2586,6 +2632,7 @@ async fn admin_list_games(
                     invited_email: participant.invited_email.clone(),
                     rating_before: None,
                     rating_after: None,
+                    current_rating: None,
                     resigned: participant.resigned,
                 })
                 .collect(),
@@ -2631,6 +2678,9 @@ async fn admin_force_end_game(
             .map_err(ApiProblem::from_sqlx)?;
         dto
     };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
     // Always a no-op in practice — an admin force-end never moves rating
     // (see `stats::settle_ratings`) — but calling it anyway keeps this
     // handler consistent with every other place a Finished game's DTO
@@ -5998,6 +6048,27 @@ mod tests {
         let winner_rating = finished.participants[1].rating_after.expect("winner should be rated");
         assert!(resigner_rating < 1500.0, "resigning while 300 points ahead must still lose rating: got {resigner_rating}");
         assert!(winner_rating > 1500.0, "the non-resigning seat must gain rating: got {winner_rating}");
+        // `current_rating` (shown next to a player's name in the roster)
+        // must reflect the just-applied change, not the stale pre-game
+        // value.
+        assert_eq!(finished.participants[0].current_rating, Some(resigner_rating));
+        assert_eq!(finished.participants[1].current_rating, Some(winner_rating));
+    }
+
+    #[tokio::test]
+    async fn current_rating_defaults_to_1500_for_a_never_rated_player() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        for participant in &started.game.participants {
+            assert_eq!(
+                participant.current_rating,
+                Some(1500.0),
+                "a brand-new player's roster entry should show the default rating, not None"
+            );
+        }
     }
 
     #[tokio::test]

@@ -280,15 +280,16 @@ pub fn Home(
                                 p { class: "composer-copy",
                                     // The last move's own already-formatted
                                     // description ("Alice played CARROT for
-                                    // 24", "Bob passed", ...) is more useful
-                                    // here than a bare "Your turn"/"Waiting
-                                    // for X" — whose turn it is stays visible
-                                    // in the status strip's "Turn: ..." chip
-                                    // above, so nothing is lost by giving this
-                                    // slot to the more informative text.
+                                    // 24", "Bob passed", ...) leads, with the
+                                    // turn indicator right after it — e.g.
+                                    // "Hazel played RUN for 10. Waiting for
+                                    // John." — rather than replacing it, so
+                                    // this slot carries both what just
+                                    // happened and whose turn it is now.
                                     if let Some(last_move) = game.moves.last() {
-                                        "{last_move.description}"
-                                    } else if is_your_turn {
+                                        "{last_move.description}. "
+                                    }
+                                    if is_your_turn {
                                         "Your turn"
                                     } else {
                                         "Waiting for {current_turn_name(&game)}"
@@ -548,6 +549,7 @@ mod tests {
             invited_email: None,
             rating_before: None,
             rating_after: None,
+            current_rating: None,
             resigned: false,
         }
     }

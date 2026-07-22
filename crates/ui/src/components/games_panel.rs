@@ -1108,6 +1108,9 @@ fn player_table(
                         }
                     }
                     "{participant.display_name}"
+                    if let Some(rating) = participant.current_rating {
+                        span { class: "player-table-rating", " ({rating:.0})" }
+                    }
                     if is_you {
                         span { class: "player-table-you-tag", " (you)" }
                     }
@@ -1709,6 +1712,7 @@ mod tests {
             invited_email: None,
             rating_before: None,
             rating_after: None,
+            current_rating: None,
             resigned: false,
         }
     }

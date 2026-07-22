@@ -445,3 +445,43 @@ pub async fn attach_rating_deltas(pool: &Pool<Sqlite>, dto: &mut api::GameStateD
     }
     Ok(())
 }
+
+/// Fills in `current_rating` on every participant of a game's DTO with a
+/// resolvable subject (a `player_id` or an `engine_id`) — regardless of
+/// the game's own status, unlike `attach_rating_deltas`, since "what's
+/// this opponent's rating right now" is meaningful at any point in a
+/// game, not just once it's over. 1500 for a subject that's never been
+/// rated (matching `get_subject_stats`'s own default), `None` only for
+/// an unclaimed seat. One small query per distinct subject rather than
+/// one per seat, since a self-play game (e.g. a "Bot Showdown") would
+/// otherwise look the same subject up twice.
+pub async fn attach_current_ratings(pool: &Pool<Sqlite>, dto: &mut api::GameStateDto) -> Result<(), sqlx::Error> {
+    let mut seen: std::collections::HashMap<(&'static str, String), f64> = std::collections::HashMap::new();
+    for participant in &dto.participants {
+        let subject = match (&participant.player_id, &participant.engine_id) {
+            (Some(id), None) => Some(("player", id.clone())),
+            (None, Some(id)) => Some(("engine", id.clone())),
+            _ => None,
+        };
+        let Some((kind, id)) = subject else { continue };
+        if seen.contains_key(&(kind, id.clone())) {
+            continue;
+        }
+        let row = sqlx::query("select rating from player_ratings where subject_kind = ?1 and subject_id = ?2")
+            .bind(kind)
+            .bind(&id)
+            .fetch_optional(pool)
+            .await?;
+        seen.insert((kind, id), row.map(|r| r.get::<f64, _>(0)).unwrap_or(DEFAULT_RATING));
+    }
+
+    for participant in &mut dto.participants {
+        let subject = match (&participant.player_id, &participant.engine_id) {
+            (Some(id), None) => Some(("player", id.clone())),
+            (None, Some(id)) => Some(("engine", id.clone())),
+            _ => None,
+        };
+        participant.current_rating = subject.and_then(|key| seen.get(&key).copied());
+    }
+    Ok(())
+}

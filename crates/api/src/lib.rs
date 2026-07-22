@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// compatibility check fire on every routine bugfix deploy. Release/build
 /// numbering for display purposes is a separate concern — see each
 /// binary's own `app_version()`.
-pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 3 };
+pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 4 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiVersion {
@@ -203,6 +203,17 @@ pub struct ParticipantDto {
     /// itself, since it needs a DB read `to_dto()` doesn't have.
     pub rating_before: Option<f64>,
     pub rating_after: Option<f64>,
+    /// This seat's rating *right now* — shown next to their name so an
+    /// opponent's standing is visible at a glance, at any point in a
+    /// game, not just once it's `Finished`. Distinct from `rating_after`:
+    /// this is always their current `player_ratings` row (1500 if never
+    /// rated), not specifically what this game itself changed it to (and
+    /// unaffected by the current game's own outcome until it's actually
+    /// settled). `None` only for a seat with neither a `player_id` nor an
+    /// `engine_id` (an unclaimed seat), same as every other rating field.
+    /// Populated by `stats::attach_current_ratings`, not `to_dto()`
+    /// itself, since it needs a DB read `to_dto()` doesn't have.
+    pub current_rating: Option<f64>,
     /// `None` for an Engine seat or any already-claimed Human seat (the
     /// creator's own seat, or an accepted invitee) — there's no invitation
     /// lifecycle left to report. `Some(...)` for an unclaimed Human seat,
