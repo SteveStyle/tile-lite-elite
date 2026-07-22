@@ -13,6 +13,10 @@ pub fn Home(
     game: GameStateDto,
     is_live: bool,
     is_loading: bool,
+    /// `Some((before, after))` only when this game just moved the
+    /// viewer's own rating — see `ParticipantDto.rating_before`/
+    /// `rating_after`'s doc comment for exactly when that is.
+    my_rating_delta: Option<(f64, f64)>,
     info_message: Option<String>,
     error_message: Option<String>,
     rack_tiles: Vec<RackTileView>,
@@ -193,7 +197,19 @@ pub fn Home(
                 }
             }
             if let Some(summary) = finished_game_summary(&game) {
-                p { class: "game-over-banner", "{summary}" }
+                p { class: "game-over-banner",
+                    "{summary}"
+                    if let Some((before, after)) = my_rating_delta {
+                        span {
+                            class: if after >= before { "rating-delta rating-delta-up" } else { "rating-delta rating-delta-down" },
+                            {
+                                let delta = after - before;
+                                let sign = if delta >= 0.0 { "+" } else { "" };
+                                format!("Your rating: {before:.0} → {after:.0} ({sign}{delta:.0})")
+                            }
+                        }
+                    }
+                }
             }
             if !has_rack {
                 if let Some(error_message) = error_message.clone() {
@@ -516,6 +532,8 @@ mod tests {
             score,
             invitation_status: None,
             invited_email: None,
+            rating_before: None,
+            rating_after: None,
         }
     }
 

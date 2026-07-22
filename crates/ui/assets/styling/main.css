@@ -1412,7 +1412,94 @@ button:disabled {
     }
 }
 
+.stats-card {
+    max-width: 480px;
+}
+
+.stats-view-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 10px;
+    margin: 4px 0 14px;
+}
+
+.stats-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 10px 14px;
+    border-radius: 14px;
+    background: rgba(111, 75, 44, 0.08);
+}
+
+.stats-tile-label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: rgba(35, 25, 15, 0.55);
+}
+
+.stats-tile-value {
+    font-size: 1.4rem;
+    font-weight: 700;
+    font-family: "Palatino Linotype", "Book Antiqua", Georgia, serif;
+}
+
+.rating-chart {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.rating-chart svg {
+    width: 100%;
+    height: auto;
+    border-radius: 14px;
+    background: rgba(111, 75, 44, 0.06);
+}
+
+.rating-chart-range {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.78rem;
+    color: rgba(35, 25, 15, 0.55);
+}
+
+.stats-chart-empty {
+    color: rgba(35, 25, 15, 0.6);
+    font-style: italic;
+}
+
+/* Shown on the game-over banner for whichever seat's own rating this
+   game actually moved (see `ParticipantDto.rating_before`/`rating_after`
+   — `None`/`None` for an ending that skips rating, like a timeout or a
+   creator-forced resignation). */
+.rating-delta {
+    display: block;
+    margin-top: 6px;
+    font-weight: 700;
+}
+
+.rating-delta-up {
+    color: #4a6b2e;
+}
+
+.rating-delta-down {
+    color: #8a2d1e;
+}
+
 @media (max-width: 720px) {
+    .stats-grid {
+        grid-template-columns: 1fr;
+    }
+
     .app-shell {
         padding: 14px;
     }

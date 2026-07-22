@@ -1429,6 +1429,7 @@ fn action_note(record: &MoveRecordDto) -> String {
     match record.move_type.as_str() {
         "pass" => "passed".to_string(),
         "resign" => "resigned".to_string(),
+        "force_resign" => "resigned (forced)".to_string(),
         "timeout" => "retired (exceeded time limit)".to_string(),
         "exchange" => {
             let count = record
@@ -1697,6 +1698,8 @@ mod tests {
             score: 0,
             invitation_status: None,
             invited_email: None,
+            rating_before: None,
+            rating_after: None,
         }
     }
 

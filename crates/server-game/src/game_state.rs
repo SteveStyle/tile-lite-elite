@@ -498,6 +498,8 @@ impl GameSession {
                     // Not meaningful in a list-view summary.
                     invitation_status: None,
                     invited_email: participant.invited_email.clone(),
+                    rating_before: None,
+                    rating_after: None,
                 })
                 .collect(),
             last_activity_at,
@@ -543,6 +545,11 @@ impl GameSession {
                     // and `ParticipantDto::invitation_status`'s doc comment.
                     invitation_status: None,
                     invited_email: participant.invited_email.clone(),
+                    // Filled in afterward, only for a Finished game whose
+                    // ending actually moved rating — see
+                    // `stats::attach_rating_deltas`.
+                    rating_before: None,
+                    rating_after: None,
                 })
                 .collect(),
             board: board_to_dto(&self.state.board, &self.rules.alphabet),
@@ -752,7 +759,7 @@ impl GameSession {
 
     pub fn apply_resign(&mut self, seat_number: u8) -> Result<(), String> {
         ensure_active_turn(self, seat_number)?;
-        self.finish_via_resignation(seat_number, "resigned")
+        self.finish_via_resignation(seat_number, "resign", "resigned")
     }
 
     /// The game manager's override: ends the game on behalf of a seat that
@@ -779,10 +786,15 @@ impl GameSession {
         if participant.resigned {
             return Err("That seat has already resigned".to_string());
         }
-        self.finish_via_resignation(seat_number, "resigned (by the game creator)")
+        self.finish_via_resignation(seat_number, "force_resign", "resigned (by the game creator)")
     }
 
-    fn finish_via_resignation(&mut self, seat_number: u8, reason: &str) -> Result<(), String> {
+    /// `move_type` is `"resign"` for a voluntary self-resignation or
+    /// `"force_resign"` for the creator's override — distinct values so
+    /// downstream code (rating: a win by force-resignation doesn't move
+    /// rating, unlike a win by voluntary resignation) can tell them apart
+    /// without parsing `reason`/`description` text.
+    fn finish_via_resignation(&mut self, seat_number: u8, move_type: &str, reason: &str) -> Result<(), String> {
         let participant = self
             .participants
             .get_mut(seat_number as usize)
@@ -791,7 +803,7 @@ impl GameSession {
         self.moves.push(MoveRecord {
             move_number: self.turn_number,
             seat_number,
-            move_type: "resign".to_string(),
+            move_type: move_type.to_string(),
             main_word: None,
             score_delta: 0,
             positions: Vec::new(),
@@ -804,6 +816,27 @@ impl GameSession {
             .map(|other| other.seat_number);
         self.status = GameStatus::Finished;
         Ok(())
+    }
+
+    /// The admin cleanup tool's own ending path (`admin_force_end_game` in
+    /// app.rs) — for abandoned/stuck games, bypassing normal win/resign/
+    /// timeout logic entirely (no `winner_seat`, no `resigned` flag, can
+    /// even apply to a `Waiting` game with unclaimed seats). Pushes a
+    /// terminal move so downstream code can tell this ending apart from
+    /// every other kind — specifically, rating: an admin force-end
+    /// shouldn't move anyone's ELO, same reasoning as a timeout or a
+    /// creator-forced resignation not moving it either.
+    pub fn admin_force_finish(&mut self) {
+        self.moves.push(MoveRecord {
+            move_number: self.turn_number,
+            seat_number: self.current_seat,
+            move_type: "admin_force_end".to_string(),
+            main_word: None,
+            score_delta: 0,
+            positions: Vec::new(),
+            description: "Game force-ended by admin".to_string(),
+        });
+        self.status = GameStatus::Finished;
     }
 
     /// Hides a finished game from one seat's player — a purely per-viewer

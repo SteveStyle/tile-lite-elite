@@ -19,7 +19,7 @@ use tokio_tungstenite::connect_async;
 
 use crate::components::auth_panel::AuthPanel;
 use crate::components::games_panel::GamesPanel;
-use crate::views::{Home, ResetPassword};
+use crate::views::{Home, ResetPassword, StatsView};
 
 const MAIN_CSS: Asset = asset!("/assets/styling/main.css");
 pub(crate) const BOARD_WIDTH: usize = 15;
@@ -120,6 +120,7 @@ pub fn RootApp() -> Element {
     let mut chat_watermarks: Signal<HashMap<String, String>> =
         use_signal(|| crate::local_storage::load_chat_watermarks().last_seen);
     let mut session = use_signal(|| None::<api::PlayerSessionDto>);
+    let mut show_stats = use_signal(|| false);
     let mut is_loading = use_signal(|| false);
     let mut info_message = use_signal(|| Some("Loading games from server...".to_string()));
     let mut error_message = use_signal(|| None::<String>);
@@ -413,6 +414,17 @@ pub fn RootApp() -> Element {
     // after the fact.
     let viewer_rack_seat = viewer_rack_seat(&game_for_view, viewer_player_id.as_deref());
     let can_view_rack = viewer_rack_seat.is_some();
+    // `None` unless this game just moved the viewer's own rating — either
+    // it's still in progress, this ending skipped rating (timeout/forced
+    // resignation/admin force-end), or the viewer holds no seat here at
+    // all. See `ParticipantDto.rating_before`/`rating_after`.
+    let my_rating_delta = viewer_player_id.as_deref().and_then(|my_id| {
+        game_for_view
+            .participants
+            .iter()
+            .find(|p| p.player_id.as_deref() == Some(my_id))
+            .and_then(|participant| Some((participant.rating_before?, participant.rating_after?)))
+    });
     let unordered_rack_tiles =
         rack_tiles_for_seat(&game_for_view, viewer_rack_seat, &staged_placements());
     if rack_order().len() != unordered_rack_tiles.len() {
@@ -588,6 +600,20 @@ pub fn RootApp() -> Element {
                         });
                         info_message.set(Some("Details updated".to_string()));
                     },
+                    on_open_stats: move |_| show_stats.set(true),
+                }
+            }
+
+            if session().is_some() && show_stats() {
+                div { class: "modal-backdrop",
+                    div { class: "modal-card stats-card",
+                        StatsView {
+                            server_url: server_url.clone(),
+                            player_id: session().as_ref().map(|s| s.player_id.clone()),
+                            token: session().as_ref().map(|s| s.session_token.clone()),
+                            on_close: move |_| show_stats.set(false),
+                        }
+                    }
                 }
             }
 
@@ -1056,6 +1082,7 @@ pub fn RootApp() -> Element {
                     game: game_for_home,
                     is_live: game().is_some(),
                     is_loading: is_loading(),
+                    my_rating_delta,
                     info_message: info_message().clone(),
                     error_message: error_message().clone(),
                     rack_tiles,
@@ -1651,6 +1678,8 @@ fn empty_live_game() -> GameStateDto {
             score: 0,
             invitation_status: None,
             invited_email: None,
+            rating_before: None,
+            rating_after: None,
         }],
         board: empty_board(),
         racks: vec![RackDto {
@@ -1732,6 +1761,22 @@ pub(crate) async fn search_players(
         token,
     )
     .await
+}
+
+pub(crate) async fn fetch_player_stats(
+    server_url: &str,
+    player_id: &str,
+    token: Option<&str>,
+) -> Result<api::PlayerStatsDto, String> {
+    get_json_auth(&format!("{server_url}/players/{player_id}/stats"), token).await
+}
+
+pub(crate) async fn fetch_player_rating_history(
+    server_url: &str,
+    player_id: &str,
+    token: Option<&str>,
+) -> Result<Vec<api::RatingPointDto>, String> {
+    get_json_auth(&format!("{server_url}/players/{player_id}/rating-history"), token).await
 }
 
 async fn load_game_summaries(
@@ -3824,6 +3869,8 @@ mod tests {
             score: 0,
             invitation_status: None,
             invited_email: None,
+            rating_before: None,
+            rating_after: None,
         }
     }
 

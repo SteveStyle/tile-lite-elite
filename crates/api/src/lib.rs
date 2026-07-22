@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// compatibility check fire on every routine bugfix deploy. Release/build
 /// numbering for display purposes is a separate concern — see each
 /// binary's own `app_version()`.
-pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 1 };
+pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 2 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiVersion {
@@ -186,7 +186,7 @@ pub struct EngineProfileDto {
     pub supports_ranking: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ParticipantDto {
     pub seat_number: u8,
     pub kind: SeatKind,
@@ -194,6 +194,15 @@ pub struct ParticipantDto {
     pub player_id: Option<String>,
     pub engine_id: Option<String>,
     pub score: i32,
+    /// This seat's rating immediately before/after this game, if — and
+    /// only if — the game actually moved it: both `None` while the game
+    /// is still in progress, and both stay `None` even once `Finished` if
+    /// this particular ending skipped rating (a timeout, a creator-forced
+    /// resignation, or an admin force-end — see `stats::settle_ratings`).
+    /// Populated by `stats::attach_rating_deltas`, not by `to_dto()`
+    /// itself, since it needs a DB read `to_dto()` doesn't have.
+    pub rating_before: Option<f64>,
+    pub rating_after: Option<f64>,
     /// `None` for an Engine seat or any already-claimed Human seat (the
     /// creator's own seat, or an accepted invitee) — there's no invitation
     /// lifecycle left to report. `Some(...)` for an unclaimed Human seat,
@@ -250,7 +259,7 @@ pub enum GameRelationship {
 /// A lightweight summary of a game, cheap enough to fetch in bulk for a
 /// games list. Deliberately excludes the board/rack/move-log detail that
 /// `GameStateDto` carries — fetch the full game by id once it's selected.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GameSummaryDto {
     pub id: String,
     pub status: GameStatus,
@@ -327,7 +336,7 @@ pub struct PostChatMessageRequest {
     pub body: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GameStateDto {
     pub id: String,
     pub status: GameStatus,
@@ -369,7 +378,7 @@ pub struct GameStateDto {
     pub messages: Vec<ChatMessageDto>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum GameEventDto {
     StateUpdated { game: GameStateDto },
@@ -553,7 +562,7 @@ pub struct InvitationResponseRequest {
 /// A game summary with `created_at`, for age-based filtering/display in the
 /// admin CLI — the ordinary player-facing `GameSummaryDto` deliberately
 /// doesn't carry this.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AdminGameSummaryDto {
     pub id: String,
     pub status: GameStatus,
@@ -565,4 +574,44 @@ pub struct AdminGameSummaryDto {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AdminResetPasswordRequest {
     pub new_password: String,
+}
+
+// ========== Rating & Stats ==========
+//
+// A "rating subject" is a player or an engine (bot) — both are rated and
+// tracked identically, keyed by (subject_kind, subject_id) where subject_id
+// is a `players.id` or an `engine_profiles.id`. See `server_game::stats` for
+// the ELO-style update and outcome bookkeeping this serves.
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RatingSubjectKind {
+    Player,
+    Engine,
+}
+
+/// A subject's current rating plus aggregate outcome/bingo counters. Never
+/// 404s for an unrated subject — `rating` is 1500 and every counter is 0
+/// for a player/engine that's never finished a rated game.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PlayerStatsDto {
+    pub subject_kind: RatingSubjectKind,
+    pub subject_id: String,
+    pub rating: f64,
+    pub games_rated: i64,
+    pub wins: i64,
+    pub losses: i64,
+    pub ties: i64,
+    pub timeouts: i64,
+    pub resignations: i64,
+    pub bingo_count: i64,
+}
+
+/// One point on a subject's rating-over-time graph — its rating
+/// immediately after one specific game.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RatingPointDto {
+    pub game_id: String,
+    pub rating_after: f64,
+    pub created_at: String,
 }

@@ -29,6 +29,7 @@ use crate::game_state::{
     move_candidate_from_dto, redact_game_state, resolve_viewer_access, tile_from_dto,
 };
 use crate::persistence;
+use crate::stats;
 use rules_shared::format_move_error;
 
 #[derive(Clone)]
@@ -108,6 +109,17 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/forgot-password", post(request_password_reset))
         .route("/auth/reset-password", post(reset_password))
         .route("/players/search", get(search_players))
+        // Rating & Stats
+        .route("/players/{player_id}/stats", get(get_player_stats))
+        .route(
+            "/players/{player_id}/rating-history",
+            get(get_player_rating_history),
+        )
+        .route("/engines/{engine_id}/stats", get(get_engine_stats))
+        .route(
+            "/engines/{engine_id}/rating-history",
+            get(get_engine_rating_history),
+        )
         // Games
         .route("/games", post(create_game).get(list_games))
         .route("/games/{game_id}", get(get_game))
@@ -511,7 +523,15 @@ async fn get_game(
             "Sign in and be part of this game to view it",
         ));
     }
-    let dto = game_dto_with_invitation_status(&state, game).await?;
+    let mut dto = game_dto_with_invitation_status(&state, game).await?;
+    drop(games);
+    // Not just for the moment a game finishes — reopening an old finished
+    // game later should still show what it did to your rating, not only
+    // the one-time broadcast at the moment it happened. A no-op query
+    // whenever `dto.status` isn't `Finished`.
+    stats::attach_rating_deltas(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
     Ok(Json(redact_game_state(dto, &access)))
 }
 
@@ -557,7 +577,7 @@ async fn start_game(
     // duration of an all-engine game.
     run_engine_turns(&state, &game_id).await?;
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -575,6 +595,13 @@ async fn start_game(
         let access = resolve_viewer_access(game, caller_player_id.as_deref());
         (dto, access)
     };
+    // An all-engine game (e.g. Bot Showdown) can finish entirely within
+    // `run_engine_turns` above, before this handler ever gets to broadcast
+    // anything — so `dto.status` may already be `Finished` here, and a
+    // seated participant's rating may have just moved.
+    stats::attach_rating_deltas(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     tracing::info!(game_id = %dto.id, status = ?dto.status, "game started");
 
@@ -837,7 +864,7 @@ async fn force_resign_seat(
         .await
         .ok_or_else(|| ApiProblem::unauthorized("Sign in to force-resign a seat"))?;
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -858,6 +885,12 @@ async fn force_resign_seat(
         let access = resolve_viewer_access(game, Some(&caller_player_id));
         (dto, access)
     };
+    // Always a no-op — a creator-forced resignation never moves rating
+    // (see `stats::settle_ratings`) — kept for consistency with every
+    // other place a Finished game's DTO goes out.
+    stats::attach_rating_deltas(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     // Same GameFinished-vs-StateUpdated broadcast pattern as submit_action —
     // force_resign always finishes the game, but mirroring the conditional
@@ -939,7 +972,7 @@ async fn submit_action(
     // would starve a WebSocket connection's own read lock.
     run_engine_turns(&state, &game_id).await?;
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -951,6 +984,13 @@ async fn submit_action(
         let access = resolve_viewer_access(game, caller_player_id.as_deref());
         (dto, access)
     };
+    // A no-op unless this move (or a follow-on engine turn triggered by
+    // `run_engine_turns` above) just finished the game via a normal
+    // ending or a voluntary resignation — the only endings that move
+    // rating (see `stats::settle_ratings`).
+    stats::attach_rating_deltas(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     // Broadcast the unredacted dto — per-connection redaction happens in
     // `stream_events`, not here (see the identical note in `start_game`).
@@ -1189,7 +1229,7 @@ async fn suggest_move(
     // would starve a WebSocket connection's own read lock.
     run_engine_turns(&state, &game_id).await?;
 
-    let (dto, access) = {
+    let (mut dto, access) = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
@@ -1201,6 +1241,13 @@ async fn suggest_move(
         let access = resolve_viewer_access(game, caller_player_id.as_deref());
         (dto, access)
     };
+    // A no-op unless this move (or a follow-on engine turn triggered by
+    // `run_engine_turns` above) just finished the game via a normal
+    // ending or a voluntary resignation — the only endings that move
+    // rating (see `stats::settle_ratings`).
+    stats::attach_rating_deltas(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
 
     // Broadcast the unredacted dto — per-connection redaction happens in
     // `stream_events`, not here (see the identical note in `start_game`).
@@ -1473,6 +1520,70 @@ async fn search_players(
         .await
         .map_err(ApiProblem::from_sqlx)?;
     Ok(Json(names))
+}
+
+/// Same openness level as `search_players`: gated on being signed in at
+/// all, not on being the subject in question — this app has no public/
+/// private stats distinction. Never 404s; an unrated player just comes
+/// back as rating 1500 with every counter at 0 (see
+/// `stats::get_subject_stats`).
+async fn get_player_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(player_id): Path<String>,
+) -> Result<Json<api::PlayerStatsDto>, ApiProblem> {
+    authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to view stats"))?;
+    let stats = stats::get_subject_stats(&state.db, "player", &player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    Ok(Json(stats))
+}
+
+async fn get_player_rating_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(player_id): Path<String>,
+) -> Result<Json<Vec<api::RatingPointDto>>, ApiProblem> {
+    authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to view rating history"))?;
+    let history = stats::get_rating_history(&state.db, "player", &player_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    Ok(Json(history))
+}
+
+/// The engine (bot) counterpart to `get_player_stats` — a bot is a rating
+/// subject too (see `stats::settle_ratings`'s doc comment), so it gets the
+/// same read surface.
+async fn get_engine_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(engine_id): Path<String>,
+) -> Result<Json<api::PlayerStatsDto>, ApiProblem> {
+    authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to view stats"))?;
+    let stats = stats::get_subject_stats(&state.db, "engine", &engine_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    Ok(Json(stats))
+}
+
+async fn get_engine_rating_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(engine_id): Path<String>,
+) -> Result<Json<Vec<api::RatingPointDto>>, ApiProblem> {
+    authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to view rating history"))?;
+    let history = stats::get_rating_history(&state.db, "engine", &engine_id)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    Ok(Json(history))
 }
 
 async fn change_password(
@@ -2249,6 +2360,14 @@ async fn expire_overdue_turns(state: &AppState) {
             }
         }
     }
+    // Always a no-op — a timeout never moves rating (see
+    // `stats::settle_ratings`) — kept for consistency with every other
+    // place a Finished game's DTO goes out.
+    for dto in &mut finished {
+        if let Err(error) = stats::attach_rating_deltas(&state.db, dto).await {
+            tracing::error!(game_id = %dto.id, %error, "failed to read rating deltas after timeout retirement");
+        }
+    }
     for dto in finished {
         let _ = state.events.send(GameEventDto::GameFinished { game: dto });
     }
@@ -2300,7 +2419,7 @@ async fn expire_old_finished_games(state: &AppState) {
 /// Same as `expire_overdue_turns` but scoped to one game — cheaper for
 /// handlers that already know which game they care about.
 async fn expire_overdue_turn(state: &AppState, game_id: &str) {
-    let finished = {
+    let mut finished = {
         let mut games = state.games.write().await;
         let Some(game) = games.get_mut(game_id) else {
             return;
@@ -2314,6 +2433,12 @@ async fn expire_overdue_turn(state: &AppState, game_id: &str) {
         }
         game.to_dto()
     };
+    // Always a no-op — a timeout never moves rating (see
+    // `stats::settle_ratings`) — kept for consistency with every other
+    // place a Finished game's DTO goes out.
+    if let Err(error) = stats::attach_rating_deltas(&state.db, &mut finished).await {
+        tracing::error!(game_id, %error, "failed to read rating deltas after timeout retirement");
+    }
     let _ = state.events.send(GameEventDto::GameFinished { game: finished });
 }
 
@@ -2459,6 +2584,8 @@ async fn admin_list_games(
                     // Not meaningful in an admin summary view.
                     invitation_status: None,
                     invited_email: participant.invited_email.clone(),
+                    rating_before: None,
+                    rating_after: None,
                 })
                 .collect(),
         })
@@ -2491,18 +2618,25 @@ async fn admin_force_end_game(
     State(state): State<AppState>,
     Path(game_id): Path<String>,
 ) -> Result<Json<api::GameStateDto>, ApiProblem> {
-    let dto = {
+    let mut dto = {
         let mut games = state.games.write().await;
         let game = games
             .get_mut(&game_id)
             .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
-        game.status = api::GameStatus::Finished;
+        game.admin_force_finish();
         let dto = game.to_dto();
         persistence::save_game(&state.db, game)
             .await
             .map_err(ApiProblem::from_sqlx)?;
         dto
     };
+    // Always a no-op in practice — an admin force-end never moves rating
+    // (see `stats::settle_ratings`) — but calling it anyway keeps this
+    // handler consistent with every other place a Finished game's DTO
+    // goes out, rather than being a special case someone has to remember.
+    stats::attach_rating_deltas(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
     tracing::warn!(game_id, "admin: game force-ended");
     let _ = state.events.send(GameEventDto::GameFinished { game: dto.clone() });
     Ok(Json(dto))
@@ -5342,6 +5476,281 @@ mod tests {
             finished.participants.iter().any(|participant| participant.score != 0),
             "expected at least one participant to have a non-zero score by game end"
         );
+    }
+
+    #[tokio::test]
+    async fn bot_showdown_nets_to_exactly_zero_rating_change_but_still_counts_the_game() {
+        // Both seats resolve to the identical rating subject ("greedy-v1",
+        // the only registered engine) — per the design, this must not be
+        // skipped as unratable; instead the self-pair's two opposite
+        // deltas must sum to exactly zero, leaving the bot's rating
+        // unchanged while still recording that it played one game.
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let owner = register_player(app.clone(), "Referee3").await;
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&owner.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy One".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Engine,
+                            display_name: "Greedy Two".to_string(),
+                            engine_id: Some("greedy-v1".to_string()),
+                            claim: None,
+                        },
+                    ],
+                    seed: Some(778),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+
+        send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/start", created.id),
+            Some(&owner.session_token),
+            &StartGameRequest::default(),
+        )
+        .await;
+
+        let stats = stats::get_subject_stats(&state.db, "engine", "greedy-v1")
+            .await
+            .expect("stats query should succeed");
+        assert_eq!(stats.rating, 1500.0, "a self-play game must net to zero rating change");
+        assert_eq!(stats.games_rated, 1, "one game played, not two, even though it occupied two seats");
+
+        let history = stats::get_rating_history(&state.db, "engine", "greedy-v1")
+            .await
+            .expect("history query should succeed");
+        assert_eq!(history.len(), 1, "one rating_history row for the game, not one per seat");
+    }
+
+    #[tokio::test]
+    async fn passing_out_a_game_ties_and_leaves_first_time_ratings_at_1500() {
+        // Two brand-new (1500-rated) players drawing means expected score
+        // and actual score both land on exactly 0.5 for each side — zero
+        // delta either way. This also exercises the only path that can
+        // produce a genuine 'tie' outcome (the scoreless-turn-limit path,
+        // via `finish_game(None)`).
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+
+        // Both racks emptied so the scoreless-limit ending's usual
+        // rack-value deduction (`finish_game`'s `participant.score -=
+        // rack_value`) subtracts zero from both — otherwise whichever
+        // rack happened to be dealt a lower-value hand would "win" on
+        // points, which isn't the tie this test is actually after.
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&started.game.id).expect("game should exist");
+            for participant in &mut game.participants {
+                participant.rack = Rack::default();
+            }
+        }
+
+        for seat in [0u8, 1, 0, 1, 0, 1] {
+            let response = send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/actions", started.game.id),
+                Some(if seat == 0 { &started.alice.session_token } else { &started.bob.session_token }),
+                &GameActionRequest { seat_number: seat, action: PlayerActionDto::Pass },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let fetched: GameStateDto = read_json(
+            send_empty_auth(
+                app,
+                Method::GET,
+                &format!("/games/{}", started.game.id),
+                Some(&started.alice.session_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(fetched.status, api::GameStatus::Finished);
+        assert_eq!(fetched.winner_seat, None, "an even pass-out is a genuine tie");
+
+        for participant in &fetched.participants {
+            assert_eq!(participant.rating_before, Some(1500.0));
+            assert_eq!(participant.rating_after, Some(1500.0));
+        }
+    }
+
+    #[tokio::test]
+    async fn voluntary_resignation_moves_rating_via_forfeit_ranking_even_when_ahead_on_score() {
+        // Seat 0 is well ahead on points, then resigns. Ranking by raw
+        // score would let the resigner "win" the rating exchange by
+        // quitting while ahead — the forfeit override must rank them last
+        // regardless, so the game still records seat 0 losing rating and
+        // seat 1 gaining it.
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&started.game.id).expect("game should exist");
+            game.participants[0].score = 300;
+        }
+
+        let response = send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.alice.session_token),
+            &GameActionRequest { seat_number: 0, action: PlayerActionDto::Resign },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let finished: GameStateDto = read_json(response).await;
+        assert_eq!(finished.status, api::GameStatus::Finished);
+        assert_eq!(finished.winner_seat, Some(1));
+
+        let resigner_rating = finished.participants[0].rating_after.expect("resigner should be rated");
+        let winner_rating = finished.participants[1].rating_after.expect("winner should be rated");
+        assert!(resigner_rating < 1500.0, "resigning while 300 points ahead must still lose rating: got {resigner_rating}");
+        assert!(winner_rating > 1500.0, "the non-resigning seat must gain rating: got {winner_rating}");
+    }
+
+    #[tokio::test]
+    async fn force_resignation_does_not_move_rating() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        let response = send_empty_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/seats/1/force-resign", started.game.id),
+            Some(&started.alice.session_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let finished: GameStateDto = read_json(response).await;
+        assert_eq!(finished.status, api::GameStatus::Finished);
+        for participant in &finished.participants {
+            assert_eq!(participant.rating_before, None, "a creator-forced resignation must not move rating");
+            assert_eq!(participant.rating_after, None);
+        }
+
+        let winner_stats = stats::get_subject_stats(&state.db, "player", &started.alice.player_id)
+            .await
+            .expect("stats query should succeed");
+        assert_eq!(winner_stats.games_rated, 0);
+    }
+
+    #[tokio::test]
+    async fn timeout_does_not_move_rating() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&started.game.id).expect("game should exist");
+            game.turn_started_at = "0".to_string();
+        }
+
+        let fetched: GameStateDto = read_json(
+            send_empty_auth(
+                app,
+                Method::GET,
+                &format!("/games/{}", started.game.id),
+                Some(&started.alice.session_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(fetched.status, api::GameStatus::Finished);
+        assert_eq!(fetched.moves.last().expect("a move should be recorded").move_type, "timeout");
+        for participant in &fetched.participants {
+            assert_eq!(participant.rating_before, None, "a timeout must not move rating");
+            assert_eq!(participant.rating_after, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_force_end_does_not_move_rating() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        let response = send_admin::<()>(
+            app,
+            Method::POST,
+            &format!("/admin/games/{}/force-end", started.game.id),
+            loopback_peer(),
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let finished: GameStateDto = read_json(response).await;
+        assert_eq!(finished.status, api::GameStatus::Finished);
+        for participant in &finished.participants {
+            assert_eq!(participant.rating_before, None, "an admin force-end must not move rating");
+            assert_eq!(participant.rating_after, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn resaving_an_already_finished_game_does_not_re_rate_it() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_two_human_game(app.clone()).await;
+        for seat in [0u8, 1, 0, 1, 0, 1] {
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/actions", started.game.id),
+                Some(if seat == 0 { &started.alice.session_token } else { &started.bob.session_token }),
+                &GameActionRequest { seat_number: seat, action: PlayerActionDto::Pass },
+            )
+            .await;
+        }
+
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&started.game.id).expect("game should exist");
+            assert_eq!(game.status, api::GameStatus::Finished);
+            persistence::save_game(&state.db, game)
+                .await
+                .expect("re-saving an already-finished game should succeed");
+        }
+
+        let stats = stats::get_subject_stats(&state.db, "player", &started.alice.player_id)
+            .await
+            .expect("stats query should succeed");
+        assert_eq!(stats.games_rated, 1, "re-saving an already-rated game must not rate it a second time");
     }
 
     #[tokio::test]

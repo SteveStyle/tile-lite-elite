@@ -85,6 +85,10 @@ pub fn AuthPanel(
     /// fresh login (unlike a password change, this doesn't invalidate the
     /// session, so there's no re-login to piggyback the refresh on).
     on_details_updated: EventHandler<api::PlayerDto>,
+    /// Opens the Stats view (rating graph + win/loss/tie/timeout/
+    /// resignation/bingo counters) — `RootApp` owns the actual modal, this
+    /// button just asks for it, same pattern as `on_logout`.
+    on_open_stats: EventHandler<()>,
 ) -> Element {
     let stored = crate::local_storage::load();
     let has_remembered_name = stored.remembered_name.is_some();
@@ -153,6 +157,11 @@ pub fn AuthPanel(
                             }
                         },
                         "Edit user details"
+                    }
+                    button {
+                        class: "toggle-button toggle-button-muted",
+                        onclick: move |_| on_open_stats.call(()),
+                        "Stats"
                     }
                     button {
                         class: "toggle-button toggle-button-muted",

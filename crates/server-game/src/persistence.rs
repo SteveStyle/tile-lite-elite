@@ -181,6 +181,21 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
 
 pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(), sqlx::Error> {
     let now = now_iso();
+    let mut tx = pool.begin().await?;
+
+    // Captured before any writes, so the rating step below can tell
+    // whether this save is the *first* time this game becomes Finished —
+    // the single-fire gate that both makes rating idempotent (re-saving an
+    // already-finished game, e.g. via `remove_for_player`, must not re-rate
+    // it) and permanently excludes any game that was already 'finished'
+    // before this feature shipped (no backfill).
+    let prior = sqlx::query("select status, stats_settled_at from games where id = ?1")
+        .bind(&session.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let prior_status: Option<String> = prior.as_ref().map(|row| row.get(0));
+    let prior_stats_settled_at: Option<String> = prior.as_ref().and_then(|row| row.get(1));
+
     let snapshot_json = serde_json::to_string(&PersistedGame {
         id: session.id.clone(),
         status: session.status.clone(),
@@ -248,19 +263,29 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
     .bind(session.random_seed as i64)
     .bind(Option::<String>::None)
     .bind(snapshot_json)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query("delete from game_participants where game_id = ?1")
         .bind(&session.id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
+    // Recomputed on every save, not just the first time a game finishes —
+    // it's a pure function of already-immutable-once-Finished session
+    // state, so recomputing is always cheap and always reproduces the same
+    // values (harmless on a re-save, e.g. `remove_for_player`). `None`
+    // outcome/0 bingo_count for a game still in progress.
+    let outcomes = crate::stats::compute_participant_outcomes(session);
     for participant in &session.participants {
+        let outcome = outcomes
+            .iter()
+            .find(|o| o.seat_number == participant.seat_number)
+            .expect("compute_participant_outcomes covers every participant");
         sqlx::query(
             "insert into game_participants (
-                id, game_id, seat_number, kind, display_name, player_id, engine_id, score, joined_at, left_at
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                id, game_id, seat_number, kind, display_name, player_id, engine_id, score, joined_at, left_at, outcome, bingo_count
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(format!("{}-seat-{}", session.id, participant.seat_number))
         .bind(&session.id)
@@ -272,13 +297,15 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         .bind(participant.score)
         .bind(&now)
         .bind(Option::<String>::None)
-        .execute(pool)
+        .bind(outcome.outcome.map(crate::stats::Outcome::as_db_str))
+        .bind(outcome.bingo_count)
+        .execute(&mut *tx)
         .await?;
     }
 
     sqlx::query("delete from game_moves where game_id = ?1")
         .bind(&session.id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
     for record in &session.moves {
@@ -296,13 +323,13 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         .bind(serde_json::to_string(record).expect("move record should serialize"))
         .bind(record.score_delta)
         .bind(&now)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
 
     sqlx::query("delete from game_messages where game_id = ?1")
         .bind(&session.id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
 
     for record in &session.messages {
@@ -317,10 +344,28 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         .bind(&record.display_name)
         .bind(&record.body)
         .bind(&record.created_at)
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     }
 
+    // The single-fire gate: only the save that actually transitions this
+    // game into Finished for the first time ever runs the rating step —
+    // never a legacy game that was already 'finished' before this column
+    // existed (no backfill), and never a repeat save of an already-rated
+    // game.
+    if session.status == GameStatus::Finished
+        && prior_status.as_deref() != Some("finished")
+        && prior_stats_settled_at.is_none()
+    {
+        crate::stats::settle_ratings(&mut tx, session, &now).await?;
+        sqlx::query("update games set stats_settled_at = ?2 where id = ?1")
+            .bind(&session.id)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
     Ok(())
 }
 
