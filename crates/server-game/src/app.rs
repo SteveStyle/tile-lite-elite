@@ -242,6 +242,7 @@ async fn list_games(
         .ok_or_else(|| ApiProblem::unauthorized("Sign in to see your games"))?;
 
     expire_overdue_turns(&state).await;
+    send_move_time_reminders(&state).await;
     expire_old_finished_games(&state).await;
     if let Err(error) = persistence::delete_expired_sessions(&state.db).await {
         tracing::error!(%error, "failed to delete expired sessions");
@@ -410,6 +411,7 @@ async fn create_game(
                 resigned: false,
                 removed_by_player: false,
                 invited_email,
+                reminder_sent_turn: None,
             }
         })
         .collect::<Vec<_>>();
@@ -723,6 +725,7 @@ async fn add_seat_to_game(
             resigned: false,
             removed_by_player: false,
             invited_email,
+            reminder_sent_turn: None,
         };
         game.add_seat(participant).map_err(ApiProblem::bad_request)?;
 
@@ -2413,6 +2416,111 @@ async fn expire_overdue_turns(state: &AppState) {
     }
     for dto in finished {
         let _ = state.events.send(GameEventDto::GameFinished { game: dto });
+    }
+}
+
+/// Move-time-limit fraction remaining at which a reminder email fires —
+/// see `send_move_time_reminders`.
+const REMINDER_REMAINING_FRACTION: u64 = 3;
+
+/// Games with a same-day move-time-limit don't get reminders — a limit
+/// that short doesn't leave enough runway for one to be useful.
+const REMINDER_MIN_TIME_LIMIT_SECONDS: u64 = 24 * 60 * 60;
+
+/// Same lazy-sweep pattern as `expire_overdue_turns` (no background
+/// scheduler in this server — see its doc comment): called from
+/// `list_games`, checks every active game whose `move_time_limit_seconds`
+/// exceeds a day, and emails the seat on turn once its remaining time
+/// drops to a third of that limit (e.g. 24h remaining on the default 72h
+/// limit). Fires at most once per turn, tracked via
+/// `ParticipantState::reminder_sent_turn`, and only for claimed human
+/// seats — engines never run out the clock in a way anyone needs telling
+/// about, and an unclaimed seat has no one to email.
+async fn send_move_time_reminders(state: &AppState) {
+    struct Reminder {
+        game_id: String,
+        seat: u8,
+        player_id: String,
+        display_name: String,
+        remaining_seconds: u64,
+    }
+
+    let mut reminders = Vec::new();
+    {
+        let mut games = state.games.write().await;
+        for game in games.values_mut() {
+            if game.move_time_limit_seconds <= REMINDER_MIN_TIME_LIMIT_SECONDS {
+                continue;
+            }
+            let Some(remaining) = game.seconds_remaining_on_turn() else {
+                continue;
+            };
+            if remaining * REMINDER_REMAINING_FRACTION > game.move_time_limit_seconds {
+                continue;
+            }
+            let seat = game.current_seat;
+            let turn_number = game.turn_number;
+            let Some(participant) = game.participants.get_mut(seat as usize) else {
+                continue;
+            };
+            if participant.kind != api::SeatKind::Human
+                || participant.reminder_sent_turn == Some(turn_number)
+            {
+                continue;
+            }
+            let Some(player_id) = participant.player_id.clone() else {
+                continue;
+            };
+            participant.reminder_sent_turn = Some(turn_number);
+            let display_name = participant.display_name.clone();
+
+            if let Err(error) = persistence::save_game(&state.db, game).await {
+                tracing::error!(game_id = %game.id, %error, "failed to persist move-time reminder flag");
+            }
+            reminders.push(Reminder {
+                game_id: game.id.clone(),
+                seat,
+                player_id,
+                display_name,
+                remaining_seconds: remaining,
+            });
+        }
+    }
+
+    for reminder in reminders {
+        let player = match persistence::get_player_by_id(&state.db, &reminder.player_id).await {
+            Ok(Some(player)) => player,
+            Ok(None) => continue,
+            Err(error) => {
+                tracing::error!(game_id = %reminder.game_id, seat = reminder.seat, %error, "failed to look up player for move-time reminder");
+                continue;
+            }
+        };
+        tracing::info!(game_id = %reminder.game_id, seat = reminder.seat, "move-time reminder sent");
+        crate::email::send_move_time_reminder(
+            &state.email,
+            &player.email,
+            &reminder.display_name,
+            &format_duration_days_hours(reminder.remaining_seconds),
+            &state.public_base_url,
+        )
+        .await;
+    }
+}
+
+/// "1 day 4 hours" / "1 day" / "4 hours" style label for the reminder
+/// email's body — coarser than the UI's `format_time_remaining` (spelled
+/// out, not `d`/`h` shorthand) since this reads as a sentence.
+fn format_duration_days_hours(total_seconds: u64) -> String {
+    let days = total_seconds / 86_400;
+    let hours = (total_seconds % 86_400) / 3_600;
+    let day_part = (days > 0).then(|| format!("{days} day{}", if days == 1 { "" } else { "s" }));
+    let hour_part = (hours > 0).then(|| format!("{hours} hour{}", if hours == 1 { "" } else { "s" }));
+    match (day_part, hour_part) {
+        (Some(d), Some(h)) => format!("{d} {h}"),
+        (Some(d), None) => d,
+        (None, Some(h)) => h,
+        (None, None) => "less than an hour".to_string(),
     }
 }
 
@@ -7272,6 +7380,147 @@ mod tests {
         assert!(
             log_text.contains("/invite?id="),
             "expected a join link in the email body, got log:\n{log_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn move_time_reminder_fires_once_when_a_long_limit_game_runs_low_on_time() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        // Default move_time_limit_seconds is 72h; back-date the turn's start
+        // so only ~1000s (well under the 24h/third-of-72h reminder
+        // threshold) remain on Alice's (seat 0) turn.
+        let started = create_two_human_game(app.clone()).await;
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&started.game.id).expect("game should exist");
+            let remaining = 1_000;
+            game.turn_started_at =
+                (now_iso().parse::<u64>().unwrap_or(0) + remaining - game.move_time_limit_seconds)
+                    .to_string();
+        }
+
+        let log = start_capturing_log_on_this_thread();
+
+        let response = send_empty_auth(
+            app.clone(),
+            Method::GET,
+            "/games",
+            Some(&started.alice.session_token),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let log_text = log.text();
+        assert!(
+            log_text.contains("alice@example.com"),
+            "expected a reminder emailed to alice@example.com, got log:\n{log_text}"
+        );
+        assert!(
+            log_text.contains("move is due soon"),
+            "expected the move-reminder email's subject, got log:\n{log_text}"
+        );
+
+        // A second sweep on the same turn must not send a second reminder.
+        let response = send_empty_auth(app, Method::GET, "/games", Some(&started.alice.session_token))
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let occurrences = log.text().matches("move is due soon").count();
+        assert_eq!(occurrences, 1, "reminder should fire at most once per turn, got log:\n{}", log.text());
+    }
+
+    #[tokio::test]
+    async fn move_time_reminder_does_not_fire_for_a_same_day_limit_game() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let alice = register_player(app.clone(), "Alice").await;
+        let bob = register_player(app.clone(), "Bob").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Open seat".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Open),
+                        },
+                    ],
+                    seed: Some(42),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: Some(3_600),
+                },
+            )
+            .await,
+        )
+        .await;
+
+        let bob_games: Vec<api::GameSummaryDto> = read_json(
+            send_empty_auth(app.clone(), Method::GET, "/games", Some(&bob.session_token)).await,
+        )
+        .await;
+        let invitation = bob_games
+            .iter()
+            .find(|summary| summary.id == created.id)
+            .expect("the open seat should appear in Bob's games list")
+            .invitation_id
+            .clone()
+            .expect("an invited-open entry should carry an invitation id");
+        let accept_response = send_empty_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/invitations/{invitation}/accept"),
+            Some(&bob.session_token),
+        )
+        .await;
+        assert_eq!(accept_response.status(), StatusCode::OK);
+
+        let started: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                Some(&alice.session_token),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(started.status, api::GameStatus::Active);
+
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&started.id).expect("game should exist");
+            game.turn_started_at =
+                (now_iso().parse::<u64>().unwrap_or(0) - game.move_time_limit_seconds + 30)
+                    .to_string();
+        }
+
+        let log = start_capturing_log_on_this_thread();
+        let response = send_empty_auth(app, Method::GET, "/games", Some(&alice.session_token)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let log_text = log.text();
+        assert!(
+            !log_text.contains("move is due soon"),
+            "a same-day move-time-limit game should never send a reminder, got log:\n{log_text}"
         );
     }
 

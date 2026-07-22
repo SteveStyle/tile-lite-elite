@@ -30,6 +30,7 @@ const WELCOME_TEMPLATE: &str = include_str!("../emails/welcome.txt");
 const INVITATION_TEMPLATE: &str = include_str!("../emails/invitation.txt");
 const JOIN_INVITATION_TEMPLATE: &str = include_str!("../emails/join-invitation.txt");
 const PASSWORD_RESET_TEMPLATE: &str = include_str!("../emails/password-reset.txt");
+const MOVE_REMINDER_TEMPLATE: &str = include_str!("../emails/move-reminder.txt");
 
 pub async fn send_welcome(config: &EmailConfig, to: &str, display_name: &str, base_url: &str) {
     let (subject, body) = render(
@@ -70,6 +71,27 @@ pub async fn send_join_invitation(config: &EmailConfig, to: &str, inviter_name: 
 
 pub async fn send_password_reset(config: &EmailConfig, to: &str, reset_url: &str) {
     let (subject, body) = render(PASSWORD_RESET_TEMPLATE, &[("reset_url", reset_url)]);
+    send(config, to, &subject, &body).await;
+}
+
+/// Sent at most once per turn, only once remaining time drops to a third
+/// of the game's move-time-limit — see `app::send_move_time_reminders`.
+/// `time_remaining` is a pre-formatted label like "1 day 4 hours".
+pub async fn send_move_time_reminder(
+    config: &EmailConfig,
+    to: &str,
+    display_name: &str,
+    time_remaining: &str,
+    base_url: &str,
+) {
+    let (subject, body) = render(
+        MOVE_REMINDER_TEMPLATE,
+        &[
+            ("display_name", display_name),
+            ("time_remaining", time_remaining),
+            ("base_url", base_url),
+        ],
+    );
     send(config, to, &subject, &body).await;
 }
 
@@ -165,6 +187,10 @@ mod tests {
                 &["inviter_name", "join_url"][..],
             ),
             (PASSWORD_RESET_TEMPLATE, &["reset_url"][..]),
+            (
+                MOVE_REMINDER_TEMPLATE,
+                &["display_name", "time_remaining", "base_url"][..],
+            ),
         ] {
             let values: Vec<(&str, &str)> = keys.iter().map(|key| (*key, "x")).collect();
             let (subject, body) = render(template, &values);

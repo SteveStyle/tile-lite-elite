@@ -210,6 +210,14 @@ pub struct ParticipantState {
     /// same as `removed_by_player`.
     #[serde(default)]
     pub invited_email: Option<String>,
+    /// The `turn_number` a "your time is running low" reminder email was
+    /// last sent for on this seat, if any — compared against the live
+    /// `turn_number` to tell whether one is still owed this turn. Never
+    /// needs resetting: a new turn always has a `turn_number` that doesn't
+    /// match whatever was stored here. Missing on any game persisted
+    /// before this field existed, same as `removed_by_player`.
+    #[serde(default)]
+    pub reminder_sent_turn: Option<i64>,
 }
 
 /// Number of consecutive scoreless plays (passes or exchanges), summed
@@ -469,6 +477,19 @@ impl GameSession {
         });
         self.handle_seat_exit(seat);
         true
+    }
+
+    /// Seconds left before the current seat's turn times out (see
+    /// `apply_move_timeout`), or `None` if the game isn't active or
+    /// `turn_started_at` fails to parse. Saturates at zero rather than
+    /// going negative once the deadline has already passed.
+    pub fn seconds_remaining_on_turn(&self) -> Option<u64> {
+        if self.status != GameStatus::Active {
+            return None;
+        }
+        let started = self.turn_started_at.parse::<u64>().ok()?;
+        let elapsed = now_unix_seconds().saturating_sub(started);
+        Some(self.move_time_limit_seconds.saturating_sub(elapsed))
     }
 
     /// A lightweight summary for games-list views. `last_activity_at` is
@@ -1329,6 +1350,7 @@ mod tests {
             resigned: false,
             removed_by_player: false,
             invited_email: None,
+            reminder_sent_turn: None,
         }
     }
 

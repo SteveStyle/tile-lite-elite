@@ -1,0 +1,5 @@
+Subject: Your move is due soon in Tile Lite Elite
+
+Hi {{display_name}},
+
+You have about {{time_remaining}} left to make your move. Log in at {{base_url}} to play your turn before time runs out.

@@ -80,6 +80,7 @@ fn engine_participant(seat_number: u8, display_name: &str) -> ParticipantState {
         resigned: false,
         removed_by_player: false,
         invited_email: None,
+        reminder_sent_turn: None,
     }
 }
 
