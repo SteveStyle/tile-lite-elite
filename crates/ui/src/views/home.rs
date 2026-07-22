@@ -278,7 +278,21 @@ pub fn Home(
                         } else if is_active {
                             div { class: "preview-banner",
                                 p { class: "composer-copy",
-                                    if is_your_turn { "Your turn" } else { "Waiting for {current_turn_name(&game)}" }
+                                    // The last move's own already-formatted
+                                    // description ("Alice played CARROT for
+                                    // 24", "Bob passed", ...) is more useful
+                                    // here than a bare "Your turn"/"Waiting
+                                    // for X" — whose turn it is stays visible
+                                    // in the status strip's "Turn: ..." chip
+                                    // above, so nothing is lost by giving this
+                                    // slot to the more informative text.
+                                    if let Some(last_move) = game.moves.last() {
+                                        "{last_move.description}"
+                                    } else if is_your_turn {
+                                        "Your turn"
+                                    } else {
+                                        "Waiting for {current_turn_name(&game)}"
+                                    }
                                 }
                             }
                         }
@@ -534,6 +548,7 @@ mod tests {
             invited_email: None,
             rating_before: None,
             rating_after: None,
+            resigned: false,
         }
     }
 

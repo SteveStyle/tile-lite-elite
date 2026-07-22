@@ -1130,6 +1130,18 @@ button:disabled {
     color: rgba(35, 25, 15, 0.55);
 }
 
+/* A resigned/force-resigned/timed-out seat, still shown in the roster
+   (never removed mid-game — see GameSession::handle_seat_exit) but done
+   playing. Dimmed rather than hidden, so it's clearly distinguishable
+   from the still-active rows around it without losing the row entirely. */
+.player-table-exited {
+    opacity: 0.55;
+}
+
+.player-table-exited .player-table-score {
+    font-weight: 400;
+}
+
 .player-table-reorder {
     display: inline-flex;
     flex-direction: column;

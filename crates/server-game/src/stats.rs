@@ -10,12 +10,17 @@ use sqlx::{Pool, Row, Sqlite, Transaction};
 use crate::game_state::GameSession;
 
 /// The move type of the very last move recorded, if any — for a `Finished`
-/// game this is always the terminal action that ended it: `"place"`/
-/// `"pass"`/`"exchange"` for a normal ending (someone went out, or the
-/// scoreless-turn limit), `"resign"`/`"force_resign"`/`"timeout"` for the
-/// three ways a game can be cut short, or `"admin_force_end"` for the admin
-/// cleanup tool. `None` only for a game with no moves at all (e.g.
-/// admin-force-ending a `Waiting` game that never started).
+/// game this is always whichever action actually finished it: `"place"`/
+/// `"pass"`/`"exchange"` for someone going out or hitting the scoreless-
+/// turn limit, `"resign"`/`"force_resign"`/`"timeout"` if the very last
+/// active seat exited (the game only continues past an individual exit
+/// while 2+ active seats remain — see `GameSession::handle_seat_exit`), or
+/// `"admin_force_end"` for the admin cleanup tool. `None` only for a game
+/// with no moves at all (e.g. admin-force-ending a `Waiting` game that
+/// never started). Used only to detect the `admin_force_end` case today —
+/// per-seat exit classification for ranking/rating goes through
+/// `seat_exit` instead, since a game can have exit moves scattered
+/// throughout its history, not just as the last move.
 fn terminal_move_type(session: &GameSession) -> Option<&str> {
     session.moves.last().map(|mv| mv.move_type.as_str())
 }
@@ -50,6 +55,32 @@ pub struct ParticipantOutcome {
     pub bingo_count: i64,
 }
 
+/// How a seat that's no longer active left the game — found by looking up
+/// *that seat's own* last resignation/force-resignation/timeout move.
+/// `Resigned`/`ForceResigned`/`TimedOut` mirrors move type 1:1, but is its
+/// own type rather than reusing `Outcome`: a force-resignation and a
+/// voluntary resignation are the identical `Outcome::Resigned` stats
+/// bucket, but need to be told apart for ranking purposes (only a
+/// voluntary resignation is ranked at all — see `settle_ratings`).
+enum SeatExit {
+    Resigned { move_number: i64 },
+    ForceResigned,
+    TimedOut,
+}
+
+fn seat_exit(session: &GameSession, seat_number: u8) -> Option<SeatExit> {
+    session
+        .moves
+        .iter()
+        .rev()
+        .find(|mv| mv.seat_number == seat_number && matches!(mv.move_type.as_str(), "resign" | "force_resign" | "timeout"))
+        .map(|mv| match mv.move_type.as_str() {
+            "timeout" => SeatExit::TimedOut,
+            "force_resign" => SeatExit::ForceResigned,
+            _ => SeatExit::Resigned { move_number: mv.move_number },
+        })
+}
+
 /// Pure and safe to call unconditionally on every save, `Finished` or not —
 /// once a game is `Finished` its participants/moves never change again, so
 /// recomputing this on a later re-save (e.g. `remove_for_player`) always
@@ -75,43 +106,29 @@ pub fn compute_participant_outcomes(session: &GameSession) -> Vec<ParticipantOut
             .collect();
     }
 
-    // At most one seat can be the resigned/timed-out forfeiter today — any
-    // resignation or timeout ends the whole game immediately (see
-    // `GameSession::finish_via_resignation`/`apply_move_timeout`) — so
-    // there's never more than one to find.
-    let forfeiter = session.participants.iter().find(|p| p.resigned);
-    let forfeiter_seat = forfeiter.map(|p| p.seat_number);
-    let forfeiter_outcome = forfeiter.map(|p| {
-        let is_timeout = session
-            .moves
-            .iter()
-            .rev()
-            .find(|mv| mv.seat_number == p.seat_number && (mv.move_type == "resign" || mv.move_type == "force_resign" || mv.move_type == "timeout"))
-            .is_some_and(|mv| mv.move_type == "timeout");
-        if is_timeout { Outcome::Timeout } else { Outcome::Resigned }
-    });
-
-    let max_score = session
-        .participants
-        .iter()
-        .filter(|p| Some(p.seat_number) != forfeiter_seat)
-        .map(|p| p.score)
-        .max();
+    // A game can now continue through several individual exits before it
+    // actually finishes (see `GameSession::handle_seat_exit`), so there
+    // can be any number of resigned/timed-out/force-resigned seats, not
+    // just one — win/loss/tie is decided purely among the seats that were
+    // still active when the game ended.
+    let max_score = session.participants.iter().filter(|p| !p.resigned).map(|p| p.score).max();
 
     session
         .participants
         .iter()
         .map(|p| {
-            let outcome = if Some(p.seat_number) == forfeiter_seat {
-                forfeiter_outcome.unwrap_or(Outcome::Resigned)
+            let outcome = if p.resigned {
+                match seat_exit(session, p.seat_number) {
+                    Some(SeatExit::TimedOut) => Outcome::Timeout,
+                    // A force-resignation and a voluntary resignation are
+                    // the same stats bucket — only their ranking/rating
+                    // treatment differs (see `settle_ratings`).
+                    Some(SeatExit::ForceResigned) | Some(SeatExit::Resigned { .. }) | None => Outcome::Resigned,
+                }
             } else {
                 match max_score {
                     Some(max) if p.score == max => {
-                        let sharers = session
-                            .participants
-                            .iter()
-                            .filter(|q| Some(q.seat_number) != forfeiter_seat && q.score == max)
-                            .count();
+                        let sharers = session.participants.iter().filter(|q| !q.resigned && q.score == max).count();
                         if sharers > 1 { Outcome::Tie } else { Outcome::Win }
                     }
                     _ => Outcome::Loss,
@@ -137,18 +154,27 @@ const RATING_FLOOR: f64 = 100.0;
 /// writes anything:
 ///
 /// - Skips entirely (no writes, no `games_rated` change) when the game's
-///   terminal move was a timeout or a creator-forced resignation — an
-///   administrative/non-organic ending shouldn't move anyone's rating,
-///   unlike a *voluntary* resignation, which does (via the forfeit-ranking
-///   below).
-/// - Skips a seat with neither a `player_id` nor an `engine_id` (an
-///   unclaimed seat — reachable via `admin_force_end_game` on a `Waiting`
+///   terminal move was an admin force-end — the one ending with no
+///   per-seat signal at all (see `GameSession::admin_force_finish`), so
+///   there's nothing to attribute a rating change to.
+/// - A seat whose own exit was a force-resignation or a timeout is left
+///   out of ranking entirely — not "last", simply not rated by this game
+///   at all, same treatment as an unresolvable seat (no `player_id`/
+///   `engine_id`, e.g. an unclaimed seat on an admin-force-ended `Waiting`
 ///   game).
-/// - Skips entirely if fewer than 2 such seats remain.
+/// - Skips entirely if fewer than 2 rankable seats remain.
 ///
-/// Seats are ranked by `(!forfeited, score)`, not raw `score` — so a player
-/// who resigns while ahead on points still ranks last for rating purposes,
-/// matching who the game actually declared the winner to be.
+/// The remaining seats rank in two tiers: still-active "finishers" (by
+/// score) always outrank voluntary resigners (by resignation recency —
+/// the seat that resigned *later* ranks better among resigners), matching
+/// a full multi-player example worked through with the user: seats
+/// A and B resign in that order, C is force-resigned, D times out, E and
+/// F finish with scores 100/200 → F, then E, then B, then A are ranked
+/// (highest to lowest); C and D aren't ranked or rated at all. A 2-seat
+/// game is the degenerate case of the same rule (one seat exiting always
+/// leaves at most one other active, ending the game immediately) — the
+/// player who resigns while ahead on points still ranks below the other,
+/// which is why voluntary resignation is ranked rather than excluded.
 ///
 /// A subject occupying more than one seat in the same game (e.g. two engine
 /// seats both bound to the same bot in a "Bot Showdown") is handled by
@@ -156,48 +182,55 @@ const RATING_FLOOR: f64 = 100.0;
 /// skipping the game — two seats for the identical subject always net to
 /// an exact zero contribution from their own mutual pairing (for any pair
 /// `(i, j)`, `delta_j = K·((1−S_i) − (1−E_i)) = −delta_i`, regardless of
-/// score or forfeit status), so this naturally handles pure self-play
-/// (nets to zero) and a mixed game (e.g. a human seated against two bot
-/// seats, whose combined effect lands as one net update to the bot's row)
-/// without any special-casing.
+/// their rank), so this naturally handles pure self-play (nets to zero)
+/// and a mixed game (e.g. a human seated against two bot seats, whose
+/// combined effect lands as one net update to the bot's row) without any
+/// special-casing.
 pub async fn settle_ratings(
     tx: &mut Transaction<'_, Sqlite>,
     session: &GameSession,
     ended_at: &str,
 ) -> Result<(), sqlx::Error> {
-    // Timeout, creator-forced resignation, and an admin force-end are all
-    // administrative/non-organic endings that shouldn't move anyone's
-    // rating — unlike a normal finish or a *voluntary* resignation, which
-    // do. `terminal_move_type` also covers a `Waiting` game admin-force-
-    // ended with no moves at all (`None`, correctly not administrative in
-    // the sense of "skip because of this check" — it's excluded below
-    // anyway by having fewer than 2 resolvable seats in the typical case,
-    // but if it somehow has 2+ claimed seats with zero moves played, that
-    // still isn't an organic ending and also shouldn't rate — so `None`
-    // is folded into the skip here too).
-    let administrative_ending = !matches!(terminal_move_type(session), Some("place" | "pass" | "exchange" | "resign"));
-    if administrative_ending {
+    if terminal_move_type(session) == Some("admin_force_end") {
         return Ok(());
     }
 
-    let forfeiter_seat = session.participants.iter().find(|p| p.resigned).map(|p| p.seat_number);
-
-    // (subject_kind, subject_id, forfeited, score) per resolvable seat.
-    let mut seats: Vec<(&'static str, String, bool, i32)> = Vec::new();
+    // (subject_kind, subject_id, rank_key) per rankable seat. `rank_key`'s
+    // first element is the tier — 1 (finisher) always outranks 0
+    // (resigner) regardless of the second element, since tuples compare
+    // lexicographically — and the second element is the finisher's score,
+    // or the resigner's own resignation move number (later = better among
+    // resigners). A force-resigned/timed-out seat, or one with neither a
+    // `player_id` nor an `engine_id`, is skipped entirely: not ranked, not
+    // in the pairwise comparison at all.
+    let mut seats: Vec<(&'static str, String, (u8, i64))> = Vec::new();
     for p in &session.participants {
         let subject = match (&p.player_id, &p.engine_id) {
             (Some(id), None) => ("player", id.clone()),
             (None, Some(id)) => ("engine", id.clone()),
             _ => continue,
         };
-        seats.push((subject.0, subject.1, Some(p.seat_number) == forfeiter_seat, p.score));
+        let rank_key = if p.resigned {
+            match seat_exit(session, p.seat_number) {
+                Some(SeatExit::Resigned { move_number }) => (0u8, move_number),
+                // Excluded from ranking entirely, per the user's rule.
+                Some(SeatExit::ForceResigned) | Some(SeatExit::TimedOut) => continue,
+                // A resigned seat with no matching exit move on record —
+                // shouldn't happen in practice, but there's nothing to
+                // rank it by, so exclude rather than guess.
+                None => continue,
+            }
+        } else {
+            (1u8, p.score as i64)
+        };
+        seats.push((subject.0, subject.1, rank_key));
     }
     if seats.len() < 2 {
         return Ok(());
     }
 
     let mut ratings_before = Vec::with_capacity(seats.len());
-    for (kind, id, ..) in &seats {
+    for (kind, id, _) in &seats {
         let row = sqlx::query("select rating from player_ratings where subject_kind = ?1 and subject_id = ?2")
             .bind(*kind)
             .bind(id.as_str())
@@ -213,9 +246,7 @@ pub async fn settle_ratings(
             if i == j {
                 continue;
             }
-            let rank_i = (!seats[i].2, seats[i].3);
-            let rank_j = (!seats[j].2, seats[j].3);
-            let s_i = match rank_i.cmp(&rank_j) {
+            let s_i = match seats[i].2.cmp(&seats[j].2) {
                 std::cmp::Ordering::Greater => 1.0,
                 std::cmp::Ordering::Less => 0.0,
                 std::cmp::Ordering::Equal => 0.5,
@@ -229,7 +260,7 @@ pub async fn settle_ratings(
     // deltas (and its pre-game rating, identical across those seats since
     // it's the same DB row) summed into one net update.
     let mut by_subject: std::collections::BTreeMap<(&'static str, String), (f64, f64)> = std::collections::BTreeMap::new();
-    for (i, (kind, id, ..)) in seats.iter().enumerate() {
+    for (i, (kind, id, _)) in seats.iter().enumerate() {
         let entry = by_subject.entry((*kind, id.clone())).or_insert((ratings_before[i], 0.0));
         entry.1 += deltas[i];
     }

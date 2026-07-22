@@ -434,13 +434,13 @@ impl GameSession {
 
     /// Auto-retires the current seat if it has sat on its turn past
     /// `move_time_limit_seconds`, exactly as if that player had resigned —
-    /// same "the game ends the moment anyone leaves" rule `apply_resign`
-    /// already applies, just triggered by a deadline instead of a manual
-    /// action. Returns whether anything changed, so callers know whether to
-    /// persist and broadcast. There's no background scheduler in this
-    /// server, so this is checked lazily whenever a game is touched (see
-    /// `expire_overdue_turns` in `app.rs`) rather than firing exactly on
-    /// the deadline.
+    /// removes just this seat and moves play on to the next active one
+    /// (see `handle_seat_exit`), same as `apply_resign`, just triggered by
+    /// a deadline instead of a manual action. Returns whether anything
+    /// changed, so callers know whether to persist and broadcast. There's
+    /// no background scheduler in this server, so this is checked lazily
+    /// whenever a game is touched (see `expire_overdue_turns` in `app.rs`)
+    /// rather than firing exactly on the deadline.
     pub fn apply_move_timeout(&mut self) -> bool {
         if self.status != GameStatus::Active {
             return false;
@@ -467,12 +467,7 @@ impl GameSession {
             positions: Vec::new(),
             description: format!("{display_name} was retired for exceeding the move time limit"),
         });
-        self.winner_seat = self
-            .participants
-            .iter()
-            .find(|other| !other.resigned)
-            .map(|other| other.seat_number);
-        self.status = GameStatus::Finished;
+        self.handle_seat_exit(seat);
         true
     }
 
@@ -500,6 +495,7 @@ impl GameSession {
                     invited_email: participant.invited_email.clone(),
                     rating_before: None,
                     rating_after: None,
+                    resigned: participant.resigned,
                 })
                 .collect(),
             last_activity_at,
@@ -550,6 +546,7 @@ impl GameSession {
                     // `stats::attach_rating_deltas`.
                     rating_before: None,
                     rating_after: None,
+                    resigned: participant.resigned,
                 })
                 .collect(),
             board: board_to_dto(&self.state.board, &self.rules.alphabet),
@@ -762,14 +759,14 @@ impl GameSession {
         self.finish_via_resignation(seat_number, "resign", "resigned")
     }
 
-    /// The game manager's override: ends the game on behalf of a seat that
-    /// isn't necessarily on turn — unlike self-`apply_resign` (which
+    /// The game manager's override: removes a seat on behalf of a player
+    /// who isn't necessarily on turn — unlike self-`apply_resign` (which
     /// requires it to be exactly that seat's turn, since a player resigns
     /// *in place of* taking their move), a creator dealing with a player
     /// who's gone quiet needs to act regardless of whose turn it currently
-    /// is. Same effect otherwise: this codebase's `resign` has always meant
-    /// "end the game now, remaining player(s) win," not "this seat drops
-    /// out and play continues" — see `finish_via_resignation`.
+    /// is. Same effect otherwise: see `finish_via_resignation` — this seat
+    /// drops out, everyone else keeps playing (the whole game only ends
+    /// once at most one active seat remains).
     pub fn force_resign(&mut self, seat_number: u8) -> Result<(), String> {
         if self.status != GameStatus::Active {
             return Err("The game must be active to force-resign a seat".to_string());
@@ -794,6 +791,12 @@ impl GameSession {
     /// downstream code (rating: a win by force-resignation doesn't move
     /// rating, unlike a win by voluntary resignation) can tell them apart
     /// without parsing `reason`/`description` text.
+    ///
+    /// Removes just this one seat — the game only ends outright once
+    /// `handle_seat_exit` finds at most one active seat left; with more
+    /// than that still playing, this seat simply drops out and everyone
+    /// else continues, matching a real multi-player table where one
+    /// player quitting shouldn't end the game for the rest.
     fn finish_via_resignation(&mut self, seat_number: u8, move_type: &str, reason: &str) -> Result<(), String> {
         let participant = self
             .participants
@@ -809,12 +812,7 @@ impl GameSession {
             positions: Vec::new(),
             description: format!("{} {reason}", participant.display_name),
         });
-        self.winner_seat = self
-            .participants
-            .iter()
-            .find(|other| !other.resigned)
-            .map(|other| other.seat_number);
-        self.status = GameStatus::Finished;
+        self.handle_seat_exit(seat_number);
         Ok(())
     }
 
@@ -1008,12 +1006,18 @@ impl GameSession {
         self.winner_seat = self.compute_winner_seat();
     }
 
+    /// Only among seats that were still active when the game ended — a
+    /// seat that already resigned/timed out/was force-resigned earlier in
+    /// this same game has a score frozen from whenever it left, which
+    /// must never win purely because a plain unfiltered `max` happened to
+    /// land on it (reachable the moment a game can continue with some
+    /// seats already exited, see `handle_seat_exit`).
     fn compute_winner_seat(&self) -> Option<u8> {
-        let max_score = self.participants.iter().map(|p| p.score).max()?;
+        let max_score = self.participants.iter().filter(|p| !p.resigned).map(|p| p.score).max()?;
         let mut leaders = self
             .participants
             .iter()
-            .filter(|participant| participant.score == max_score);
+            .filter(|participant| !participant.resigned && participant.score == max_score);
         let first = leaders.next()?;
         if leaders.next().is_some() {
             None
@@ -1022,29 +1026,62 @@ impl GameSession {
         }
     }
 
+    /// Checked before finding a next seat, not after — once a game can
+    /// accumulate exits from several individual resignations/timeouts
+    /// across its own history (see `handle_seat_exit`), a plain "advance
+    /// to current+1" would loop forever hunting for an active seat if at
+    /// most one remains. Also used directly by `handle_seat_exit`, which
+    /// needs the identical check outside of a turn-advance (a
+    /// force-resignation targeting a seat that isn't on turn still needs
+    /// to end the game immediately if it was the second-to-last active
+    /// seat, without otherwise touching whose turn it is).
+    fn finish_if_one_or_fewer_active(&mut self) -> bool {
+        if self.participants.iter().filter(|p| !p.resigned).count() > 1 {
+            return false;
+        }
+        self.status = GameStatus::Finished;
+        self.winner_seat = self
+            .participants
+            .iter()
+            .find(|participant| !participant.resigned)
+            .map(|participant| participant.seat_number);
+        true
+    }
+
     fn advance_turn(&mut self) {
         if self.status == GameStatus::Finished {
             return;
         }
+        if self.finish_if_one_or_fewer_active() {
+            return;
+        }
 
-        let next_seat = ((self.current_seat as usize + 1) % self.participants.len()) as u8;
-        self.current_seat = next_seat;
+        let seat_count = self.participants.len();
+        let mut next_seat = (self.current_seat as usize + 1) % seat_count;
+        while self.participants[next_seat].resigned {
+            next_seat = (next_seat + 1) % seat_count;
+        }
+        self.current_seat = next_seat as u8;
         self.turn_number += 1;
         self.turn_started_at = now_unix_seconds().to_string();
+    }
 
-        if self
-            .participants
-            .iter()
-            .filter(|participant| !participant.resigned)
-            .count()
-            <= 1
-        {
-            self.status = GameStatus::Finished;
-            self.winner_seat = self
-                .participants
-                .iter()
-                .find(|participant| !participant.resigned)
-                .map(|participant| participant.seat_number);
+    /// Applies the turn-order consequence of a seat leaving the game
+    /// (resignation, force-resignation, or a move timeout) — called after
+    /// `participant.resigned` has already been set to `true` for
+    /// `seat_number`. If this leaves at most one active seat, the game
+    /// ends now. Otherwise, only if it was `seat_number`'s own turn does
+    /// play move on (like a pass, via `advance_turn`) — a force-
+    /// resignation targeting a seat that wasn't on turn leaves the
+    /// current turn undisturbed, matching how `force_resign` already
+    /// works today (it can target any seat regardless of whose turn it
+    /// is).
+    fn handle_seat_exit(&mut self, seat_number: u8) {
+        if self.finish_if_one_or_fewer_active() {
+            return;
+        }
+        if seat_number == self.current_seat {
+            self.advance_turn();
         }
     }
 }

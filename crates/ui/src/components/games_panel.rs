@@ -1016,7 +1016,17 @@ fn player_table(
     let rows = participants.iter().map(|participant| {
         let is_you = viewer_player_id.is_some() && participant.player_id.as_deref() == viewer_player_id;
         let is_creators_seat = creator_player_id.is_some() && participant.player_id.as_deref() == creator_player_id;
-        let row_class = if is_you { "player-table-you" } else { "" };
+        // A resigned/force-resigned/timed-out seat stays in the roster
+        // (never removed mid-game) but is done playing — greyed out
+        // rather than dropped, so the table still shows who was in the
+        // game. Which of the three it was is already visible in that
+        // seat's own "Last move" cell.
+        let row_class = match (is_you, participant.resigned) {
+            (true, true) => "player-table-you player-table-exited",
+            (true, false) => "player-table-you",
+            (false, true) => "player-table-exited",
+            (false, false) => "",
+        };
         let cell = last_move_cell(moves, participant.seat_number);
         let seat_number = participant.seat_number;
         let is_claimed = participant.player_id.is_some();
@@ -1056,14 +1066,13 @@ fn player_table(
                 }
             }
         } else if game_status == GameStatus::Active {
-            // No need to also check "already resigned" — `ParticipantDto`
-            // doesn't even expose that, because it can't matter: resigning
-            // (self or forced) ends the *whole* game immediately (see
-            // `GameSession::finish_via_resignation`), so the moment any
-            // seat resigns, `game_status` stops being `Active` for
-            // everyone and this whole branch stops rendering at all.
+            // A multi-player game keeps going once at least 2 seats are
+            // still active (see `GameSession::handle_seat_exit`), so an
+            // already-resigned/force-resigned/timed-out seat can be sat
+            // right next to still-playing ones here — must check
+            // `participant.resigned` explicitly, not just `game_status`.
             rsx! {
-                if viewer_is_creator && !is_creators_seat {
+                if viewer_is_creator && !is_creators_seat && !participant.resigned {
                     button {
                         class: "toggle-button toggle-button-muted",
                         onclick: move |_| confirm_action.set(Some(SeatConfirmAction::ForceResign(seat_number))),
@@ -1700,6 +1709,7 @@ mod tests {
             invited_email: None,
             rating_before: None,
             rating_after: None,
+            resigned: false,
         }
     }
 

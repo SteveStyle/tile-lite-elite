@@ -1680,6 +1680,7 @@ fn empty_live_game() -> GameStateDto {
             invited_email: None,
             rating_before: None,
             rating_after: None,
+            resigned: false,
         }],
         board: empty_board(),
         racks: vec![RackDto {
@@ -3871,6 +3872,7 @@ mod tests {
             invited_email: None,
             rating_before: None,
             rating_after: None,
+            resigned: false,
         }
     }
 

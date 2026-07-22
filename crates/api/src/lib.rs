@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// compatibility check fire on every routine bugfix deploy. Release/build
 /// numbering for display purposes is a separate concern — see each
 /// binary's own `app_version()`.
-pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 2 };
+pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 3 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiVersion {
@@ -217,6 +217,16 @@ pub struct ParticipantDto {
     /// roster view can show it and a "Send"/"Resend" click doesn't need it
     /// re-typed. `None` for every other seat kind/claim.
     pub invited_email: Option<String>,
+    /// This seat has left the game — resigned, force-resigned, or timed
+    /// out — but is still shown in the roster (never removed mid-game),
+    /// gone from the turn order, and (once the game is `Finished`)
+    /// excluded from ranking unless it was a voluntary resignation, which
+    /// is still ranked, just below every seat that kept playing — see
+    /// `stats::settle_ratings`'s doc comment for the full ranking rule.
+    /// The roster view uses this to gray the seat out; which of
+    /// resigned/force-resigned/timed-out it was is already visible via
+    /// that seat's own "Last move" cell.
+    pub resigned: bool,
 }
 
 /// A `Waiting` game's unclaimed-seat lifecycle, inferred from that seat's

@@ -2586,6 +2586,7 @@ async fn admin_list_games(
                     invited_email: participant.invited_email.clone(),
                     rating_before: None,
                     rating_after: None,
+                    resigned: participant.resigned,
                 })
                 .collect(),
         })
@@ -2699,7 +2700,7 @@ impl IntoResponse for ApiProblem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::game_state::{board_from_dto, move_candidate_to_dto};
+    use crate::game_state::{MoveRecord, board_from_dto, move_candidate_to_dto};
     use api::{CreateSeatRequest, GameStateDto, SeatClaim, SeatKind};
     use axum::body::{Body, to_bytes};
     use axum::http::{Method, Request};
@@ -4251,6 +4252,368 @@ mod tests {
         .await;
         assert_eq!(started.status, api::GameStatus::Active);
         TwoHumanGame { game: started, alice: waiting.alice, bob: waiting.bob }
+    }
+
+    struct ThreeHumanGame {
+        game: GameStateDto,
+        alice: PlayerSessionDto,
+        bob: PlayerSessionDto,
+        carol: PlayerSessionDto,
+    }
+
+    /// Same shape as `create_two_human_game`, one more seat — used by the
+    /// multi-player continuation tests, which specifically need at least 3
+    /// active seats to observe "one resigns, the other two keep playing"
+    /// (with only 2 seats, any single exit always ends the game).
+    async fn create_three_human_game(app: Router) -> ThreeHumanGame {
+        let alice = register_player(app.clone(), "Alice3").await;
+        let bob = register_player(app.clone(), "Bob3").await;
+        let carol = register_player(app.clone(), "Carol3").await;
+
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Alice3".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Bob3".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Named { display_name: "Bob3".to_string() }),
+                        },
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "Carol3".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Named { display_name: "Carol3".to_string() }),
+                        },
+                    ],
+                    seed: Some(42),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+
+        for player in [&bob, &carol] {
+            let games: Vec<api::GameSummaryDto> = read_json(
+                send_empty_auth(app.clone(), Method::GET, "/games", Some(&player.session_token)).await,
+            )
+            .await;
+            let invitation_id = games
+                .iter()
+                .find(|summary| summary.id == created.id)
+                .expect("the named invitation should appear in this player's games list")
+                .invitation_id
+                .clone()
+                .expect("a named-invited entry should carry an invitation id");
+            let accept_response = send_empty_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/invitations/{invitation_id}/accept"),
+                Some(&player.session_token),
+            )
+            .await;
+            assert_eq!(accept_response.status(), StatusCode::OK);
+        }
+
+        let started: GameStateDto = read_json(
+            send_json_auth(
+                app,
+                Method::POST,
+                &format!("/games/{}/start", created.id),
+                Some(&alice.session_token),
+                &StartGameRequest::default(),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(started.status, api::GameStatus::Active);
+        ThreeHumanGame { game: started, alice, bob, carol }
+    }
+
+    #[tokio::test]
+    async fn a_resignation_in_a_three_player_game_only_removes_that_seat() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_three_human_game(app.clone()).await;
+        assert_eq!(started.game.current_seat, 0, "Alice3 (seat 0) goes first");
+
+        // Alice passes so it becomes Bob's turn.
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.alice.session_token),
+            &GameActionRequest { seat_number: 0, action: PlayerActionDto::Pass },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let after_alice: GameStateDto = read_json(response).await;
+        assert_eq!(after_alice.current_seat, 1);
+
+        // Bob resigns instead of taking his turn.
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.bob.session_token),
+            &GameActionRequest { seat_number: 1, action: PlayerActionDto::Resign },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let after_bob: GameStateDto = read_json(response).await;
+        assert_eq!(
+            after_bob.status,
+            api::GameStatus::Active,
+            "2 active seats remain (Alice, Carol) — the game must not end"
+        );
+        assert_eq!(
+            after_bob.current_seat, 2,
+            "turn should skip straight to Carol (seat 2), not wrap back to resigned Bob"
+        );
+
+        // Carol takes a real turn — confirms she genuinely can still act.
+        let response = send_json_auth(
+            app.clone(),
+            Method::POST,
+            &format!("/games/{}/actions", started.game.id),
+            Some(&started.carol.session_token),
+            &GameActionRequest { seat_number: 2, action: PlayerActionDto::Pass },
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let after_carol: GameStateDto = read_json(response).await;
+        assert_eq!(after_carol.status, api::GameStatus::Active);
+        assert_eq!(after_carol.current_seat, 0, "turn wraps back to Alice, skipping resigned Bob again");
+    }
+
+    #[tokio::test]
+    async fn six_player_game_ranks_finishers_by_score_then_resigners_by_recency_and_excludes_force_resigned_and_timed_out()
+    {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        // A: resigns first. B: resigns second (should outrank A). C:
+        // force-resigned (excluded). D: times out (excluded). E: finishes
+        // with 100. F: finishes with 200 (should outrank E). Built via the
+        // real API, then only the exits themselves are poked directly
+        // (score/resigned/move history) — same convention already used by
+        // `voluntary_resignation_moves_rating_via_forfeit_ranking_even_when_ahead_on_score`.
+        let alice = register_player(app.clone(), "A6").await;
+        let bob = register_player(app.clone(), "B6").await;
+        let carol = register_player(app.clone(), "C6").await;
+        let dave = register_player(app.clone(), "D6").await;
+        let eve = register_player(app.clone(), "E6").await;
+        let frank = register_player(app.clone(), "F6").await;
+
+        let named = |name: &str| CreateSeatRequest {
+            kind: SeatKind::Human,
+            display_name: name.to_string(),
+            engine_id: None,
+            claim: Some(SeatClaim::Named { display_name: name.to_string() }),
+        };
+        let created: GameStateDto = read_json(
+            send_json_auth(
+                app.clone(),
+                Method::POST,
+                "/games",
+                Some(&alice.session_token),
+                &CreateGameRequest {
+                    seats: vec![
+                        CreateSeatRequest {
+                            kind: SeatKind::Human,
+                            display_name: "A6".to_string(),
+                            engine_id: None,
+                            claim: Some(SeatClaim::Creator),
+                        },
+                        named("B6"),
+                        named("C6"),
+                        named("D6"),
+                        named("E6"),
+                        named("F6"),
+                    ],
+                    seed: Some(99),
+                    variant: None,
+                    language: None,
+                    board_layout: None,
+                    move_time_limit_seconds: None,
+                },
+            )
+            .await,
+        )
+        .await;
+
+        for player in [&bob, &carol, &dave, &eve, &frank] {
+            let games: Vec<api::GameSummaryDto> = read_json(
+                send_empty_auth(app.clone(), Method::GET, "/games", Some(&player.session_token)).await,
+            )
+            .await;
+            let invitation_id = games
+                .iter()
+                .find(|summary| summary.id == created.id)
+                .expect("named invitation should appear in this player's games list")
+                .invitation_id
+                .clone()
+                .expect("invitation id");
+            let response = send_empty_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/invitations/{invitation_id}/accept"),
+                Some(&player.session_token),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        send_json_auth(
+            app,
+            Method::POST,
+            &format!("/games/{}/start", created.id),
+            Some(&alice.session_token),
+            &StartGameRequest::default(),
+        )
+        .await;
+
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&created.id).expect("game should exist");
+            let exit = |game: &mut GameSession, seat: u8, move_number: i64, move_type: &str, description: &str| {
+                game.participants[seat as usize].resigned = true;
+                game.moves.push(MoveRecord {
+                    move_number,
+                    seat_number: seat,
+                    move_type: move_type.to_string(),
+                    main_word: None,
+                    score_delta: 0,
+                    positions: Vec::new(),
+                    description: description.to_string(),
+                });
+            };
+            exit(game, 0, 1, "resign", "A6 resigned");
+            exit(game, 1, 2, "resign", "B6 resigned");
+            exit(game, 2, 3, "force_resign", "C6 resigned (by the game creator)");
+            exit(game, 3, 4, "timeout", "D6 was retired for exceeding the move time limit");
+            game.participants[4].score = 100;
+            game.participants[5].score = 200;
+            game.status = api::GameStatus::Finished;
+            game.winner_seat = Some(5);
+            persistence::save_game(&state.db, game)
+                .await
+                .expect("save should succeed");
+        }
+
+        for (name, player_id) in [("C6", &carol.player_id), ("D6", &dave.player_id)] {
+            let stats = stats::get_subject_stats(&state.db, "player", player_id)
+                .await
+                .expect("stats query should succeed");
+            assert_eq!(stats.games_rated, 0, "{name} was force-resigned/timed out and must not be rated");
+        }
+
+        let rating_of = |player_id: &str| {
+            let pool = state.db.clone();
+            let player_id = player_id.to_string();
+            async move {
+                stats::get_subject_stats(&pool, "player", &player_id)
+                    .await
+                    .expect("stats query should succeed")
+            }
+        };
+        let rating_a = rating_of(&alice.player_id).await;
+        let rating_b = rating_of(&bob.player_id).await;
+        let rating_e = rating_of(&eve.player_id).await;
+        let rating_f = rating_of(&frank.player_id).await;
+        assert_eq!(rating_a.games_rated, 1);
+        assert_eq!(rating_b.games_rated, 1);
+        assert_eq!(rating_e.games_rated, 1);
+        assert_eq!(rating_f.games_rated, 1);
+        assert!(
+            rating_f.rating > rating_e.rating,
+            "F (score 200) should rank above E (score 100): F={} E={}",
+            rating_f.rating,
+            rating_e.rating
+        );
+        assert!(
+            rating_e.rating > rating_b.rating,
+            "E (a finisher) should rank above B (a resigner) regardless of score: E={} B={}",
+            rating_e.rating,
+            rating_b.rating
+        );
+        assert!(
+            rating_b.rating > rating_a.rating,
+            "B (resigned later) should rank above A (resigned earlier): B={} A={}",
+            rating_b.rating,
+            rating_a.rating
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_winner_seat_ignores_a_resigned_seats_frozen_score() {
+        let database_url = test_database_url();
+        let state = create_test_state(&database_url).await;
+        let app = build_router(state.clone());
+
+        let started = create_three_human_game(app.clone()).await;
+        assert_eq!(started.game.current_seat, 0);
+
+        // Alice resigns first, holding what would be (if it counted) the
+        // highest score in the game — must never be allowed to "win" via
+        // `compute_winner_seat`'s max, since she was no longer playing
+        // when the game actually ended.
+        {
+            let mut games = state.games.write().await;
+            let game = games.get_mut(&started.game.id).expect("game should exist");
+            game.apply_resign(0).expect("Alice should be able to resign on her own turn");
+            game.participants[0].score = 500;
+        }
+
+        // Bob and Carol pass repeatedly to hit the scoreless-turn limit
+        // and finish the game normally between just the two of them.
+        for seat in [1u8, 2, 1, 2, 1, 2] {
+            let token = if seat == 1 { &started.bob.session_token } else { &started.carol.session_token };
+            let response = send_json_auth(
+                app.clone(),
+                Method::POST,
+                &format!("/games/{}/actions", started.game.id),
+                Some(token),
+                &GameActionRequest { seat_number: seat, action: PlayerActionDto::Pass },
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        let fetched: GameStateDto = read_json(
+            send_empty_auth(
+                app,
+                Method::GET,
+                &format!("/games/{}", started.game.id),
+                Some(&started.alice.session_token),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(fetched.status, api::GameStatus::Finished);
+        assert_ne!(
+            fetched.winner_seat,
+            Some(0),
+            "Alice resigned and must never be declared the winner despite her frozen score"
+        );
     }
 
     #[tokio::test]
