@@ -3008,14 +3008,14 @@ async fn registering_without_stay_logged_in_gets_a_session_that_expires() {
         .parse()
         .unwrap();
     let now: u64 = super::now_iso().parse().unwrap();
-    // Should be ~7 days out — just confirm it's in the right ballpark
-    // rather than pinning an exact second.
-    assert!(expires_at > now + 6 * 24 * 60 * 60);
-    assert!(expires_at < now + 8 * 24 * 60 * 60);
+    // Should be ~10 days out (the uniform absolute cap) — just confirm it's
+    // in the right ballpark rather than pinning an exact second.
+    assert!(expires_at > now + 9 * 24 * 60 * 60);
+    assert!(expires_at < now + 11 * 24 * 60 * 60);
 }
 
 #[tokio::test]
-async fn logging_in_with_stay_logged_in_gets_a_session_that_never_expires() {
+async fn stay_logged_in_no_longer_changes_server_side_expiry() {
     let database_url = test_database_url();
     let state = create_test_state(&database_url).await;
     let db = state.db.clone();
@@ -3039,15 +3039,32 @@ async fn logging_in_with_stay_logged_in_gets_a_session_that_never_expires() {
         .await
         .expect("query should succeed")
         .expect("session should exist");
+    // `stay_logged_in` is still recorded (it drives client-side token
+    // persistence), but it no longer affects server-side expiry: every
+    // session now gets the same ~10-day absolute cap, not the old "never
+    // expires".
     assert!(record.stay_logged_in);
-    assert_eq!(record.expires_at, None);
+    let expires_at: u64 = record
+        .expires_at
+        .expect("a stay_logged_in session now has an absolute expiry too")
+        .parse()
+        .unwrap();
+    let now: u64 = super::now_iso().parse().unwrap();
+    assert!(expires_at > now + 9 * 24 * 60 * 60);
+    assert!(expires_at < now + 11 * 24 * 60 * 60);
 }
 
+/// A session past its absolute `expires_at` is rejected. A session with *no*
+/// absolute expiry (the shape old `stay_logged_in` rows have, from before
+/// expiry became uniform) is still honoured while its `last_seen_at` is
+/// fresh — but the idle window catches it once dormant, which is what
+/// finally bounds those previously-immortal rows.
 #[tokio::test]
-async fn expired_session_token_is_rejected_and_a_stay_logged_in_one_is_not() {
+async fn expired_absolute_token_is_rejected_and_a_no_expiry_one_idle_expires() {
     let database_url = test_database_url();
     let state = create_test_state(&database_url).await;
     let app = build_router(state.clone());
+    let db = state.db.clone();
 
     let expired_token = "expired-token";
     persistence::create_session(
@@ -3056,30 +3073,42 @@ async fn expired_session_token_is_rejected_and_a_stay_logged_in_one_is_not() {
         &register_player(app.clone(), "Alice").await.player_id,
         &hash_token(expired_token),
         false,
-        Some("0"), // already expired (epoch second 0)
+        Some("0"), // already past its absolute expiry
     )
     .await
     .expect("session should be created");
 
-    let never_expires_token = "never-expires-token";
+    let no_expiry_token = "no-expiry-token";
     persistence::create_session(
         &state.db,
         &Uuid::new_v4().to_string(),
         &register_player(app.clone(), "Bob").await.player_id,
-        &hash_token(never_expires_token),
+        &hash_token(no_expiry_token),
         true,
-        None,
+        None, // no absolute expiry, like a pre-change stay_logged_in row
     )
     .await
     .expect("session should be created");
 
-    let expired_response =
-        send_empty_auth(app.clone(), Method::GET, "/games", Some(expired_token)).await;
-    assert_eq!(expired_response.status(), StatusCode::UNAUTHORIZED);
+    // Past absolute expiry -> rejected.
+    let expired = send_empty_auth(app.clone(), Method::GET, "/games", Some(expired_token)).await;
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
 
-    let stay_logged_in_response =
-        send_empty_auth(app, Method::GET, "/games", Some(never_expires_token)).await;
-    assert_eq!(stay_logged_in_response.status(), StatusCode::OK);
+    // No absolute expiry but freshly created (last_seen = now) -> still valid.
+    let fresh = send_empty_auth(app.clone(), Method::GET, "/games", Some(no_expiry_token)).await;
+    assert_eq!(fresh.status(), StatusCode::OK);
+
+    // ...but once it goes dormant past the idle window, it's rejected too.
+    let now = now_iso().parse::<u64>().expect("now parses");
+    let stale = (now - persistence::SESSION_IDLE_WINDOW_SECS - 60).to_string();
+    sqlx::query("update sessions set last_seen_at = ?1 where token_hash = ?2")
+        .bind(&stale)
+        .bind(hash_token(no_expiry_token))
+        .execute(&db)
+        .await
+        .expect("backdate last_seen");
+    let idle = send_empty_auth(app, Method::GET, "/games", Some(no_expiry_token)).await;
+    assert_eq!(idle.status(), StatusCode::UNAUTHORIZED);
 }
 
 #[tokio::test]
@@ -3093,8 +3122,11 @@ async fn delete_expired_sessions_removes_only_past_expiry_ones() {
     let bob = register_player(app.clone(), "Bob").await;
     let carol = register_player(app.clone(), "Carol").await;
 
-    // alice: already expired; bob: expires far in the future; carol:
-    // stay_logged_in, no expiry at all. Only alice's should be deleted.
+    // alice: already past absolute expiry; bob: expiry far in the future;
+    // carol: stay_logged_in, no absolute expiry. All three get a fresh
+    // `last_seen_at` from create_session, so the idle clause doesn't touch
+    // them and only alice's absolute expiry deletes her — the idle clause is
+    // exercised in `an_idle_session_past_the_window_is_rejected_and_swept`.
     persistence::create_session(
         &db,
         &Uuid::new_v4().to_string(),
@@ -3147,6 +3179,165 @@ async fn delete_expired_sessions_removes_only_past_expiry_ones() {
             .await
             .expect("query should succeed")
             .is_some()
+    );
+}
+
+/// Idle expiry: a session dormant past the idle window is rejected on the
+/// next authenticated call and removed by the sweep — even though its
+/// absolute `expires_at` is still in the future. This is what finally bounds
+/// the previously-immortal `stay_logged_in` rows.
+#[tokio::test]
+async fn an_idle_session_past_the_window_is_rejected_and_swept() {
+    let state = create_test_state(&test_database_url()).await;
+    let app = build_router(state.clone());
+    let db = state.db.clone();
+    let alice = register_player(app.clone(), "Alice").await;
+
+    let now = now_iso().parse::<u64>().expect("now parses");
+    let stale = (now - persistence::SESSION_IDLE_WINDOW_SECS - 60).to_string();
+    sqlx::query("update sessions set last_seen_at = ?1 where token_hash = ?2")
+        .bind(&stale)
+        .bind(hash_token(&alice.session_token))
+        .execute(&db)
+        .await
+        .expect("backdate last_seen");
+
+    let response = send_json(
+        app.clone(),
+        Method::POST,
+        "/auth/validate",
+        &api::ValidateSessionRequest {
+            session_token: alice.session_token.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    persistence::delete_expired_sessions(&db)
+        .await
+        .expect("sweep should succeed");
+    assert!(
+        persistence::get_session_by_token_hash(&db, &hash_token(&alice.session_token))
+            .await
+            .expect("query should succeed")
+            .is_none()
+    );
+}
+
+/// Absolute cap: a session past its hard `expires_at` is rejected and swept
+/// even when `last_seen_at` is fresh (i.e. it was being actively used) — the
+/// two limits are independent.
+#[tokio::test]
+async fn a_session_past_absolute_expiry_is_rejected_even_when_recently_active() {
+    let state = create_test_state(&test_database_url()).await;
+    let app = build_router(state.clone());
+    let db = state.db.clone();
+    let alice = register_player(app.clone(), "Alice").await;
+
+    sqlx::query("update sessions set expires_at = '1' where token_hash = ?1")
+        .bind(hash_token(&alice.session_token))
+        .execute(&db)
+        .await
+        .expect("backdate expires_at");
+
+    let response = send_json(
+        app.clone(),
+        Method::POST,
+        "/auth/validate",
+        &api::ValidateSessionRequest {
+            session_token: alice.session_token.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    persistence::delete_expired_sessions(&db)
+        .await
+        .expect("sweep should succeed");
+    assert!(
+        persistence::get_session_by_token_hash(&db, &hash_token(&alice.session_token))
+            .await
+            .expect("query should succeed")
+            .is_none()
+    );
+}
+
+/// Explicit logout deletes the row immediately and the token stops
+/// validating right away — no waiting for the sweep.
+#[tokio::test]
+async fn logout_deletes_the_session_and_invalidates_its_token() {
+    let state = create_test_state(&test_database_url()).await;
+    let app = build_router(state.clone());
+    let db = state.db.clone();
+    let alice = register_player(app.clone(), "Alice").await;
+
+    let response = send_empty_auth(
+        app.clone(),
+        Method::POST,
+        "/auth/logout",
+        Some(&alice.session_token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    assert!(
+        persistence::get_session_by_token_hash(&db, &hash_token(&alice.session_token))
+            .await
+            .expect("query should succeed")
+            .is_none()
+    );
+
+    let validate = send_json(
+        app.clone(),
+        Method::POST,
+        "/auth/validate",
+        &api::ValidateSessionRequest {
+            session_token: alice.session_token.clone(),
+        },
+    )
+    .await;
+    assert_eq!(validate.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// An authenticated request refreshes `last_seen_at` when it's staler than
+/// the bump throttle, so the idle window slides with activity.
+#[tokio::test]
+async fn an_authenticated_request_bumps_stale_last_seen() {
+    let state = create_test_state(&test_database_url()).await;
+    let app = build_router(state.clone());
+    let db = state.db.clone();
+    let alice = register_player(app.clone(), "Alice").await;
+
+    // Past the bump throttle but well within the idle window: still valid,
+    // but due for a refresh.
+    let now = now_iso().parse::<u64>().expect("now parses");
+    let staleish = (now - persistence::LAST_SEEN_BUMP_THROTTLE_SECS - 60).to_string();
+    sqlx::query("update sessions set last_seen_at = ?1 where token_hash = ?2")
+        .bind(&staleish)
+        .bind(hash_token(&alice.session_token))
+        .execute(&db)
+        .await
+        .expect("backdate last_seen");
+
+    let response = send_json(
+        app.clone(),
+        Method::POST,
+        "/auth/validate",
+        &api::ValidateSessionRequest {
+            session_token: alice.session_token.clone(),
+        },
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let session = persistence::get_session_by_token_hash(&db, &hash_token(&alice.session_token))
+        .await
+        .expect("query should succeed")
+        .expect("session still exists");
+    let bumped: u64 = session.last_seen_at.parse().expect("last_seen parses");
+    assert!(
+        bumped >= now - 5,
+        "last_seen should have been refreshed to ~now (backdated to {staleish}, now {bumped})"
     );
 }
 

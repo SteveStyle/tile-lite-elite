@@ -829,6 +829,26 @@ pub struct SessionRecord {
     pub stay_logged_in: bool,
 }
 
+/// Absolute maximum session lifetime. Even a continuously-active session
+/// must re-authenticate once it passes this — `expires_at` is set to
+/// `created_at + this` at creation and never extended. Uniform for every
+/// session: `stay_logged_in` no longer affects server-side expiry, it's
+/// purely a client concern (whether the token is persisted across a browser
+/// restart). See `app::auth::session_expiry`.
+pub const SESSION_MAX_LIFETIME_SECS: u64 = 10 * 24 * 60 * 60;
+
+/// Idle window: a session unused (no authenticated request) for longer than
+/// this is treated as logged out, whichever comes first with the absolute
+/// cap above. Sliding — `last_seen_at` is bumped on activity (throttled by
+/// `LAST_SEEN_BUMP_THROTTLE_SECS`). Enforced in `app::common::player_id_for_token`
+/// (rejects the token) and in `delete_expired_sessions` (prunes the row).
+pub const SESSION_IDLE_WINDOW_SECS: u64 = 48 * 60 * 60;
+
+/// Only rewrite `last_seen_at` when it's staler than this, so an actively
+/// used session doesn't cause a DB write on every single request (the idle
+/// window is days, so minute-scale precision is plenty).
+pub const LAST_SEEN_BUMP_THROTTLE_SECS: u64 = 15 * 60;
+
 pub async fn create_session(
     pool: &Pool<Sqlite>,
     id: &str,
@@ -912,13 +932,39 @@ pub async fn get_session_by_id(
 /// Lazy cleanup, same pattern as `expire_old_finished_games`/the
 /// move-time-limit retirement — checked whenever something relevant is
 /// touched (see the `list_games` call site), not a background scheduler.
-/// A `stay_logged_in` session has `expires_at is null` (see
-/// `register_player`/`login_player`), so it's never touched here
-/// regardless of age — that's the entire point of the checkbox.
+/// Prunes a session once it hits *either* limit: past its absolute
+/// `expires_at`, or idle (no `last_seen_at` bump) for longer than
+/// `SESSION_IDLE_WINDOW_SECS`. The idle clause is what finally bounds
+/// `stay_logged_in` rows, which used to have `expires_at is null` and so
+/// lived forever. (`expires_at`/`last_seen_at` are unix-second strings, all
+/// the same width in this era, so string `<` matches numeric `<`.)
 pub async fn delete_expired_sessions(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
     let now = now_iso();
-    sqlx::query("delete from sessions where expires_at is not null and expires_at < ?1")
-        .bind(&now)
+    let idle_cutoff = now
+        .parse::<u64>()
+        .map(|n| n.saturating_sub(SESSION_IDLE_WINDOW_SECS).to_string())
+        .unwrap_or_else(|_| now.clone());
+    sqlx::query(
+        "delete from sessions
+         where (expires_at is not null and expires_at < ?1)
+            or last_seen_at < ?2",
+    )
+    .bind(&now)
+    .bind(&idle_cutoff)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Deletes the session behind a bearer token — the explicit log-out path.
+/// A no-op if the token hash isn't present (already gone / never existed),
+/// so the caller never has to distinguish "deleted" from "wasn't there".
+pub async fn delete_session_by_token_hash(
+    pool: &Pool<Sqlite>,
+    token_hash: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("delete from sessions where token_hash = ?1")
+        .bind(token_hash)
         .execute(pool)
         .await?;
     Ok(())

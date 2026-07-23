@@ -33,7 +33,7 @@ pub(crate) async fn register_player(
         .map_err(ApiProblem::from_sqlx)?;
 
     let session_token = Uuid::new_v4().to_string();
-    let expires_at = session_expiry(request.stay_logged_in);
+    let expires_at = session_expiry();
     persistence::create_session(
         &state.db,
         &Uuid::new_v4().to_string(),
@@ -85,7 +85,7 @@ pub(crate) async fn login_player(
     tracing::info!(player_id = %player.id, display_name = %display_name, "player logged in");
 
     let session_token = Uuid::new_v4().to_string();
-    let expires_at = session_expiry(request.stay_logged_in);
+    let expires_at = session_expiry();
     persistence::create_session(
         &state.db,
         &Uuid::new_v4().to_string(),
@@ -109,13 +109,15 @@ pub(crate) async fn validate_session(
     State(state): State<AppState>,
     Json(request): Json<ValidateSessionRequest>,
 ) -> Result<Json<PlayerDto>, ApiProblem> {
-    let session =
-        persistence::get_session_by_token_hash(&state.db, &hash_token(&request.session_token))
-            .await
-            .map_err(ApiProblem::from_sqlx)?
-            .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
+    // Routed through the shared token check so startup validation enforces
+    // the same absolute + idle limits (and refreshes `last_seen_at`) as
+    // every other authenticated request — otherwise a dormant or expired
+    // session would still validate here until the lazy sweep removed it.
+    let player_id = player_id_for_token(&state, &request.session_token)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
 
-    let player = persistence::get_player_by_id(&state.db, &session.player_id)
+    let player = persistence::get_player_by_id(&state.db, &player_id)
         .await
         .map_err(ApiProblem::from_sqlx)?
         .ok_or_else(|| ApiProblem::unauthorized("Session is invalid or has expired"))?;
@@ -127,6 +129,18 @@ pub(crate) async fn validate_session(
         created_at: player.created_at,
         last_seen_at: player.last_seen_at,
     }))
+}
+
+/// Explicit log-out: deletes the session behind the presented bearer token,
+/// invalidating it immediately — the precise signal, versus idle expiry's
+/// eventual guess. Always `204`: an unknown or already-gone token is a
+/// no-op, so a client tearing down its own state never has to care whether
+/// the row was still there.
+pub(crate) async fn logout(State(state): State<AppState>, headers: HeaderMap) -> StatusCode {
+    if let Some(token) = bearer_token(&headers) {
+        let _ = persistence::delete_session_by_token_hash(&state.db, &hash_token(token)).await;
+    }
+    StatusCode::NO_CONTENT
 }
 
 #[derive(serde::Deserialize)]
@@ -430,22 +444,17 @@ pub(crate) fn hash_token(token: &str) -> String {
 /// long enough that it isn't a race against actually receiving the email.
 pub(crate) const PASSWORD_RESET_TOKEN_TTL_SECS: u64 = 60 * 60;
 
-/// How long an ordinary (not "stay logged in") session stays valid. Most
-/// logins never check that box, so without a real expiry every one of
-/// them leaves a permanent row — this is what actually bounds the
-/// `sessions` table's growth; a `stay_logged_in` session gets no expiry
-/// at all (see `session_expiry`), since that's the whole point of the box.
-pub(crate) const SESSION_TTL_SECS: u64 = 7 * 24 * 60 * 60;
-
-/// `None` for a `stay_logged_in` session (no expiry); otherwise
-/// `SESSION_TTL_SECS` out from now. Shared by `register_player` and
+/// A new session's absolute `expires_at`: `SESSION_MAX_LIFETIME_SECS` out
+/// from now, the same for every session. Even a continuously-active session
+/// must re-authenticate once it passes this; a dormant one is logged out
+/// sooner by the idle window (enforced in `player_id_for_token`). The
+/// `stay_logged_in` flag deliberately doesn't enter into it — that's now a
+/// purely client-side concern (whether the token survives a browser
+/// restart), not a server-side lifetime. Shared by `register_player` and
 /// `login_player` so both compute it identically.
-pub(crate) fn session_expiry(stay_logged_in: bool) -> Option<String> {
-    if stay_logged_in {
-        return None;
-    }
+pub(crate) fn session_expiry() -> Option<String> {
     now_iso()
         .parse::<u64>()
-        .map(|now| (now + SESSION_TTL_SECS).to_string())
+        .map(|now| (now + persistence::SESSION_MAX_LIFETIME_SECS).to_string())
         .ok()
 }

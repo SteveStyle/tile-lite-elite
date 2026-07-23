@@ -345,8 +345,20 @@ pub fn RootApp() -> Element {
                 let Some(token) = session().map(|current| current.session_token.clone()) else {
                     continue;
                 };
-                if let Ok(summaries) = load_game_summaries(&server_url, Some(&token)).await {
-                    game_summaries.set(summaries);
+                match load_game_summaries(&server_url, Some(&token)).await {
+                    Ok(summaries) => game_summaries.set(summaries),
+                    Err(err) if err == SESSION_INVALID_MESSAGE => {
+                        // The session died server-side (idle or absolute
+                        // expiry) — drop to the login modal cleanly instead
+                        // of failing the poll silently forever.
+                        let stored = crate::local_storage::load();
+                        crate::local_storage::save(&crate::local_storage::StoredAuth {
+                            remembered_name: stored.remembered_name,
+                            session_token: None,
+                        });
+                        session.set(None);
+                    }
+                    Err(_) => {}
                 }
             }
         });
@@ -459,6 +471,7 @@ pub fn RootApp() -> Element {
         _ => None,
     };
     let server_url_for_login = server_url.clone();
+    let server_url_for_logout = server_url.clone();
     let server_url_for_custom_create = server_url.clone();
     let server_url_for_accept = server_url.clone();
     let server_url_for_invite_accept = server_url.clone();
@@ -551,6 +564,17 @@ pub fn RootApp() -> Element {
                         });
                     },
                     on_logout: move |_| {
+                        // Delete the session server-side now — the precise
+                        // "logged out" signal (idle expiry is only the
+                        // fallback for sessions never explicitly closed).
+                        // Best-effort: local state is cleared below whether
+                        // or not this reaches the server.
+                        if let Some(token) = session().map(|current| current.session_token.clone()) {
+                            let server_url = server_url_for_logout.clone();
+                            spawn(async move {
+                                logout(&server_url, &token).await;
+                            });
+                        }
                         let stored = crate::local_storage::load();
                         crate::local_storage::save(&crate::local_storage::StoredAuth {
                             remembered_name: stored.remembered_name,
@@ -1789,6 +1813,20 @@ pub(crate) async fn fetch_player_rating_history(
     .await
 }
 
+/// Sentinel error returned by the authenticated GET path on a `401`, so the
+/// games-list poll can tell "the session is gone server-side" apart from an
+/// ordinary request failure and drop to the login modal instead of retrying
+/// forever.
+pub(crate) const SESSION_INVALID_MESSAGE: &str = "__session_invalid__";
+
+/// Best-effort explicit log-out: asks the server to delete this session now.
+/// The caller clears its local state regardless, so a failure (offline,
+/// already-gone) just means the row gets cleaned up later by idle expiry —
+/// nothing for the UI to react to.
+pub(crate) async fn logout(server_url: &str, token: &str) {
+    let _ = post_no_content(&format!("{server_url}/auth/logout"), Some(token), &()).await;
+}
+
 async fn load_game_summaries(
     server_url: &str,
     token: Option<&str>,
@@ -2419,6 +2457,9 @@ where
     let response = request.send().await.map_err(|_| mark_offline())?;
     mark_online();
     if !response.status().is_success() {
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(SESSION_INVALID_MESSAGE.to_string());
+        }
         let msg = response
             .json::<api::ApiError>()
             .await
@@ -2449,6 +2490,9 @@ where
     let response = builder.send().await.map_err(|_| mark_offline())?;
     mark_online();
     if !response.ok() {
+        if response.status() == 401 {
+            return Err(SESSION_INVALID_MESSAGE.to_string());
+        }
         let msg = response
             .json::<api::ApiError>()
             .await

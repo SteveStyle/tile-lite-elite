@@ -137,6 +137,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/auth/register", post(register_player))
         .route("/auth/login", post(login_player))
         .route("/auth/validate", post(validate_session))
+        .route("/auth/logout", post(logout))
         .route("/auth/change-password", post(change_password))
         .route("/auth/update-details", post(update_player_details))
         .route("/auth/forgot-password", post(request_password_reset))

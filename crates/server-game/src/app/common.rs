@@ -44,37 +44,60 @@ pub(crate) async fn game_dto_with_invitation_status(
     Ok(dto)
 }
 
+/// The raw bearer token from an `Authorization: Bearer <token>` header, if
+/// present and well-formed. Shared by `authenticated_player_id` and the
+/// logout handler.
+pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
 /// Resolves the `Authorization: Bearer <token>` header (if present and
 /// valid) to a player id. Returns `None` rather than an error for any
-/// missing/malformed/unknown/expired token — callers decide whether an
+/// missing/malformed/unknown/expired/idle token — callers decide whether an
 /// absent identity is acceptable for the action they're guarding.
 pub(crate) async fn authenticated_player_id(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Option<String> {
-    let token = headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")?;
-    player_id_for_token(state, token).await
+    player_id_for_token(state, bearer_token(headers)?).await
 }
 
-/// Shared by `authenticated_player_id` (reads the token from the
-/// `Authorization` header, used by every REST call) and `game_events`
-/// (reads it from a query parameter instead — browsers' native `WebSocket`
-/// API can't set custom headers on the handshake, so the token has to
-/// travel some other way for that one endpoint).
+/// Resolves a session token to a player id, enforcing both session limits
+/// and keeping the session's `last_seen_at` fresh. Shared by
+/// `authenticated_player_id` (header token, every REST call), `game_events`
+/// (query-parameter token — the browser `WebSocket` handshake can't set
+/// custom headers), and `validate_session` (client startup).
+///
+/// A token is rejected (`None`) if the session is missing, past its
+/// absolute `expires_at`, or idle beyond `SESSION_IDLE_WINDOW_SECS` (dormant
+/// == logged out). When it's still valid, `last_seen_at` is bumped — but
+/// only if it's staler than `LAST_SEEN_BUMP_THROTTLE_SECS`, so an active
+/// session doesn't write to the DB on every request.
 pub(crate) async fn player_id_for_token(state: &AppState, token: &str) -> Option<String> {
     let session = persistence::get_session_by_token_hash(&state.db, &hash_token(token))
         .await
         .ok()??;
 
+    let now = now_iso().parse::<u64>().ok()?;
+
     if let Some(expires_at) = &session.expires_at
-        && let (Ok(expiry), Ok(now)) = (expires_at.parse::<u64>(), now_iso().parse::<u64>())
-        && now > expiry
+        && let Ok(expiry) = expires_at.parse::<u64>()
+        && now >= expiry
     {
         return None;
+    }
+
+    let last_seen = session.last_seen_at.parse::<u64>().ok()?;
+    let idle = now.saturating_sub(last_seen);
+    if idle > persistence::SESSION_IDLE_WINDOW_SECS {
+        return None;
+    }
+    if idle > persistence::LAST_SEEN_BUMP_THROTTLE_SECS {
+        let _ = persistence::update_session_last_seen(&state.db, &session.id).await;
     }
 
     Some(session.player_id)
