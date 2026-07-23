@@ -367,13 +367,11 @@ pub fn AuthPanel(
     } else {
         "Register"
     };
-    // Each `move` closure below needs its own owned copy — `server_url` is
-    // a plain (non-Copy) String, so one `move` closure capturing it would
-    // leave nothing for the rest.
-    let server_url_for_display_enter = server_url.clone();
-    let server_url_for_email_enter = server_url.clone();
-    let server_url_for_password_enter = server_url.clone();
-    let server_url_for_button = server_url.clone();
+    // One owned copy per `move` closure that needs it — `server_url` is a
+    // non-Copy String. Enter-to-submit now comes from the native `<form>`
+    // submit below rather than per-input key handlers, so there are just
+    // two closures left: the form's submit, and the forgot-password request.
+    let server_url_for_submit = server_url.clone();
     let server_url_for_forgot_password = server_url.clone();
 
     rsx! {
@@ -388,6 +386,7 @@ pub fn AuthPanel(
             p { class: "modal-copy", "Log in or register to create and play games." }
             div { class: "auth-panel-tabs",
                 button {
+                    r#type: "button",
                     class: if mode() == AuthMode::Login { "auth-tab auth-tab-active" } else { "auth-tab" },
                     onclick: move |_| {
                         mode.set(AuthMode::Login);
@@ -396,6 +395,7 @@ pub fn AuthPanel(
                     "Log in"
                 }
                 button {
+                    r#type: "button",
                     class: if mode() == AuthMode::Register { "auth-tab auth-tab-active" } else { "auth-tab" },
                     onclick: move |_| {
                         mode.set(AuthMode::Register);
@@ -405,111 +405,106 @@ pub fn AuthPanel(
                 }
             }
 
-            input {
-                class: "auth-input",
-                placeholder: "Display name",
-                value: "{display_name}",
-                oninput: move |event| display_name.set(event.value()),
-                onkeydown: move |event| {
-                    if event.key() == Key::Enter {
-                        submit_login_or_register(
-                            server_url_for_display_enter.clone(),
-                            mode(),
-                            display_name,
-                            email,
-                            password,
-                            remember_me,
-                            stay_logged_in,
-                            is_submitting,
-                            error_message,
-                            retry_message,
-                            on_authenticated,
-                        );
-                    }
+            // A real <form> so Enter submits natively and browsers'
+            // autofill / password managers behave. Deliberately NOT using
+            // per-input `onkeydown` Enter handlers: a browser autofill
+            // selection dispatches a keydown-shaped event with `.key`
+            // undefined, and Dioxus marshalling that missing key threw
+            // mid-render, wedging the reactive runtime ("RefCell already
+            // borrowed" in diff/node.rs) and freezing the whole modal.
+            form {
+                class: "auth-form",
+                // Do NOT call `event.prevent_default()` here. dioxus-web (0.6)
+                // already suppresses a form's native submit/navigation by
+                // default for `submit` events — calling prevent_default would
+                // counterintuitively RE-ENABLE it and reload the page (see the
+                // inverted "submit" handling in dioxus-web's dom.rs). So we
+                // just run the submit logic and let dioxus swallow the submit.
+                onsubmit: move |_| {
+                    submit_login_or_register(
+                        server_url_for_submit.clone(),
+                        mode(),
+                        display_name,
+                        email,
+                        password,
+                        remember_me,
+                        stay_logged_in,
+                        is_submitting,
+                        error_message,
+                        retry_message,
+                        on_authenticated,
+                    );
                 },
-            }
-            if mode() == AuthMode::Register {
                 input {
                     class: "auth-input",
-                    placeholder: "Email",
-                    value: "{email}",
-                    oninput: move |event| email.set(event.value()),
-                    onkeydown: move |event| {
-                        if event.key() == Key::Enter {
-                            submit_login_or_register(
-                                server_url_for_email_enter.clone(),
-                                mode(),
-                                display_name,
-                                email,
-                                password,
-                                remember_me,
-                                stay_logged_in,
-                                is_submitting,
-                                error_message,
-                                retry_message,
-                                on_authenticated,
-                            );
-                        }
-                    },
+                    placeholder: "Display name",
+                    autocomplete: "username",
+                    value: "{display_name}",
+                    oninput: move |event| display_name.set(event.value()),
                 }
-            }
-            input {
-                class: "auth-input",
-                r#type: "password",
-                placeholder: "Password",
-                value: "{password}",
-                oninput: move |event| password.set(event.value()),
-                onkeydown: move |event| {
-                    if event.key() == Key::Enter {
-                        submit_login_or_register(
-                            server_url_for_password_enter.clone(),
-                            mode(),
-                            display_name,
-                            email,
-                            password,
-                            remember_me,
-                            stay_logged_in,
-                            is_submitting,
-                            error_message,
-                            retry_message,
-                            on_authenticated,
-                        );
+                if mode() == AuthMode::Register {
+                    input {
+                        class: "auth-input",
+                        placeholder: "Email",
+                        autocomplete: "email",
+                        value: "{email}",
+                        oninput: move |event| email.set(event.value()),
                     }
-                },
-            }
-
-            label {
-                class: "auth-checkbox-label",
-                title: "Pre-fills your display name next time you log in. Doesn't keep you signed in or store your password.",
-                input {
-                    r#type: "checkbox",
-                    checked: remember_me(),
-                    oninput: move |event| remember_me.set(event.value() == "true"),
                 }
-                "Remember me"
-            }
-            label {
-                class: "auth-checkbox-label",
-                title: "Keeps you signed in on this device — no need to log in again next time. Leave unchecked on a shared or public computer.",
                 input {
-                    r#type: "checkbox",
-                    checked: stay_logged_in(),
-                    oninput: move |event| stay_logged_in.set(event.value() == "true"),
+                    class: "auth-input",
+                    r#type: "password",
+                    placeholder: "Password",
+                    autocomplete: if mode() == AuthMode::Login { "current-password" } else { "new-password" },
+                    value: "{password}",
+                    oninput: move |event| password.set(event.value()),
                 }
-                "Stay logged in"
+
+                label {
+                    class: "auth-checkbox-label",
+                    title: "Pre-fills your display name next time you log in. Doesn't keep you signed in or store your password.",
+                    input {
+                        r#type: "checkbox",
+                        checked: remember_me(),
+                        oninput: move |event| remember_me.set(event.value() == "true"),
+                    }
+                    "Remember me"
+                }
+                label {
+                    class: "auth-checkbox-label",
+                    title: "Keeps you signed in on this device — no need to log in again next time. Leave unchecked on a shared or public computer.",
+                    input {
+                        r#type: "checkbox",
+                        checked: stay_logged_in(),
+                        oninput: move |event| stay_logged_in.set(event.value() == "true"),
+                    }
+                    "Stay logged in"
+                }
+
+                if let Some(message) = retry_message() {
+                    p { class: "status-banner", "{message}" }
+                }
+                if let Some(error) = error_message() {
+                    p { class: "error-banner", "{error}" }
+                }
+
+                div { class: "modal-actions",
+                    button {
+                        r#type: "submit",
+                        class: "toggle-button",
+                        disabled: is_submitting(),
+                        "{submit_label}"
+                    }
+                }
             }
 
-            if let Some(message) = retry_message() {
-                p { class: "status-banner", "{message}" }
-            }
-            if let Some(error) = error_message() {
-                p { class: "error-banner", "{error}" }
-            }
-
-            // Only meaningful once an account exists — Register mode has
-            // nothing to "forget" yet.
+            // Below the form, not inside it — its own field and buttons must
+            // never be part of the login/register submission (and pressing
+            // Enter in its email box must not submit the form above). Only
+            // meaningful once an account exists, so Login mode only.
             if mode() == AuthMode::Login {
                 button {
+                    r#type: "button",
                     class: "toggle-button toggle-button-muted",
                     onclick: move |_| {
                         show_forgot_password.set(!show_forgot_password());
@@ -523,6 +518,7 @@ pub fn AuthPanel(
                     input {
                         class: "auth-input",
                         placeholder: "Email",
+                        autocomplete: "email",
                         value: "{forgot_password_email}",
                         oninput: move |event| forgot_password_email.set(event.value()),
                     }
@@ -531,6 +527,7 @@ pub fn AuthPanel(
                     }
                     div { class: "auth-panel-actions",
                         button {
+                            r#type: "button",
                             class: "toggle-button toggle-button-muted",
                             disabled: is_requesting_reset(),
                             onclick: move |_| {
@@ -541,6 +538,7 @@ pub fn AuthPanel(
                             "Cancel"
                         }
                         button {
+                            r#type: "button",
                             class: "toggle-button",
                             disabled: is_requesting_reset(),
                             onclick: move |_| {
@@ -567,29 +565,6 @@ pub fn AuthPanel(
                             "Send reset link"
                         }
                     }
-                }
-            }
-
-            div { class: "modal-actions",
-                button {
-                    class: "toggle-button",
-                    disabled: is_submitting(),
-                    onclick: move |_| {
-                        submit_login_or_register(
-                            server_url_for_button.clone(),
-                            mode(),
-                            display_name,
-                            email,
-                            password,
-                            remember_me,
-                            stay_logged_in,
-                            is_submitting,
-                            error_message,
-                            retry_message,
-                            on_authenticated,
-                        );
-                    },
-                    "{submit_label}"
                 }
             }
         }

@@ -1413,6 +1413,17 @@ button:disabled {
     font-size: 0.95rem;
 }
 
+/* The login/register inputs now live inside a real <form> (native Enter
+   submit + autofill). The form is a single direct child of `.modal-card`,
+   so it must reproduce that column's flex+gap itself — otherwise its inner
+   fields collapse together with no vertical spacing. */
+.auth-form {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 14px;
+}
+
 @media (max-width: 1080px) {
     .workspace-shell {
         grid-template-columns: 1fr;

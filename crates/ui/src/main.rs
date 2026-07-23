@@ -40,6 +40,14 @@ fn main() {
 
     #[cfg(all(feature = "web", not(feature = "desktop")))]
     {
+        // Route Rust panics to the browser console with a real message +
+        // stack instead of the bare `unreachable executed` a wasm abort
+        // otherwise shows — see how the auth-modal RefCell-borrow panic was
+        // diagnosed. `cfg(wasm32)`-gated because the crate (and this whole
+        // launch branch) also compiles for the host target under `cargo
+        // test`, where the hook isn't available.
+        #[cfg(target_arch = "wasm32")]
+        console_error_panic_hook::set_once();
         dioxus::launch(App);
     }
 }

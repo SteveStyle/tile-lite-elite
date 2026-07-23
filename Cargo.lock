@@ -5452,6 +5452,7 @@ name = "tile-lite-elite-ui"
 version = "0.4.4"
 dependencies = [
  "api",
+ "console_error_panic_hook",
  "dioxus",
  "dioxus-desktop",
  "dioxus-web",
