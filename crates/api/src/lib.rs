@@ -84,8 +84,12 @@ pub enum TileDto {
     /// One or two characters — most tiles are one, but a digraph tile
     /// (e.g. Spanish's CH/LL/RR) is a single physical tile/board
     /// square/rack slot that displays two.
-    Letter { letter: String },
-    Blank { acting_as: Option<String> },
+    Letter {
+        letter: String,
+    },
+    Blank {
+        acting_as: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -565,11 +569,6 @@ pub struct InvitePlayerRequest {
 pub struct InvitationPreviewDto {
     pub inviting_player_display_name: String,
     pub status: InvitationStatus,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InvitationResponseRequest {
-    pub accept: bool,
 }
 
 // ========== Admin ==========

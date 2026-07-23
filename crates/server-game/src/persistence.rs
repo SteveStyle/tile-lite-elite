@@ -6,7 +6,9 @@ use sqlx::{
 };
 use std::str::FromStr;
 
-use crate::game_state::{ChatMessageRecord, GameSession, MoveRecord, ParticipantState, board_from_dto};
+use crate::game_state::{
+    ChatMessageRecord, GameSession, MoveRecord, ParticipantState, board_from_dto,
+};
 use rules_shared::{Alphabet, GameState, Premium, Score, Tile, VariantRules};
 
 /// Mirrors `rules_shared::VariantRules` field-for-field, but as its own type
@@ -198,7 +200,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
 
     let snapshot_json = serde_json::to_string(&PersistedGame {
         id: session.id.clone(),
-        status: session.status.clone(),
+        status: session.status,
         variant: session.variant.clone(),
         language: session.language.clone(),
         board_layout: session.board_layout.clone(),
@@ -225,8 +227,8 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
     sqlx::query(
         "insert into games (
             id, created_at, started_at, ended_at, status, variant, language, board_layout,
-            turn_number, current_seat, winner_seat, random_seed, notes, snapshot_json
-        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            turn_number, current_seat, winner_seat, random_seed, snapshot_json
+        ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
         on conflict(id) do update set
             started_at = excluded.started_at,
             ended_at = excluded.ended_at,
@@ -238,7 +240,6 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
             current_seat = excluded.current_seat,
             winner_seat = excluded.winner_seat,
             random_seed = excluded.random_seed,
-            notes = excluded.notes,
             snapshot_json = excluded.snapshot_json",
     )
     .bind(&session.id)
@@ -261,7 +262,6 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
     .bind(session.current_seat as i64)
     .bind(session.winner_seat.map(i64::from))
     .bind(session.random_seed as i64)
-    .bind(Option::<String>::None)
     .bind(snapshot_json)
     .execute(&mut *tx)
     .await?;
@@ -284,8 +284,8 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
             .expect("compute_participant_outcomes covers every participant");
         sqlx::query(
             "insert into game_participants (
-                id, game_id, seat_number, kind, display_name, player_id, engine_id, score, joined_at, left_at, outcome, bingo_count
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                id, game_id, seat_number, kind, display_name, player_id, engine_id, score, joined_at, outcome, bingo_count
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(format!("{}-seat-{}", session.id, participant.seat_number))
         .bind(&session.id)
@@ -296,7 +296,6 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         .bind(&participant.engine_id)
         .bind(participant.score)
         .bind(&now)
-        .bind(Option::<String>::None)
         .bind(outcome.outcome.map(crate::stats::Outcome::as_db_str))
         .bind(outcome.bingo_count)
         .execute(&mut *tx)
@@ -311,15 +310,14 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
     for record in &session.moves {
         sqlx::query(
             "insert into game_moves (
-                id, game_id, move_number, seat_number, move_type, tiles_json, payload_json, score_delta, created_at, is_validated
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1)",
+                id, game_id, move_number, seat_number, move_type, payload_json, score_delta, created_at
+            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(format!("{}-move-{}", session.id, record.move_number))
         .bind(&session.id)
         .bind(record.move_number)
         .bind(record.seat_number as i64)
         .bind(&record.move_type)
-        .bind(Option::<String>::None)
         .bind(serde_json::to_string(record).expect("move record should serialize"))
         .bind(record.score_delta)
         .bind(&now)
@@ -510,12 +508,13 @@ pub async fn update_player_password(
     password_hash: &str,
 ) -> Result<bool, sqlx::Error> {
     let now = now_iso();
-    let result = sqlx::query("update players set password_hash = ?1, updated_at = ?2 where id = ?3")
-        .bind(password_hash)
-        .bind(&now)
-        .bind(player_id)
-        .execute(pool)
-        .await?;
+    let result =
+        sqlx::query("update players set password_hash = ?1, updated_at = ?2 where id = ?3")
+            .bind(password_hash)
+            .bind(&now)
+            .bind(player_id)
+            .execute(pool)
+            .await?;
     Ok(result.rows_affected() > 0)
 }
 
@@ -991,7 +990,10 @@ pub async fn get_password_reset_token_by_hash(
     }))
 }
 
-pub async fn consume_password_reset_token(pool: &Pool<Sqlite>, id: &str) -> Result<(), sqlx::Error> {
+pub async fn consume_password_reset_token(
+    pool: &Pool<Sqlite>,
+    id: &str,
+) -> Result<(), sqlx::Error> {
     let now = now_iso();
     sqlx::query("update password_reset_tokens set consumed_at = ?1 where id = ?2")
         .bind(&now)
@@ -1056,8 +1058,7 @@ fn invitation_from_row(row: sqlx::sqlite::SqliteRow) -> InvitationRecord {
     }
 }
 
-const INVITATION_COLUMNS: &str =
-    "id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, responded_at, invited_email";
+const INVITATION_COLUMNS: &str = "id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, responded_at, invited_email";
 
 pub async fn create_invitation(
     pool: &Pool<Sqlite>,
@@ -1134,7 +1135,9 @@ pub async fn get_invitations_for_game(
 /// `invited_player_id is null` until claimed): those are only reachable via
 /// their mailed link, not general browsing — see `InvitationRecord.
 /// invited_email`'s doc comment.
-pub async fn get_open_invitations(pool: &Pool<Sqlite>) -> Result<Vec<InvitationRecord>, sqlx::Error> {
+pub async fn get_open_invitations(
+    pool: &Pool<Sqlite>,
+) -> Result<Vec<InvitationRecord>, sqlx::Error> {
     let rows = sqlx::query(&format!(
         "select {INVITATION_COLUMNS} from game_invitations
          where invited_player_id is null and invited_email is null and status = 'pending'"
@@ -1255,12 +1258,11 @@ pub async fn claim_invitation(
     // been backfilled to whoever claimed it — checking that here would
     // misreport a late second acceptor as "not your invitation" instead of
     // "no longer available".
-    if existing.status == "pending" {
-        if let Some(named) = &existing.invited_player_id {
-            if named != claimant_player_id {
-                return Err(ClaimInvitationError::NotYourInvitation);
-            }
-        }
+    if existing.status == "pending"
+        && let Some(named) = &existing.invited_player_id
+        && named != claimant_player_id
+    {
+        return Err(ClaimInvitationError::NotYourInvitation);
     }
 
     let now = now_iso();
