@@ -117,7 +117,7 @@ pub fn RootApp() -> Element {
     // indicator in the games list — purely local to this device/browser,
     // no server-side read-receipt concept. Loaded once at startup; kept in
     // sync with local storage by the reactive block below.
-    let mut chat_watermarks: Signal<HashMap<String, String>> =
+    let mut chat_watermarks: Signal<HashMap<String, i64>> =
         use_signal(|| crate::local_storage::load_chat_watermarks().last_seen);
     let mut session = use_signal(|| None::<api::PlayerSessionDto>);
     let mut show_stats = use_signal(|| false);
@@ -391,7 +391,7 @@ pub fn RootApp() -> Element {
         && chat_watermarks().get(&current_game.id) != Some(&latest.created_at)
     {
         let game_id = current_game.id.clone();
-        let created_at = latest.created_at.clone();
+        let created_at = latest.created_at;
         chat_watermarks.with_mut(|marks| {
             marks.insert(game_id, created_at);
         });
@@ -1693,7 +1693,7 @@ fn empty_live_game() -> GameStateDto {
         final_bonus_points: None,
         bag_count: 100,
         move_time_limit_seconds: 0,
-        turn_started_at: "0".to_string(),
+        turn_started_at: 0,
         participants: vec![ParticipantDto {
             seat_number: 0,
             kind: SeatKind::Human,

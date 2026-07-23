@@ -37,6 +37,9 @@ Facts you look up rather than read start to end.
 - [4.1 Configuration](4.1-configuration.md) — environments, environment variables, versioning scheme
 - [4.2 Database Schema](4.2-database-schema.md)
 - [4.3 API Schema](4.3-api-schema.md) — every HTTP/WebSocket endpoint and DTO
+- [4.4 snapshot_json Schema](4.4-snapshot-json-schema.md) — the authoritative game-state JSON blob's shape
+- [4.5 Data Dictionary](4.5-data-dictionary.md) — where each game field lives across snapshot/DB/DTO, and its kind
+- [4.6 Client-Local Storage](4.6-client-local-storage.md) — StoredAuth / chat watermarks kept on the device
 
 ## Current Direction
 

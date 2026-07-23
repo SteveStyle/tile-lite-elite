@@ -40,7 +40,7 @@ pub(crate) async fn register_player(
         &player_id,
         &hash_token(&session_token),
         request.stay_logged_in,
-        expires_at.as_deref(),
+        expires_at,
     )
     .await
     .map_err(ApiProblem::from_sqlx)?;
@@ -92,7 +92,7 @@ pub(crate) async fn login_player(
         &player.id,
         &hash_token(&session_token),
         request.stay_logged_in,
-        expires_at.as_deref(),
+        expires_at,
     )
     .await
     .map_err(ApiProblem::from_sqlx)?;
@@ -319,16 +319,13 @@ pub(crate) async fn request_password_reset(
             .map_err(ApiProblem::from_sqlx)?;
 
         let token = Uuid::new_v4().to_string();
-        let expires_at = now_iso()
-            .parse::<u64>()
-            .map(|now| (now + PASSWORD_RESET_TOKEN_TTL_SECS).to_string())
-            .unwrap_or_default();
+        let expires_at = now_unix_seconds() + PASSWORD_RESET_TOKEN_TTL_SECS;
         persistence::create_password_reset_token(
             &state.db,
             &Uuid::new_v4().to_string(),
             &player.id,
             &hash_token(&token),
-            &expires_at,
+            expires_at,
         )
         .await
         .map_err(ApiProblem::from_sqlx)?;
@@ -374,8 +371,8 @@ pub(crate) async fn reset_password(
         return Err(invalid());
     }
 
-    let expiry: u64 = record.expires_at.parse().unwrap_or(0);
-    let now: u64 = now_iso().parse().unwrap_or(u64::MAX);
+    let expiry = record.expires_at;
+    let now = now_unix_seconds();
     if now > expiry {
         tracing::warn!(player_id = %record.player_id, "password reset rejected: token expired");
         return Err(invalid());
@@ -442,7 +439,7 @@ pub(crate) fn hash_token(token: &str) -> String {
 /// How long a password-reset link stays valid after it's requested. Short
 /// enough that a link sitting unread in an inbox for days can't be used,
 /// long enough that it isn't a race against actually receiving the email.
-pub(crate) const PASSWORD_RESET_TOKEN_TTL_SECS: u64 = 60 * 60;
+pub(crate) const PASSWORD_RESET_TOKEN_TTL_SECS: i64 = 60 * 60;
 
 /// A new session's absolute `expires_at`: `SESSION_MAX_LIFETIME_SECS` out
 /// from now, the same for every session. Even a continuously-active session
@@ -452,9 +449,6 @@ pub(crate) const PASSWORD_RESET_TOKEN_TTL_SECS: u64 = 60 * 60;
 /// purely client-side concern (whether the token survives a browser
 /// restart), not a server-side lifetime. Shared by `register_player` and
 /// `login_player` so both compute it identically.
-pub(crate) fn session_expiry() -> Option<String> {
-    now_iso()
-        .parse::<u64>()
-        .map(|now| (now + persistence::SESSION_MAX_LIFETIME_SECS).to_string())
-        .ok()
+pub(crate) fn session_expiry() -> Option<i64> {
+    Some(now_unix_seconds() + persistence::SESSION_MAX_LIFETIME_SECS)
 }

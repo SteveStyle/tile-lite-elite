@@ -7,7 +7,7 @@ use sqlx::{
 use std::str::FromStr;
 
 use crate::game_state::{
-    ChatMessageRecord, GameSession, MoveRecord, ParticipantState, board_from_dto,
+    ChatMessageRecord, GameSession, MoveRecord, ParticipantState, board_from_dto, now_unix_seconds,
 };
 use rules_shared::{Alphabet, GameState, Premium, Score, Tile, VariantRules};
 
@@ -145,8 +145,11 @@ struct PersistedGame {
     // this field has no real turn-start time to recover, and defaulting to
     // the epoch would make it look instantly overdue the moment it's
     // reloaded, retiring whoever's turn it is before they get a chance.
-    #[serde(default = "now_iso")]
-    turn_started_at: String,
+    #[serde(
+        default = "crate::game_state::now_unix_seconds",
+        deserialize_with = "crate::game_state::deserialize_i64_flexible"
+    )]
+    turn_started_at: i64,
 }
 
 fn default_move_time_limit_seconds() -> u64 {
@@ -182,7 +185,7 @@ pub async fn migrate(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
 }
 
 pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(), sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     let mut tx = pool.begin().await?;
 
     // Captured before any writes, so the rating step below can tell
@@ -196,7 +199,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         .fetch_optional(&mut *tx)
         .await?;
     let prior_status: Option<String> = prior.as_ref().map(|row| row.get(0));
-    let prior_stats_settled_at: Option<String> = prior.as_ref().and_then(|row| row.get(1));
+    let prior_stats_settled_at: Option<i64> = prior.as_ref().and_then(|row| row.get(1));
 
     let snapshot_json = serde_json::to_string(&PersistedGame {
         id: session.id.clone(),
@@ -220,7 +223,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         messages: session.messages.clone(),
         consecutive_scoreless_turns: session.consecutive_scoreless_turns,
         move_time_limit_seconds: session.move_time_limit_seconds,
-        turn_started_at: session.turn_started_at.clone(),
+        turn_started_at: session.turn_started_at,
     })
     .expect("game session should serialize");
 
@@ -243,16 +246,16 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
             snapshot_json = excluded.snapshot_json",
     )
     .bind(&session.id)
-    .bind(&now)
+    .bind(now)
     .bind(if session.status == GameStatus::Waiting {
-        None::<String>
+        None::<i64>
     } else {
-        Some(now.clone())
+        Some(now)
     })
     .bind(if session.status == GameStatus::Finished {
-        Some(now.clone())
+        Some(now)
     } else {
-        None::<String>
+        None::<i64>
     })
     .bind(status_name(&session.status))
     .bind(&session.variant)
@@ -295,7 +298,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         .bind(&participant.player_id)
         .bind(&participant.engine_id)
         .bind(participant.score)
-        .bind(&now)
+        .bind(now)
         .bind(outcome.outcome.map(crate::stats::Outcome::as_db_str))
         .bind(outcome.bingo_count)
         .execute(&mut *tx)
@@ -320,7 +323,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         .bind(&record.move_type)
         .bind(serde_json::to_string(record).expect("move record should serialize"))
         .bind(record.score_delta)
-        .bind(&now)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
     }
@@ -341,7 +344,7 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         .bind(&record.player_id)
         .bind(&record.display_name)
         .bind(&record.body)
-        .bind(&record.created_at)
+        .bind(record.created_at)
         .execute(&mut *tx)
         .await?;
     }
@@ -355,10 +358,10 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
         && prior_status.as_deref() != Some("finished")
         && prior_stats_settled_at.is_none()
     {
-        crate::stats::settle_ratings(&mut tx, session, &now).await?;
+        crate::stats::settle_ratings(&mut tx, session, now).await?;
         sqlx::query("update games set stats_settled_at = ?2 where id = ?1")
             .bind(&session.id)
-            .bind(&now)
+            .bind(now)
             .execute(&mut *tx)
             .await?;
     }
@@ -426,7 +429,7 @@ pub async fn list_game_ids(pool: &Pool<Sqlite>) -> Result<Vec<String>, sqlx::Err
 /// else needs to read it back.
 pub async fn list_finished_game_ids_older_than(
     pool: &Pool<Sqlite>,
-    cutoff: &str,
+    cutoff: i64,
 ) -> Result<Vec<String>, sqlx::Error> {
     let rows = sqlx::query("select id from games where status = 'finished' and ended_at < ?1")
         .bind(cutoff)
@@ -444,7 +447,7 @@ pub async fn list_finished_game_ids_older_than(
 /// `updated_at` column on `games`.
 pub async fn last_activity_by_game(
     pool: &Pool<Sqlite>,
-) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+) -> Result<std::collections::HashMap<String, i64>, sqlx::Error> {
     let rows = sqlx::query(
         "select
             g.id,
@@ -459,7 +462,7 @@ pub async fn last_activity_by_game(
 
     Ok(rows
         .into_iter()
-        .map(|row| (row.get::<String, _>(0), row.get::<String, _>(1)))
+        .map(|row| (row.get::<String, _>(0), row.get::<i64, _>(1)))
         .collect())
 }
 
@@ -468,13 +471,13 @@ pub async fn last_activity_by_game(
 /// in the in-memory session model needs it, only the admin listing does.
 pub async fn created_at_by_game(
     pool: &Pool<Sqlite>,
-) -> Result<std::collections::HashMap<String, String>, sqlx::Error> {
+) -> Result<std::collections::HashMap<String, i64>, sqlx::Error> {
     let rows = sqlx::query("select id, created_at from games")
         .fetch_all(pool)
         .await?;
     Ok(rows
         .into_iter()
-        .map(|row| (row.get::<String, _>(0), row.get::<String, _>(1)))
+        .map(|row| (row.get::<String, _>(0), row.get::<i64, _>(1)))
         .collect())
 }
 
@@ -507,11 +510,11 @@ pub async fn update_player_password(
     player_id: &str,
     password_hash: &str,
 ) -> Result<bool, sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     let result =
         sqlx::query("update players set password_hash = ?1, updated_at = ?2 where id = ?3")
             .bind(password_hash)
-            .bind(&now)
+            .bind(now)
             .bind(player_id)
             .execute(pool)
             .await?;
@@ -528,7 +531,7 @@ pub async fn update_player_details(
     display_name: Option<&str>,
     email: Option<&str>,
 ) -> Result<bool, sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     let result = sqlx::query(
         "update players
          set display_name = coalesce(?1, display_name),
@@ -538,7 +541,7 @@ pub async fn update_player_details(
     )
     .bind(display_name)
     .bind(email)
-    .bind(&now)
+    .bind(now)
     .bind(player_id)
     .execute(pool)
     .await?;
@@ -623,7 +626,7 @@ pub async fn upsert_engine_profiles(
     pool: &Pool<Sqlite>,
     profiles: &[api::EngineProfileDto],
 ) -> Result<(), sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     for profile in profiles {
         let capabilities_json = serde_json::json!({
             "supports_timed_play": profile.supports_timed_play,
@@ -650,8 +653,8 @@ pub async fn upsert_engine_profiles(
         .bind(&profile.author)
         .bind(&profile.description)
         .bind(capabilities_json)
-        .bind(&now)
-        .bind(&now)
+        .bind(now)
+        .bind(now)
         .execute(pool)
         .await?;
     }
@@ -667,9 +670,9 @@ pub struct PlayerRecord {
     pub display_name: String,
     pub email: String,
     pub password_hash: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub last_seen_at: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_seen_at: Option<i64>,
 }
 
 pub async fn create_player(
@@ -679,7 +682,7 @@ pub async fn create_player(
     email: &str,
     password_hash: &str,
 ) -> Result<PlayerRecord, sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     sqlx::query(
         "insert into players (id, display_name, email, password_hash, created_at, updated_at)
          values (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -688,8 +691,8 @@ pub async fn create_player(
     .bind(display_name)
     .bind(email)
     .bind(password_hash)
-    .bind(&now)
-    .bind(&now)
+    .bind(now)
+    .bind(now)
     .execute(pool)
     .await?;
 
@@ -698,7 +701,7 @@ pub async fn create_player(
         display_name: display_name.to_string(),
         email: email.to_string(),
         password_hash: password_hash.to_string(),
-        created_at: now.clone(),
+        created_at: now,
         updated_at: now,
         last_seen_at: None,
     })
@@ -819,9 +822,9 @@ pub struct SessionRecord {
     pub id: String,
     pub player_id: String,
     pub token_hash: Option<String>,
-    pub created_at: String,
-    pub last_seen_at: String,
-    pub expires_at: Option<String>,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub expires_at: Option<i64>,
     /// Captured from `RegisterPlayerRequest`/`LoginPlayerRequest` at
     /// creation time — stored explicitly (not just inferred from
     /// `expires_at` being `None`) so it's a readable record of intent
@@ -835,19 +838,19 @@ pub struct SessionRecord {
 /// session: `stay_logged_in` no longer affects server-side expiry, it's
 /// purely a client concern (whether the token is persisted across a browser
 /// restart). See `app::auth::session_expiry`.
-pub const SESSION_MAX_LIFETIME_SECS: u64 = 10 * 24 * 60 * 60;
+pub const SESSION_MAX_LIFETIME_SECS: i64 = 10 * 24 * 60 * 60;
 
 /// Idle window: a session unused (no authenticated request) for longer than
 /// this is treated as logged out, whichever comes first with the absolute
 /// cap above. Sliding — `last_seen_at` is bumped on activity (throttled by
 /// `LAST_SEEN_BUMP_THROTTLE_SECS`). Enforced in `app::common::player_id_for_token`
 /// (rejects the token) and in `delete_expired_sessions` (prunes the row).
-pub const SESSION_IDLE_WINDOW_SECS: u64 = 48 * 60 * 60;
+pub const SESSION_IDLE_WINDOW_SECS: i64 = 48 * 60 * 60;
 
 /// Only rewrite `last_seen_at` when it's staler than this, so an actively
 /// used session doesn't cause a DB write on every single request (the idle
 /// window is days, so minute-scale precision is plenty).
-pub const LAST_SEEN_BUMP_THROTTLE_SECS: u64 = 15 * 60;
+pub const LAST_SEEN_BUMP_THROTTLE_SECS: i64 = 15 * 60;
 
 pub async fn create_session(
     pool: &Pool<Sqlite>,
@@ -855,9 +858,9 @@ pub async fn create_session(
     player_id: &str,
     token_hash: &str,
     stay_logged_in: bool,
-    expires_at: Option<&str>,
+    expires_at: Option<i64>,
 ) -> Result<SessionRecord, sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     sqlx::query(
         "insert into sessions (id, player_id, token_hash, created_at, last_seen_at, expires_at, stay_logged_in)
          values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -865,8 +868,8 @@ pub async fn create_session(
     .bind(id)
     .bind(player_id)
     .bind(token_hash)
-    .bind(&now)
-    .bind(&now)
+    .bind(now)
+    .bind(now)
     .bind(expires_at)
     .bind(stay_logged_in)
     .execute(pool)
@@ -876,9 +879,9 @@ pub async fn create_session(
         id: id.to_string(),
         player_id: player_id.to_string(),
         token_hash: Some(token_hash.to_string()),
-        created_at: now.clone(),
+        created_at: now,
         last_seen_at: now,
-        expires_at: expires_at.map(|s| s.to_string()),
+        expires_at,
         stay_logged_in,
     })
 }
@@ -939,18 +942,15 @@ pub async fn get_session_by_id(
 /// lived forever. (`expires_at`/`last_seen_at` are unix-second strings, all
 /// the same width in this era, so string `<` matches numeric `<`.)
 pub async fn delete_expired_sessions(pool: &Pool<Sqlite>) -> Result<(), sqlx::Error> {
-    let now = now_iso();
-    let idle_cutoff = now
-        .parse::<u64>()
-        .map(|n| n.saturating_sub(SESSION_IDLE_WINDOW_SECS).to_string())
-        .unwrap_or_else(|_| now.clone());
+    let now = now_unix_seconds();
+    let idle_cutoff = now - SESSION_IDLE_WINDOW_SECS;
     sqlx::query(
         "delete from sessions
          where (expires_at is not null and expires_at < ?1)
             or last_seen_at < ?2",
     )
-    .bind(&now)
-    .bind(&idle_cutoff)
+    .bind(now)
+    .bind(idle_cutoff)
     .execute(pool)
     .await?;
     Ok(())
@@ -971,9 +971,9 @@ pub async fn delete_session_by_token_hash(
 }
 
 pub async fn update_session_last_seen(pool: &Pool<Sqlite>, id: &str) -> Result<(), sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     sqlx::query("update sessions set last_seen_at = ?1 where id = ?2")
-        .bind(&now)
+        .bind(now)
         .bind(id)
         .execute(pool)
         .await?;
@@ -987,9 +987,9 @@ pub struct PasswordResetTokenRecord {
     pub id: String,
     pub player_id: String,
     pub token_hash: String,
-    pub created_at: String,
-    pub expires_at: String,
-    pub consumed_at: Option<String>,
+    pub created_at: i64,
+    pub expires_at: i64,
+    pub consumed_at: Option<i64>,
 }
 
 pub async fn create_password_reset_token(
@@ -997,9 +997,9 @@ pub async fn create_password_reset_token(
     id: &str,
     player_id: &str,
     token_hash: &str,
-    expires_at: &str,
+    expires_at: i64,
 ) -> Result<(), sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     sqlx::query(
         "insert into password_reset_tokens (id, player_id, token_hash, created_at, expires_at)
          values (?1, ?2, ?3, ?4, ?5)",
@@ -1007,7 +1007,7 @@ pub async fn create_password_reset_token(
     .bind(id)
     .bind(player_id)
     .bind(token_hash)
-    .bind(&now)
+    .bind(now)
     .bind(expires_at)
     .execute(pool)
     .await?;
@@ -1040,9 +1040,9 @@ pub async fn consume_password_reset_token(
     pool: &Pool<Sqlite>,
     id: &str,
 ) -> Result<(), sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     sqlx::query("update password_reset_tokens set consumed_at = ?1 where id = ?2")
-        .bind(&now)
+        .bind(now)
         .bind(id)
         .execute(pool)
         .await?;
@@ -1079,8 +1079,8 @@ pub struct InvitationRecord {
     pub inviting_player_id: String,
     pub seat_number: u8,
     pub status: String,
-    pub created_at: String,
-    pub responded_at: Option<String>,
+    pub created_at: i64,
+    pub responded_at: Option<i64>,
     /// Set only for a `SeatClaim::Email` invitation — the address the join
     /// link was sent to. Distinguishes it from a plain open/stranger
     /// invitation (both have `invited_player_id: None` until claimed), most
@@ -1115,7 +1115,7 @@ pub async fn create_invitation(
     seat_number: u8,
     invited_email: Option<&str>,
 ) -> Result<InvitationRecord, sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     sqlx::query(
         "insert into game_invitations (id, game_id, invited_player_id, inviting_player_id, seat_number, status, created_at, invited_email)
          values (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
@@ -1125,7 +1125,7 @@ pub async fn create_invitation(
     .bind(invited_player_id)
     .bind(inviting_player_id)
     .bind(seat_number as i64)
-    .bind(&now)
+    .bind(now)
     .bind(invited_email)
     .execute(pool)
     .await?;
@@ -1236,10 +1236,10 @@ pub async fn update_invitation_status(
     id: &str,
     status: &str,
 ) -> Result<(), sqlx::Error> {
-    let now = now_iso();
+    let now = now_unix_seconds();
     sqlx::query("update game_invitations set status = ?1, responded_at = ?2 where id = ?3")
         .bind(status)
-        .bind(&now)
+        .bind(now)
         .bind(id)
         .execute(pool)
         .await?;
@@ -1311,13 +1311,13 @@ pub async fn claim_invitation(
         return Err(ClaimInvitationError::NotYourInvitation);
     }
 
-    let now = now_iso();
+    let now = now_unix_seconds();
     let result = sqlx::query(
         "update game_invitations
          set status = 'accepted', responded_at = ?1, invited_player_id = coalesce(invited_player_id, ?2)
          where id = ?3 and status = 'pending'",
     )
-    .bind(&now)
+    .bind(now)
     .bind(claimant_player_id)
     .bind(invitation_id)
     .execute(pool)
@@ -1334,16 +1334,6 @@ pub async fn claim_invitation(
         responded_at: Some(now),
         ..existing
     })
-}
-
-fn now_iso() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before epoch")
-        .as_secs();
-    seconds.to_string()
 }
 
 fn status_name(status: &GameStatus) -> &'static str {

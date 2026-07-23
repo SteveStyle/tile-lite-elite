@@ -121,7 +121,8 @@ fn run_users(
                     user.id,
                     user.display_name,
                     user.email,
-                    user.last_seen_at.as_deref().unwrap_or("never")
+                    user.last_seen_at
+                        .map_or_else(|| "never".to_string(), |t| t.to_string())
                 );
             }
         }

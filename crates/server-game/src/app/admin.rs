@@ -109,13 +109,9 @@ pub(crate) async fn admin_list_games(
         }
         None => None,
     };
-    let cutoff = query.older_than_days.map(|days| {
-        let now_seconds = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time before epoch")
-            .as_secs() as i64;
-        now_seconds - days * 86_400
-    });
+    let cutoff = query
+        .older_than_days
+        .map(|days| now_unix_seconds() - days * 86_400);
 
     let games = state.games.read().await;
     let mut summaries: Vec<AdminGameSummaryDto> = games
@@ -131,20 +127,13 @@ pub(crate) async fn admin_list_games(
             };
             created_at
                 .get(&game.id)
-                .and_then(|value| value.parse::<i64>().ok())
-                .is_some_and(|created| created <= cutoff)
+                .is_some_and(|created| *created <= cutoff)
         })
         .map(|game| AdminGameSummaryDto {
             id: game.id.clone(),
             status: game.status,
-            created_at: created_at
-                .get(&game.id)
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string()),
-            last_activity_at: last_activity
-                .get(&game.id)
-                .cloned()
-                .unwrap_or_else(|| "unknown".to_string()),
+            created_at: created_at.get(&game.id).copied().unwrap_or(0),
+            last_activity_at: last_activity.get(&game.id).copied().unwrap_or(0),
             participants: game
                 .participants
                 .iter()
@@ -166,7 +155,7 @@ pub(crate) async fn admin_list_games(
                 .collect(),
         })
         .collect();
-    summaries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.created_at));
 
     Ok(Json(summaries))
 }

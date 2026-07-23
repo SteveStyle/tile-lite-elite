@@ -190,7 +190,7 @@ pub fn Home(
                 }
                 if is_active {
                     span { class: "meta-chip", "Turn: {current_turn_name(&game)}" }
-                    span { class: "meta-chip", "{crate::time_format::format_time_remaining(&game.turn_started_at, game.move_time_limit_seconds)}" }
+                    span { class: "meta-chip", "{crate::time_format::format_time_remaining(game.turn_started_at, game.move_time_limit_seconds)}" }
                 }
                 if is_loading {
                     span { class: "meta-chip", "Working..." }
@@ -574,7 +574,7 @@ mod tests {
             final_bonus_points,
             bag_count: 0,
             move_time_limit_seconds: 0,
-            turn_started_at: "0".to_string(),
+            turn_started_at: 0,
             participants,
             board: Vec::new(),
             racks: Vec::new(),

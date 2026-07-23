@@ -26,7 +26,8 @@ use uuid::Uuid;
 
 use crate::game_state::{
     EngineRegistry, GameSession, ParticipantState, ViewerAccess, attach_invitation_status,
-    move_candidate_from_dto, redact_game_state, resolve_viewer_access, tile_from_dto,
+    move_candidate_from_dto, now_unix_seconds, redact_game_state, resolve_viewer_access,
+    tile_from_dto,
 };
 use crate::persistence;
 use crate::stats;

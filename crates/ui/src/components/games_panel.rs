@@ -280,7 +280,7 @@ pub fn GamesPanel(
     /// game_id -> the `created_at` of the last chat message this device has
     /// seen for that game — see `crate::local_storage::StoredChatWatermarks`.
     /// Used only to decide whether to show the unread-mail icon in the list.
-    chat_watermarks: HashMap<String, String>,
+    chat_watermarks: HashMap<String, i64>,
     is_loading: bool,
     my_display_name: Option<String>,
     can_start: bool,
@@ -734,7 +734,7 @@ fn game_row(
             .collect::<Vec<_>>()
             .join(" vs ")
     };
-    let relative_time = format_relative_time(&summary.last_activity_at);
+    let relative_time = format_relative_time(summary.last_activity_at);
     let select_id = summary.id.clone();
     let invitation_id = summary.invitation_id.clone();
 
@@ -884,7 +884,7 @@ fn game_row(
                                             div { key: "{message.id}", class: "{message_class}",
                                                 span { class: "chat-message-sender", "{message.display_name}" }
                                                 span { class: "chat-message-body", "{message.body}" }
-                                                span { class: "chat-message-time", "{format_relative_time(&message.created_at)}" }
+                                                span { class: "chat-message-time", "{format_relative_time(message.created_at)}" }
                                             }
                                         }
                                     }
@@ -1512,7 +1512,7 @@ fn is_ready_to_start(participants: &[ParticipantDto]) -> bool {
 /// yet (see `crate::local_storage::StoredChatWatermarks`). A game with no
 /// messages at all, or whose latest message matches our stored watermark,
 /// is never unread.
-fn has_unread_chat(summary: &GameSummaryDto, chat_watermarks: &HashMap<String, String>) -> bool {
+fn has_unread_chat(summary: &GameSummaryDto, chat_watermarks: &HashMap<String, i64>) -> bool {
     summary
         .last_message_at
         .as_ref()
@@ -1783,19 +1783,19 @@ mod tests {
         assert!(is_ready_to_start(&participants));
     }
 
-    fn summary_with_last_message_at(last_message_at: Option<&str>) -> GameSummaryDto {
+    fn summary_with_last_message_at(last_message_at: Option<i64>) -> GameSummaryDto {
         GameSummaryDto {
             id: "game-1".to_string(),
             status: GameStatus::Active,
             variant: "official".to_string(),
             current_seat: 0,
             participants: vec![],
-            last_activity_at: "0".to_string(),
+            last_activity_at: 0,
             move_time_limit_seconds: 0,
-            turn_started_at: "0".to_string(),
+            turn_started_at: 0,
             relationship: GameRelationship::Participant,
             invitation_id: None,
-            last_message_at: last_message_at.map(str::to_string),
+            last_message_at,
         }
     }
 
@@ -1807,23 +1807,23 @@ mod tests {
 
     #[test]
     fn unread_chat_when_theres_no_watermark_for_the_game_yet() {
-        let summary = summary_with_last_message_at(Some("100"));
+        let summary = summary_with_last_message_at(Some(100));
         assert!(has_unread_chat(&summary, &HashMap::new()));
     }
 
     #[test]
     fn no_unread_chat_when_the_watermark_matches_the_latest_message() {
-        let summary = summary_with_last_message_at(Some("100"));
+        let summary = summary_with_last_message_at(Some(100));
         let mut watermarks = HashMap::new();
-        watermarks.insert("game-1".to_string(), "100".to_string());
+        watermarks.insert("game-1".to_string(), 100);
         assert!(!has_unread_chat(&summary, &watermarks));
     }
 
     #[test]
     fn unread_chat_when_the_watermark_is_stale() {
-        let summary = summary_with_last_message_at(Some("200"));
+        let summary = summary_with_last_message_at(Some(200));
         let mut watermarks = HashMap::new();
-        watermarks.insert("game-1".to_string(), "100".to_string());
+        watermarks.insert("game-1".to_string(), 100);
         assert!(has_unread_chat(&summary, &watermarks));
     }
 }

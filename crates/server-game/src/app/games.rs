@@ -31,10 +31,7 @@ pub(crate) async fn list_games(
     let mut summaries: Vec<api::GameSummaryDto> = Vec::new();
 
     for game in games.values() {
-        let last_activity_at = last_activity
-            .get(&game.id)
-            .cloned()
-            .unwrap_or_else(|| "unknown".to_string());
+        let last_activity_at = last_activity.get(&game.id).copied().unwrap_or(0);
 
         let is_participant = game
             .participants
@@ -97,7 +94,7 @@ pub(crate) async fn list_games(
         }
     }
 
-    summaries.sort_by(|a, b| b.last_activity_at.cmp(&a.last_activity_at));
+    summaries.sort_by_key(|s| std::cmp::Reverse(s.last_activity_at));
 
     Ok(Json(summaries))
 }

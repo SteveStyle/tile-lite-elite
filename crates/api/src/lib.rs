@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 /// compatibility check fire on every routine bugfix deploy. Release/build
 /// numbering for display purposes is a separate concern — see each
 /// binary's own `app_version()`.
-pub const API_VERSION: ApiVersion = ApiVersion { major: 1, minor: 4 };
+// 2.0: every timestamp DTO field changed from a `String` (unix seconds as
+// text) to a plain `i64` — a breaking wire change, hence the major bump.
+pub const API_VERSION: ApiVersion = ApiVersion { major: 2, minor: 0 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiVersion {
@@ -296,11 +298,11 @@ pub struct GameSummaryDto {
     /// Seconds since the Unix epoch (as a string, matching the server's
     /// storage format) of the most recent move, or the game's creation
     /// time if no moves have been made yet.
-    pub last_activity_at: String,
+    pub last_activity_at: i64,
     pub move_time_limit_seconds: u64,
     /// Seconds since the Unix epoch when `current_seat`'s turn began.
     /// Meaningless while `status` isn't `Active`.
-    pub turn_started_at: String,
+    pub turn_started_at: i64,
     pub relationship: GameRelationship,
     /// Set when `relationship` is `InvitedByName` or `InvitedOpen` — the
     /// invitation to accept/reject directly from the list.
@@ -311,7 +313,7 @@ pub struct GameSummaryDto {
     /// indicator. The client compares this against its own locally-stored
     /// "last seen" watermark per game; the server has no concept of read
     /// receipts.
-    pub last_message_at: Option<String>,
+    pub last_message_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -353,7 +355,7 @@ pub struct ChatMessageDto {
     pub player_id: String,
     pub display_name: String,
     pub body: String,
-    pub created_at: String,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -388,7 +390,7 @@ pub struct GameStateDto {
     pub move_time_limit_seconds: u64,
     /// Seconds since the Unix epoch when `current_seat`'s turn began.
     /// Meaningless while `status` isn't `Active`.
-    pub turn_started_at: String,
+    pub turn_started_at: i64,
     pub participants: Vec<ParticipantDto>,
     pub board: Vec<BoardCellDto>,
     /// Redacted per-viewer at the API boundary (see `resolve_viewer_access`/
@@ -518,8 +520,8 @@ pub struct PlayerDto {
     pub id: String,
     pub display_name: String,
     pub email: String,
-    pub created_at: String,
-    pub last_seen_at: Option<String>,
+    pub created_at: i64,
+    pub last_seen_at: Option<i64>,
 }
 
 // ========== Game Invitations ==========
@@ -542,8 +544,8 @@ pub struct GameInvitationDto {
     pub inviting_player_id: String,
     pub seat_number: u8,
     pub status: InvitationStatus,
-    pub created_at: String,
-    pub responded_at: Option<String>,
+    pub created_at: i64,
+    pub responded_at: Option<i64>,
     pub inviting_player_display_name: String,
 }
 
@@ -586,8 +588,8 @@ pub struct InvitationPreviewDto {
 pub struct AdminGameSummaryDto {
     pub id: String,
     pub status: GameStatus,
-    pub created_at: String,
-    pub last_activity_at: String,
+    pub created_at: i64,
+    pub last_activity_at: i64,
     pub participants: Vec<ParticipantDto>,
 }
 
@@ -633,5 +635,5 @@ pub struct PlayerStatsDto {
 pub struct RatingPointDto {
     pub game_id: String,
     pub rating_after: f64,
-    pub created_at: String,
+    pub created_at: i64,
 }

@@ -159,9 +159,9 @@ pub(crate) fn format_duration_days_hours(total_seconds: u64) -> String {
 /// locking — a SQL `delete ... where id = ?` on an already-gone row affects
 /// zero rows, and removing an already-removed key from the map is a no-op.
 pub(crate) async fn expire_old_finished_games(state: &AppState) {
-    let now: u64 = now_iso().parse().unwrap_or(0);
-    let cutoff = now.saturating_sub(7 * 24 * 60 * 60).to_string();
-    let stale_ids = match persistence::list_finished_game_ids_older_than(&state.db, &cutoff).await {
+    let now = now_unix_seconds();
+    let cutoff = now - 7 * 24 * 60 * 60;
+    let stale_ids = match persistence::list_finished_game_ids_older_than(&state.db, cutoff).await {
         Ok(ids) => ids,
         Err(error) => {
             tracing::error!(%error, "failed to query finished games for expiry");

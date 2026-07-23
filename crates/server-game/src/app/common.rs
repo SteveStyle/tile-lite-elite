@@ -82,17 +82,15 @@ pub(crate) async fn player_id_for_token(state: &AppState, token: &str) -> Option
         .await
         .ok()??;
 
-    let now = now_iso().parse::<u64>().ok()?;
+    let now = now_unix_seconds();
 
-    if let Some(expires_at) = &session.expires_at
-        && let Ok(expiry) = expires_at.parse::<u64>()
+    if let Some(expiry) = session.expires_at
         && now >= expiry
     {
         return None;
     }
 
-    let last_seen = session.last_seen_at.parse::<u64>().ok()?;
-    let idle = now.saturating_sub(last_seen);
+    let idle = now.saturating_sub(session.last_seen_at);
     if idle > persistence::SESSION_IDLE_WINDOW_SECS {
         return None;
     }
@@ -101,14 +99,4 @@ pub(crate) async fn player_id_for_token(state: &AppState, token: &str) -> Option
     }
 
     Some(session.player_id)
-}
-
-pub(crate) fn now_iso() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let seconds = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time before epoch")
-        .as_secs();
-    seconds.to_string()
 }

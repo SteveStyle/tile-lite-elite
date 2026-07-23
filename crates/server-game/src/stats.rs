@@ -209,7 +209,7 @@ const RATING_FLOOR: f64 = 100.0;
 pub async fn settle_ratings(
     tx: &mut Transaction<'_, Sqlite>,
     session: &GameSession,
-    ended_at: &str,
+    ended_at: i64,
 ) -> Result<(), sqlx::Error> {
     if terminal_move_type(session) == Some("admin_force_end") {
         return Ok(());

@@ -18,11 +18,8 @@ fn now_epoch_seconds() -> u64 {
 
 /// Falls back to the raw string if it isn't parseable, so an unexpected
 /// server format degrades gracefully instead of panicking the UI.
-pub fn format_relative_time(epoch_seconds_str: &str) -> String {
-    let Ok(then) = epoch_seconds_str.parse::<u64>() else {
-        return epoch_seconds_str.to_string();
-    };
-    let diff = now_epoch_seconds().saturating_sub(then);
+pub fn format_relative_time(epoch_seconds: i64) -> String {
+    let diff = now_epoch_seconds().saturating_sub(epoch_seconds.max(0) as u64);
 
     if diff < 10 {
         "just now".to_string()
@@ -46,11 +43,8 @@ pub fn format_relative_time(epoch_seconds_str: &str) -> String {
 /// combined days+hours while more than an hour remains, then switches to
 /// minutes-only for the final hour (rounded up, so any time still left
 /// reads as at least "1m left" rather than a misleading "0m left").
-pub fn format_time_remaining(turn_started_at: &str, move_time_limit_seconds: u64) -> String {
-    let Ok(started) = turn_started_at.parse::<u64>() else {
-        return "unknown".to_string();
-    };
-    let deadline = started + move_time_limit_seconds;
+pub fn format_time_remaining(turn_started_at: i64, move_time_limit_seconds: u64) -> String {
+    let deadline = turn_started_at.max(0) as u64 + move_time_limit_seconds;
     let now = now_epoch_seconds();
     if now >= deadline {
         return "overdue".to_string();
@@ -75,45 +69,45 @@ pub fn format_time_remaining(turn_started_at: &str, move_time_limit_seconds: u64
 mod tests {
     use super::*;
 
-    fn started_seconds_ago(seconds_ago: u64) -> String {
-        (now_epoch_seconds() - seconds_ago).to_string()
+    fn started_seconds_ago(seconds_ago: u64) -> i64 {
+        (now_epoch_seconds() - seconds_ago) as i64
     }
 
     #[test]
     fn shows_days_and_hours_above_one_hour_remaining() {
         // 72h limit, 20h elapsed -> 52h (2d 4h) remaining.
         let started = started_seconds_ago(20 * 3_600);
-        assert_eq!(format_time_remaining(&started, 72 * 3_600), "2d 4h left");
+        assert_eq!(format_time_remaining(started, 72 * 3_600), "2d 4h left");
     }
 
     #[test]
     fn shows_hours_only_when_under_a_day_remains() {
         // 72h limit, 68h elapsed -> 4h remaining.
         let started = started_seconds_ago(68 * 3_600);
-        assert_eq!(format_time_remaining(&started, 72 * 3_600), "4h left");
+        assert_eq!(format_time_remaining(started, 72 * 3_600), "4h left");
     }
 
     #[test]
     fn switches_to_minutes_at_exactly_one_hour_remaining() {
         let started = started_seconds_ago(71 * 3_600);
-        assert_eq!(format_time_remaining(&started, 72 * 3_600), "60m left");
+        assert_eq!(format_time_remaining(started, 72 * 3_600), "60m left");
     }
 
     #[test]
     fn shows_minutes_under_one_hour_remaining() {
         let started = started_seconds_ago(72 * 3_600 - 30 * 60);
-        assert_eq!(format_time_remaining(&started, 72 * 3_600), "30m left");
+        assert_eq!(format_time_remaining(started, 72 * 3_600), "30m left");
     }
 
     #[test]
     fn rounds_up_so_any_remaining_time_shows_at_least_one_minute() {
         let started = started_seconds_ago(72 * 3_600 - 10);
-        assert_eq!(format_time_remaining(&started, 72 * 3_600), "1m left");
+        assert_eq!(format_time_remaining(started, 72 * 3_600), "1m left");
     }
 
     #[test]
     fn reports_overdue_once_the_deadline_has_passed() {
         let started = started_seconds_ago(73 * 3_600);
-        assert_eq!(format_time_remaining(&started, 72 * 3_600), "overdue");
+        assert_eq!(format_time_remaining(started, 72 * 3_600), "overdue");
     }
 }

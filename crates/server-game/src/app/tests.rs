@@ -302,7 +302,7 @@ async fn create_game_and_list_games_via_http() {
     assert_eq!(summary.participants.len(), 2);
     assert_eq!(summary.relationship, api::GameRelationship::Participant);
     assert!(
-        !summary.last_activity_at.is_empty() && summary.last_activity_at != "unknown",
+        summary.last_activity_at > 0,
         "expected a real timestamp, got {:?}",
         summary.last_activity_at
     );
@@ -2872,17 +2872,17 @@ async fn expire_old_finished_games_deletes_stale_games_but_not_recent_ones() {
     // `ended_at` is only ever set in SQL, by `save_game`, based on
     // `status == Finished` at save time — bypass the normal flow and
     // write it directly so the test controls the exact age.
-    let now: u64 = now_iso().parse().unwrap_or(0);
-    let eight_days_ago = (now - 8 * 24 * 60 * 60).to_string();
-    let one_day_ago = (now - 24 * 60 * 60).to_string();
+    let now = now_unix_seconds();
+    let eight_days_ago = now - 8 * 24 * 60 * 60;
+    let one_day_ago = now - 24 * 60 * 60;
     sqlx::query("update games set status = 'finished', ended_at = ?1 where id = ?2")
-        .bind(&eight_days_ago)
+        .bind(eight_days_ago)
         .bind(&old.id)
         .execute(&state.db)
         .await
         .expect("update should succeed");
     sqlx::query("update games set status = 'finished', ended_at = ?1 where id = ?2")
-        .bind(&one_day_ago)
+        .bind(one_day_ago)
         .bind(&recent.id)
         .execute(&state.db)
         .await
@@ -2930,7 +2930,7 @@ fn empty_live_game_for_test(id: &str) -> GameStateDto {
         final_bonus_points: None,
         bag_count: 100,
         move_time_limit_seconds: 0,
-        turn_started_at: "0".to_string(),
+        turn_started_at: 0,
         participants: Vec::new(),
         board: Vec::new(),
         racks: Vec::new(),
@@ -3002,12 +3002,8 @@ async fn registering_without_stay_logged_in_gets_a_session_that_expires() {
         .expect("query should succeed")
         .expect("session should exist");
     assert!(!record.stay_logged_in);
-    let expires_at: u64 = record
-        .expires_at
-        .expect("should have an expiry")
-        .parse()
-        .unwrap();
-    let now: u64 = super::now_iso().parse().unwrap();
+    let expires_at = record.expires_at.expect("should have an expiry");
+    let now = super::now_unix_seconds();
     // Should be ~10 days out (the uniform absolute cap) — just confirm it's
     // in the right ballpark rather than pinning an exact second.
     assert!(expires_at > now + 9 * 24 * 60 * 60);
@@ -3044,12 +3040,10 @@ async fn stay_logged_in_no_longer_changes_server_side_expiry() {
     // session now gets the same ~10-day absolute cap, not the old "never
     // expires".
     assert!(record.stay_logged_in);
-    let expires_at: u64 = record
+    let expires_at = record
         .expires_at
-        .expect("a stay_logged_in session now has an absolute expiry too")
-        .parse()
-        .unwrap();
-    let now: u64 = super::now_iso().parse().unwrap();
+        .expect("a stay_logged_in session now has an absolute expiry too");
+    let now = super::now_unix_seconds();
     assert!(expires_at > now + 9 * 24 * 60 * 60);
     assert!(expires_at < now + 11 * 24 * 60 * 60);
 }
@@ -3073,7 +3067,7 @@ async fn expired_absolute_token_is_rejected_and_a_no_expiry_one_idle_expires() {
         &register_player(app.clone(), "Alice").await.player_id,
         &hash_token(expired_token),
         false,
-        Some("0"), // already past its absolute expiry
+        Some(0), // already past its absolute expiry
     )
     .await
     .expect("session should be created");
@@ -3099,10 +3093,10 @@ async fn expired_absolute_token_is_rejected_and_a_no_expiry_one_idle_expires() {
     assert_eq!(fresh.status(), StatusCode::OK);
 
     // ...but once it goes dormant past the idle window, it's rejected too.
-    let now = now_iso().parse::<u64>().expect("now parses");
-    let stale = (now - persistence::SESSION_IDLE_WINDOW_SECS - 60).to_string();
+    let now = now_unix_seconds();
+    let stale = now - persistence::SESSION_IDLE_WINDOW_SECS - 60;
     sqlx::query("update sessions set last_seen_at = ?1 where token_hash = ?2")
-        .bind(&stale)
+        .bind(stale)
         .bind(hash_token(no_expiry_token))
         .execute(&db)
         .await
@@ -3133,7 +3127,7 @@ async fn delete_expired_sessions_removes_only_past_expiry_ones() {
         &alice.player_id,
         &hash_token("alice-expired"),
         false,
-        Some("0"),
+        Some(0),
     )
     .await
     .expect("session should be created");
@@ -3143,7 +3137,7 @@ async fn delete_expired_sessions_removes_only_past_expiry_ones() {
         &bob.player_id,
         &hash_token("bob-future"),
         false,
-        Some("9999999999"),
+        Some(9999999999),
     )
     .await
     .expect("session should be created");
@@ -3193,10 +3187,10 @@ async fn an_idle_session_past_the_window_is_rejected_and_swept() {
     let db = state.db.clone();
     let alice = register_player(app.clone(), "Alice").await;
 
-    let now = now_iso().parse::<u64>().expect("now parses");
-    let stale = (now - persistence::SESSION_IDLE_WINDOW_SECS - 60).to_string();
+    let now = now_unix_seconds();
+    let stale = now - persistence::SESSION_IDLE_WINDOW_SECS - 60;
     sqlx::query("update sessions set last_seen_at = ?1 where token_hash = ?2")
-        .bind(&stale)
+        .bind(stale)
         .bind(hash_token(&alice.session_token))
         .execute(&db)
         .await
@@ -3310,10 +3304,10 @@ async fn an_authenticated_request_bumps_stale_last_seen() {
 
     // Past the bump throttle but well within the idle window: still valid,
     // but due for a refresh.
-    let now = now_iso().parse::<u64>().expect("now parses");
-    let staleish = (now - persistence::LAST_SEEN_BUMP_THROTTLE_SECS - 60).to_string();
+    let now = now_unix_seconds();
+    let staleish = now - persistence::LAST_SEEN_BUMP_THROTTLE_SECS - 60;
     sqlx::query("update sessions set last_seen_at = ?1 where token_hash = ?2")
-        .bind(&staleish)
+        .bind(staleish)
         .bind(hash_token(&alice.session_token))
         .execute(&db)
         .await
@@ -3334,11 +3328,52 @@ async fn an_authenticated_request_bumps_stale_last_seen() {
         .await
         .expect("query should succeed")
         .expect("session still exists");
-    let bumped: u64 = session.last_seen_at.parse().expect("last_seen parses");
+    let bumped = session.last_seen_at;
     assert!(
         bumped >= now - 5,
         "last_seen should have been refreshed to ~now (backdated to {staleish}, now {bumped})"
     );
+}
+
+/// A game snapshot written before timestamps became `i64` stored
+/// `turn_started_at` (and chat `created_at`) as strings inside
+/// `snapshot_json`. The `0004` migration only converts the timestamp
+/// *columns*, not the JSON blob, so the serde string-or-number shim is what
+/// lets such a game still load — i.e. this is a real in-place upgrade, not a
+/// wipe.
+#[tokio::test]
+async fn a_snapshot_with_string_timestamps_still_loads() {
+    let state = create_test_state(&test_database_url()).await;
+    let app = build_router(state.clone());
+    let db = state.db.clone();
+    let game = create_two_human_game(app.clone()).await;
+    let game_id = game.game.id.clone();
+
+    // Rewrite the snapshot's numeric turn_started_at as a string, mimicking a
+    // snapshot written by the pre-integer code.
+    let snapshot: String = sqlx::query_scalar("select snapshot_json from games where id = ?1")
+        .bind(&game_id)
+        .fetch_one(&db)
+        .await
+        .expect("snapshot exists");
+    let mut value: serde_json::Value = serde_json::from_str(&snapshot).expect("valid json");
+    let ts = value["turn_started_at"]
+        .as_i64()
+        .expect("numeric turn_started_at");
+    value["turn_started_at"] = serde_json::Value::String(ts.to_string());
+    let rewritten = serde_json::to_string(&value).expect("serialize");
+    sqlx::query("update games set snapshot_json = ?1 where id = ?2")
+        .bind(&rewritten)
+        .bind(&game_id)
+        .execute(&db)
+        .await
+        .expect("update snapshot");
+
+    let reloaded = persistence::load_game(&db, &game_id)
+        .await
+        .expect("load ok")
+        .expect("game still loads from a string-timestamp snapshot");
+    assert_eq!(reloaded.turn_started_at, ts);
 }
 
 #[tokio::test]
@@ -3704,7 +3739,7 @@ async fn timeout_does_not_move_rating() {
     {
         let mut games = state.games.write().await;
         let game = games.get_mut(&started.game.id).expect("game should exist");
-        game.turn_started_at = "0".to_string();
+        game.turn_started_at = 0;
     }
 
     let fetched: GameStateDto = read_json(
@@ -4645,7 +4680,7 @@ async fn admin_can_list_and_delete_games() {
         .iter()
         .find(|game| game.id == created.game.id)
         .expect("created game should be listed");
-    assert!(!listed_game.created_at.is_empty());
+    assert!(listed_game.created_at > 0);
 
     let delete_response = send_admin::<()>(
         app.clone(),
@@ -4965,10 +5000,8 @@ async fn move_time_reminder_fires_once_when_a_long_limit_game_runs_low_on_time()
     {
         let mut games = state.games.write().await;
         let game = games.get_mut(&started.game.id).expect("game should exist");
-        let remaining = 1_000;
-        game.turn_started_at = (now_iso().parse::<u64>().unwrap_or(0) + remaining
-            - game.move_time_limit_seconds)
-            .to_string();
+        let remaining: i64 = 1_000;
+        game.turn_started_at = now_unix_seconds() + remaining - game.move_time_limit_seconds as i64;
     }
 
     let log = start_capturing_log_on_this_thread();
@@ -5087,8 +5120,7 @@ async fn move_time_reminder_does_not_fire_for_a_same_day_limit_game() {
     {
         let mut games = state.games.write().await;
         let game = games.get_mut(&started.id).expect("game should exist");
-        game.turn_started_at =
-            (now_iso().parse::<u64>().unwrap_or(0) - game.move_time_limit_seconds + 30).to_string();
+        game.turn_started_at = now_unix_seconds() - game.move_time_limit_seconds as i64 + 30;
     }
 
     let log = start_capturing_log_on_this_thread();
@@ -5726,7 +5758,7 @@ async fn overdue_turn_is_auto_retired_on_next_access() {
     {
         let mut games = state.games.write().await;
         let game = games.get_mut(&created.id).expect("game should exist");
-        game.turn_started_at = "0".to_string();
+        game.turn_started_at = 0;
     }
 
     let fetched: GameStateDto = read_json(
@@ -6108,7 +6140,7 @@ async fn reset_password_rejects_an_expired_token() {
         &Uuid::new_v4().to_string(),
         &alice.player_id,
         &hash_token(&token),
-        "0", // already expired (epoch second 0)
+        0, // already expired (epoch second 0)
     )
     .await
     .expect("token should be created");
@@ -6134,13 +6166,13 @@ async fn reset_password_rejects_a_token_already_used_once() {
 
     let alice = register_player(app.clone(), "Alice").await;
     let token = Uuid::new_v4().to_string();
-    let far_future = (now_iso().parse::<u64>().unwrap() + 3600).to_string();
+    let far_future = now_unix_seconds() + 3600;
     persistence::create_password_reset_token(
         &state.db,
         &Uuid::new_v4().to_string(),
         &alice.player_id,
         &hash_token(&token),
-        &far_future,
+        far_future,
     )
     .await
     .expect("token should be created");
@@ -6181,13 +6213,13 @@ async fn reset_password_succeeds_updates_password_and_signs_out_existing_session
 
     let alice = register_player(app.clone(), "Alice").await;
     let token = Uuid::new_v4().to_string();
-    let far_future = (now_iso().parse::<u64>().unwrap() + 3600).to_string();
+    let far_future = now_unix_seconds() + 3600;
     persistence::create_password_reset_token(
         &state.db,
         &Uuid::new_v4().to_string(),
         &alice.player_id,
         &hash_token(&token),
-        &far_future,
+        far_future,
     )
     .await
     .expect("token should be created");

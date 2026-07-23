@@ -70,7 +70,8 @@ pub struct ChatMessageRecord {
     pub player_id: String,
     pub display_name: String,
     pub body: String,
-    pub created_at: String,
+    #[serde(deserialize_with = "deserialize_i64_flexible")]
+    pub created_at: i64,
 }
 
 /// Cap on a single chat message's length — plain hygiene, not intended to be
@@ -274,7 +275,7 @@ pub struct GameSession {
     /// Unix seconds (as a string, matching the rest of the codebase's
     /// timestamp convention) when `current_seat`'s turn began — reset every
     /// time the turn advances. Meaningless until the game is `Active`.
-    pub turn_started_at: String,
+    pub turn_started_at: i64,
 }
 
 impl GameSession {
@@ -317,7 +318,7 @@ impl GameSession {
             messages: Vec::new(),
             consecutive_scoreless_turns: 0,
             move_time_limit_seconds,
-            turn_started_at: now_unix_seconds().to_string(),
+            turn_started_at: now_unix_seconds(),
         }
     }
 
@@ -435,7 +436,7 @@ impl GameSession {
         self.status = GameStatus::Active;
         self.turn_number = 1;
         self.current_seat = 0;
-        self.turn_started_at = now_unix_seconds().to_string();
+        self.turn_started_at = now_unix_seconds();
     }
 
     /// Auto-retires the current seat if it has sat on its turn past
@@ -451,10 +452,8 @@ impl GameSession {
         if self.status != GameStatus::Active {
             return false;
         }
-        let Ok(started) = self.turn_started_at.parse::<u64>() else {
-            return false;
-        };
-        if now_unix_seconds().saturating_sub(started) < self.move_time_limit_seconds {
+        let started = self.turn_started_at;
+        if now_unix_seconds().saturating_sub(started) < self.move_time_limit_seconds as i64 {
             return false;
         }
 
@@ -485,15 +484,15 @@ impl GameSession {
         if self.status != GameStatus::Active {
             return None;
         }
-        let started = self.turn_started_at.parse::<u64>().ok()?;
-        let elapsed = now_unix_seconds().saturating_sub(started);
+        let started = self.turn_started_at;
+        let elapsed = now_unix_seconds().saturating_sub(started).max(0) as u64;
         Some(self.move_time_limit_seconds.saturating_sub(elapsed))
     }
 
     /// A lightweight summary for games-list views. `last_activity_at` is
     /// supplied by the caller since move timestamps live in the persistence
     /// layer, not on `GameSession` itself.
-    pub fn to_summary_dto(&self, last_activity_at: String) -> api::GameSummaryDto {
+    pub fn to_summary_dto(&self, last_activity_at: i64) -> api::GameSummaryDto {
         api::GameSummaryDto {
             id: self.id.clone(),
             status: self.status,
@@ -520,11 +519,8 @@ impl GameSession {
                 .collect(),
             last_activity_at,
             move_time_limit_seconds: self.move_time_limit_seconds,
-            turn_started_at: self.turn_started_at.clone(),
-            last_message_at: self
-                .messages
-                .last()
-                .map(|message| message.created_at.clone()),
+            turn_started_at: self.turn_started_at,
+            last_message_at: self.messages.last().map(|message| message.created_at),
             // Caller-relative fields — `list_games` fills these in per
             // requester since "why does this game show up" depends on who's
             // asking, not on the game itself.
@@ -548,7 +544,7 @@ impl GameSession {
             final_bonus_points: self.final_bonus_points,
             bag_count: self.bag.len(),
             move_time_limit_seconds: self.move_time_limit_seconds,
-            turn_started_at: self.turn_started_at.clone(),
+            turn_started_at: self.turn_started_at,
             participants: self
                 .participants
                 .iter()
@@ -604,7 +600,7 @@ impl GameSession {
                     player_id: record.player_id.clone(),
                     display_name: record.display_name.clone(),
                     body: record.body.clone(),
-                    created_at: record.created_at.clone(),
+                    created_at: record.created_at,
                 })
                 .collect(),
         }
@@ -641,7 +637,7 @@ impl GameSession {
             player_id: player_id.to_string(),
             display_name: display_name.to_string(),
             body,
-            created_at: now_unix_seconds().to_string(),
+            created_at: now_unix_seconds(),
         });
         Ok(())
     }
@@ -1102,7 +1098,7 @@ impl GameSession {
         }
         self.current_seat = next_seat as u8;
         self.turn_number += 1;
-        self.turn_started_at = now_unix_seconds().to_string();
+        self.turn_started_at = now_unix_seconds();
     }
 
     /// Applies the turn-order consequence of a seat leaving the game
@@ -1125,12 +1121,39 @@ impl GameSession {
     }
 }
 
-fn now_unix_seconds() -> u64 {
+/// Deserialize an `i64` that may appear as either a JSON number or a JSON
+/// string of digits. Timestamps inside `snapshot_json` (this crate's
+/// `turn_started_at` and `ChatMessageRecord.created_at`) were stored as
+/// strings before they became `i64`, so this lets a game snapshot written by
+/// the old code still load, converting on the fly — the same forward-compat
+/// technique used for reshaped persisted fields elsewhere. The next `save`
+/// re-serializes it as a plain number.
+pub(crate) fn deserialize_i64_flexible<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum NumOrStr {
+        Num(i64),
+        Str(String),
+    }
+    match NumOrStr::deserialize(deserializer)? {
+        NumOrStr::Num(n) => Ok(n),
+        NumOrStr::Str(s) => s.parse().map_err(serde::de::Error::custom),
+    }
+}
+
+/// Seconds since the Unix epoch as an `i64` — the single timestamp source
+/// for the whole crate (there used to be a `now_iso` twin returning the same
+/// value as a `String`; timestamps are integers everywhere now). `i64`
+/// matches SQLite's native integer type and the signed `time_t` convention.
+pub(crate) fn now_unix_seconds() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before epoch")
-        .as_secs()
+        .as_secs() as i64
 }
 
 fn ensure_active_turn(session: &GameSession, seat_number: u8) -> Result<(), String> {
@@ -1353,6 +1376,29 @@ impl PositionDtoToRules {
 mod tests {
     use super::*;
 
+    #[test]
+    fn flexible_i64_deserializes_from_a_number_or_a_digit_string() {
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            #[serde(deserialize_with = "deserialize_i64_flexible")]
+            t: i64,
+        }
+        let from_number: Wrap = serde_json::from_str(r#"{"t":1780000000}"#).unwrap();
+        assert_eq!(from_number.t, 1_780_000_000);
+        let from_string: Wrap = serde_json::from_str(r#"{"t":"1780000000"}"#).unwrap();
+        assert_eq!(from_string.t, 1_780_000_000);
+    }
+
+    #[test]
+    fn chat_message_record_loads_a_pre_integer_string_timestamp() {
+        // A snapshot written before timestamps became i64 stored created_at as
+        // a string; it must still deserialize (converting to i64) so old games
+        // load without a wipe.
+        let json = r#"{"id":"m1","player_id":"p1","display_name":"Alice","body":"hi","created_at":"1780000000"}"#;
+        let record: ChatMessageRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(record.created_at, 1_780_000_000);
+    }
+
     fn participant(seat_number: u8, kind: SeatKind, player_id: Option<&str>) -> ParticipantState {
         ParticipantState {
             seat_number,
@@ -1437,7 +1483,7 @@ mod tests {
             player_id: "alice".to_string(),
             display_name: "Alice".to_string(),
             body: "hi".to_string(),
-            created_at: "0".to_string(),
+            created_at: 0,
         });
         let dto = redact_game_state(game.to_dto(), &ViewerAccess::Creator);
         assert!(dto.racks.iter().all(|rack| rack.counts.is_empty()));
@@ -1454,7 +1500,7 @@ mod tests {
             player_id: "alice".to_string(),
             display_name: "Alice".to_string(),
             body: "hi".to_string(),
-            created_at: "0".to_string(),
+            created_at: 0,
         });
         let dto = redact_game_state(game.to_dto(), &ViewerAccess::Participant { seat_number: 0 });
         // Seat 0 (this viewer) keeps their own rack contents...

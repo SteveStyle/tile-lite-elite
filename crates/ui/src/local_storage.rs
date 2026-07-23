@@ -73,7 +73,7 @@ fn save_impl(auth: &StoredAuth) -> Result<(), String> {
 /// match the latest message) has unread chat.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredChatWatermarks {
-    pub last_seen: HashMap<String, String>,
+    pub last_seen: HashMap<String, i64>,
 }
 
 #[cfg(target_arch = "wasm32")]
