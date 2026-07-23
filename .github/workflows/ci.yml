@@ -1,0 +1,75 @@
+name: CI
+
+# Runs on every push (any branch), on pull requests, and on demand from the
+# Actions tab. See docs/3.3-testing-and-staging.md for how this fits alongside
+# the local staging environment.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch/PR cancels an in-progress run for it, so we
+# don't burn minutes finishing a run that's already superseded.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # .cargo/config.toml sets `rustc-wrapper = sccache` for fast local rebuilds,
+  # but sccache isn't installed on the runner and is incompatible with the
+  # wasm32 target anyway (see docs/3.2-development.md's "Known Build Issues").
+  # An empty value disables the wrapper for the whole job; the wasm32
+  # `target-feature` rustflags in that same config file still apply.
+  RUSTC_WRAPPER: ""
+
+jobs:
+  check:
+    name: fmt · clippy · test · wasm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # srm-utils is a git dependency (github.com/SteveStyle/utils), pulled in
+      # only by the archived old-crates. The checkout above doesn't fetch it;
+      # cargo does, during the first build step below. That repo must be
+      # reachable by the runner (it's public) for resolution to succeed.
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry and build output
+        uses: Swatinem/rust-cache@v2
+
+      # Formatting is checked only on the crates in this repo. old-crates are
+      # an untouched historical archive and are excluded from the lint gate.
+      - name: Format check
+        run: >
+          cargo fmt
+          -p api -p engine-core -p rules-shared
+          -p server-game -p admin-cli -p tile-lite-elite-ui
+          --check
+
+      # -D warnings makes any clippy or rustc warning fail the build. Scoped to
+      # this repo's crates (old-crates carry many pre-existing warnings we don't
+      # maintain), but across all targets so tests and examples are linted too.
+      - name: Clippy (deny warnings)
+        run: >
+          cargo clippy
+          --workspace --exclude first-try --exclude second-try
+          --all-targets
+          -- -D warnings
+
+      # Full workspace, including old-crates (their tests still pass and the git
+      # utils dependency resolves, so there's no reason to hide them here).
+      - name: Test
+        run: cargo test --workspace
+
+      # Compiles the web client to wasm — the deploy's Docker build does this
+      # too, and native checks above won't catch wasm-only breakage. This is a
+      # plain cargo compile (default `web` feature); it deliberately does not
+      # run the full dx / wasm-bindgen packaging pipeline the release build uses.
+      - name: Wasm build (web client)
+        run: cargo build -p tile-lite-elite-ui --target wasm32-unknown-unknown

@@ -133,8 +133,9 @@ pub fn RootApp() -> Element {
     // instant (every dictionary is compiled in), on wasm it's a real async
     // fetch (see `load_client_dictionary`), so the preview just shows
     // nothing for that brief window rather than blocking on it.
-    let mut client_dictionaries: Signal<HashMap<String, &'static rules_shared::WordListDictionary>> =
-        use_signal(HashMap::new);
+    let mut client_dictionaries: Signal<
+        HashMap<String, &'static rules_shared::WordListDictionary>,
+    > = use_signal(HashMap::new);
     // Which languages a fetch has already been dispatched for — set
     // synchronously (not inside the spawned future) so a re-render while
     // the first fetch is still in flight doesn't dispatch a second,
@@ -304,35 +305,35 @@ pub fn RootApp() -> Element {
         });
     }
 
-    if let Some(current_game) = game() {
-        if websocket_game_id().as_deref() != Some(current_game.id.as_str()) {
-            let game_id = current_game.id.clone();
-            websocket_game_id.set(Some(game_id.clone()));
-            let server_url = server_url.clone();
-            let token = session().map(|current| current.session_token.clone());
-            spawn(async move {
-                // Keep retrying for as long as this is still the selected
-                // game — a dropped connection (network blip, server
-                // restart) shouldn't leave live updates dead for the rest
-                // of the session. `subscribe_to_game_events` itself marks
-                // `IS_ONLINE` on connect/disconnect (see `mark_online` /
-                // `mark_offline`); this loop just keeps trying.
-                while websocket_game_id().as_deref() == Some(game_id.as_str()) {
-                    let _ = subscribe_to_game_events(
-                        &server_url,
-                        &game_id,
-                        token.as_deref(),
-                        game,
-                        websocket_game_id,
-                    )
-                    .await;
-                    if websocket_game_id().as_deref() != Some(game_id.as_str()) {
-                        break;
-                    }
-                    sleep_ms(WEBSOCKET_RETRY_MS).await;
+    if let Some(current_game) = game()
+        && websocket_game_id().as_deref() != Some(current_game.id.as_str())
+    {
+        let game_id = current_game.id.clone();
+        websocket_game_id.set(Some(game_id.clone()));
+        let server_url = server_url.clone();
+        let token = session().map(|current| current.session_token.clone());
+        spawn(async move {
+            // Keep retrying for as long as this is still the selected
+            // game — a dropped connection (network blip, server
+            // restart) shouldn't leave live updates dead for the rest
+            // of the session. `subscribe_to_game_events` itself marks
+            // `IS_ONLINE` on connect/disconnect (see `mark_online` /
+            // `mark_offline`); this loop just keeps trying.
+            while websocket_game_id().as_deref() == Some(game_id.as_str()) {
+                let _ = subscribe_to_game_events(
+                    &server_url,
+                    &game_id,
+                    token.as_deref(),
+                    game,
+                    websocket_game_id,
+                )
+                .await;
+                if websocket_game_id().as_deref() != Some(game_id.as_str()) {
+                    break;
                 }
-            });
-        }
+                sleep_ms(WEBSOCKET_RETRY_MS).await;
+            }
+        });
     }
 
     if !game_list_polling_started() {
@@ -373,19 +374,18 @@ pub fn RootApp() -> Element {
     // live update arrives for a game that's already open, so watching the
     // panel counts as reading it. Never touches watermarks for any other
     // game, since `game()` only ever holds the currently-selected one.
-    if let Some(current_game) = game() {
-        if let Some(latest) = current_game.messages.last() {
-            if chat_watermarks().get(&current_game.id) != Some(&latest.created_at) {
-                let game_id = current_game.id.clone();
-                let created_at = latest.created_at.clone();
-                chat_watermarks.with_mut(|marks| {
-                    marks.insert(game_id, created_at);
-                });
-                crate::local_storage::save_chat_watermarks(&crate::local_storage::StoredChatWatermarks {
-                    last_seen: chat_watermarks(),
-                });
-            }
-        }
+    if let Some(current_game) = game()
+        && let Some(latest) = current_game.messages.last()
+        && chat_watermarks().get(&current_game.id) != Some(&latest.created_at)
+    {
+        let game_id = current_game.id.clone();
+        let created_at = latest.created_at.clone();
+        chat_watermarks.with_mut(|marks| {
+            marks.insert(game_id, created_at);
+        });
+        crate::local_storage::save_chat_watermarks(&crate::local_storage::StoredChatWatermarks {
+            last_seen: chat_watermarks(),
+        });
     }
 
     let game_for_view = game().clone().unwrap_or_else(empty_live_game);
@@ -401,7 +401,8 @@ pub fn RootApp() -> Element {
                     .participants
                     .get(current.current_seat as usize)
                     .is_some_and(|participant| {
-                        participant.kind == SeatKind::Human && seat_is_open_or_owned_by(participant, viewer_player_id.as_deref())
+                        participant.kind == SeatKind::Human
+                            && seat_is_open_or_owned_by(participant, viewer_player_id.as_deref())
                     })
         });
     // Which seat's rack this viewer gets to see at all: their own claimed
@@ -1759,7 +1760,10 @@ pub(crate) async fn search_players(
     token: Option<&str>,
 ) -> Result<Vec<String>, String> {
     get_json_auth(
-        &format!("{server_url}/players/search?q={}", url_encode_query_param(query)),
+        &format!(
+            "{server_url}/players/search?q={}",
+            url_encode_query_param(query)
+        ),
         token,
     )
     .await
@@ -1778,7 +1782,11 @@ pub(crate) async fn fetch_player_rating_history(
     player_id: &str,
     token: Option<&str>,
 ) -> Result<Vec<api::RatingPointDto>, String> {
-    get_json_auth(&format!("{server_url}/players/{player_id}/rating-history"), token).await
+    get_json_auth(
+        &format!("{server_url}/players/{player_id}/rating-history"),
+        token,
+    )
+    .await
 }
 
 async fn load_game_summaries(
@@ -1879,12 +1887,7 @@ pub(crate) async fn reset_password(
         token: token.to_string(),
         new_password: new_password.to_string(),
     };
-    post_no_content(
-        &format!("{server_url}/auth/reset-password"),
-        None,
-        &request,
-    )
-    .await
+    post_no_content(&format!("{server_url}/auth/reset-password"), None, &request).await
 }
 
 /// Unauthenticated — see `api::InvitationPreviewDto`'s doc comment for why
@@ -2034,7 +2037,6 @@ async fn load_summaries_and_game(
     }
 }
 
-
 async fn create_custom_game(
     server_url: &str,
     token: Option<&str>,
@@ -2054,21 +2056,47 @@ async fn create_custom_game(
 /// Neither endpoint takes a request body (the invitation id in the path is
 /// all the server needs), but `post_json` always serializes a payload — `()`
 /// serializes to `null`, which the handlers simply never look at.
-async fn accept_invitation(server_url: &str, invitation_id: &str, token: Option<&str>) -> Result<GameStateDto, String> {
-    post_json(&format!("{server_url}/invitations/{invitation_id}/accept"), token, &()).await
+async fn accept_invitation(
+    server_url: &str,
+    invitation_id: &str,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    post_json(
+        &format!("{server_url}/invitations/{invitation_id}/accept"),
+        token,
+        &(),
+    )
+    .await
 }
 
-async fn reject_invitation(server_url: &str, invitation_id: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
-    post_json(&format!("{server_url}/invitations/{invitation_id}/reject"), token, &()).await
+async fn reject_invitation(
+    server_url: &str,
+    invitation_id: &str,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    post_json(
+        &format!("{server_url}/invitations/{invitation_id}/reject"),
+        token,
+        &(),
+    )
+    .await
 }
 
 /// Hides a finished game from the caller's own games list — see
 /// `crate::components::games_panel::game_row`'s "Remove" button.
-async fn remove_game(server_url: &str, game_id: &str, token: Option<&str>) -> Result<serde_json::Value, String> {
+async fn remove_game(
+    server_url: &str,
+    game_id: &str,
+    token: Option<&str>,
+) -> Result<serde_json::Value, String> {
     post_json(&format!("{server_url}/games/{game_id}/remove"), token, &()).await
 }
 
-async fn start_game(server_url: &str, game_id: &str, token: Option<&str>) -> Result<GameStateDto, String> {
+async fn start_game(
+    server_url: &str,
+    game_id: &str,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
     post_json(
         &format!("{server_url}/games/{game_id}/start"),
         token,
@@ -2109,7 +2137,11 @@ async fn invite_player(
     post_json(
         &format!("{server_url}/games/{game_id}/invite"),
         token,
-        &InvitePlayerRequest { invited_display_name, invited_email, seat_number },
+        &InvitePlayerRequest {
+            invited_display_name,
+            invited_email,
+            seat_number,
+        },
     )
     .await
 }
@@ -2128,7 +2160,12 @@ async fn add_seat(
     post_json(
         &format!("{server_url}/games/{game_id}/seats"),
         token,
-        &CreateSeatRequest { kind, display_name, engine_id: None, claim },
+        &CreateSeatRequest {
+            kind,
+            display_name,
+            engine_id: None,
+            claim,
+        },
     )
     .await
 }
@@ -2191,7 +2228,12 @@ async fn submit_pass(
         seat_number: game.current_seat,
         action: api::PlayerActionDto::Pass,
     };
-    post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
+    post_json(
+        &format!("{server_url}/games/{}/actions", game.id),
+        token,
+        &request,
+    )
+    .await
 }
 
 /// Not routed through `submit_pass`/`submit_resign`'s `GameActionRequest`
@@ -2220,7 +2262,12 @@ async fn submit_resign(
         seat_number: game.current_seat,
         action: api::PlayerActionDto::Resign,
     };
-    post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
+    post_json(
+        &format!("{server_url}/games/{}/actions", game.id),
+        token,
+        &request,
+    )
+    .await
 }
 
 async fn submit_exchange(
@@ -2233,7 +2280,12 @@ async fn submit_exchange(
         seat_number: game.current_seat,
         action: api::PlayerActionDto::Exchange { tiles },
     };
-    post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
+    post_json(
+        &format!("{server_url}/games/{}/actions", game.id),
+        token,
+        &request,
+    )
+    .await
 }
 
 async fn submit_manual_move(
@@ -2244,7 +2296,12 @@ async fn submit_manual_move(
     token: Option<&str>,
 ) -> Result<GameStateDto, String> {
     let request = build_manual_move_request(game, staged, direction)?;
-    post_json(&format!("{server_url}/games/{}/actions", game.id), token, &request).await
+    post_json(
+        &format!("{server_url}/games/{}/actions", game.id),
+        token,
+        &request,
+    )
+    .await
 }
 
 async fn post_json<T, R>(url: &str, token: Option<&str>, payload: &T) -> Result<R, String>
@@ -2411,13 +2468,14 @@ where
 /// path never needs to fetch anything.
 #[cfg(target_arch = "wasm32")]
 async fn get_text(url: &str) -> Result<String, String> {
-    let response = Request::get(url)
-        .send()
-        .await
-        .map_err(|_| mark_offline())?;
+    let response = Request::get(url).send().await.map_err(|_| mark_offline())?;
     mark_online();
     if !response.ok() {
-        return Err(format!("HTTP {} {}", response.status(), response.status_text()));
+        return Err(format!(
+            "HTTP {} {}",
+            response.status(),
+            response.status_text()
+        ));
     }
     response.text().await.map_err(|error| error.to_string())
 }
@@ -2651,10 +2709,16 @@ async fn subscribe_to_game_events_impl(
 /// digits and hyphens only), so no percent-encoding is needed here.
 fn websocket_url(server_url: &str, game_id: &str, token: Option<&str>) -> Result<String, String> {
     if let Some(url) = server_url.strip_prefix("http://") {
-        return Ok(with_token_query(format!("ws://{url}/games/{game_id}/events"), token));
+        return Ok(with_token_query(
+            format!("ws://{url}/games/{game_id}/events"),
+            token,
+        ));
     }
     if let Some(url) = server_url.strip_prefix("https://") {
-        return Ok(with_token_query(format!("wss://{url}/games/{game_id}/events"), token));
+        return Ok(with_token_query(
+            format!("wss://{url}/games/{game_id}/events"),
+            token,
+        ));
     }
     // An empty `server_url` means "same origin as the page" (see
     // `default_server_url` — used when a reverse proxy serves both the
@@ -2730,7 +2794,8 @@ fn invite_id_from_url() -> Option<String> {
 #[cfg(target_arch = "wasm32")]
 fn strip_invite_from_url() {
     if let Some(history) = web_sys::window().and_then(|window| window.history().ok()) {
-        let _ = history.replace_state_with_url(&web_sys::wasm_bindgen::JsValue::NULL, "", Some("/"));
+        let _ =
+            history.replace_state_with_url(&web_sys::wasm_bindgen::JsValue::NULL, "", Some("/"));
     }
 }
 
@@ -2877,9 +2942,7 @@ fn compute_client_preview(
     // three under one name), so `variant` alone determines which ruleset
     // this game actually uses. Falls back to no preview (rather than a
     // wrong one) for an edition this client doesn't recognize.
-    let Some(rules) = rules_shared::VariantRules::by_name(&game.variant) else {
-        return None;
-    };
+    let rules = rules_shared::VariantRules::by_name(&game.variant)?;
     let board_state = crate::client_rules::to_rules_board_state(&game.board, &rules.alphabet);
     let state = rules_shared::GameState::from_board(board_state, &rules, dictionary);
     let rack = game
@@ -2987,10 +3050,10 @@ fn infer_typing_direction(
         0 => DirectionDto::Horizontal,
         1 => {
             let anchor = staged[0].board_index;
-            if let Some(selected) = selected_cell {
-                if let Some(direction) = aligned_direction(anchor, selected) {
-                    return direction;
-                }
+            if let Some(selected) = selected_cell
+                && let Some(direction) = aligned_direction(anchor, selected)
+            {
+                return direction;
             }
             infer_single_tile_direction(
                 game,
@@ -3059,10 +3122,7 @@ fn find_next_placeable_cell(
     let mut current = from_index;
     loop {
         current = step_index(current, direction, forward)?;
-        let is_permanent = game
-            .board
-            .get(current)
-            .is_some_and(board_cell_has_letter);
+        let is_permanent = game.board.get(current).is_some_and(board_cell_has_letter);
         let is_staged = staged.iter().any(|p| p.board_index == current);
         if !is_permanent && !is_staged {
             return Some(current);
@@ -3079,7 +3139,9 @@ fn step_index_wrapping(index: usize, direction: DirectionDto, forward: bool) -> 
         (DirectionDto::Horizontal, true) => y * BOARD_WIDTH + (x + 1) % BOARD_WIDTH,
         (DirectionDto::Horizontal, false) => y * BOARD_WIDTH + (x + BOARD_WIDTH - 1) % BOARD_WIDTH,
         (DirectionDto::Vertical, true) => ((y + 1) % BOARD_HEIGHT) * BOARD_WIDTH + x,
-        (DirectionDto::Vertical, false) => ((y + BOARD_HEIGHT - 1) % BOARD_HEIGHT) * BOARD_WIDTH + x,
+        (DirectionDto::Vertical, false) => {
+            ((y + BOARD_HEIGHT - 1) % BOARD_HEIGHT) * BOARD_WIDTH + x
+        }
     }
 }
 
@@ -3129,10 +3191,7 @@ fn find_previous_editable_cell(
     let mut current = from_index;
     loop {
         current = step_index(current, direction, false)?;
-        let is_permanent = game
-            .board
-            .get(current)
-            .is_some_and(board_cell_has_letter);
+        let is_permanent = game.board.get(current).is_some_and(board_cell_has_letter);
         if !is_permanent {
             return Some(current);
         }
@@ -3197,7 +3256,12 @@ fn stage_tile_at_cell(
     let (tile_for_board, display_for_board) = match (&tile.tile, resolved_letter) {
         (TileDto::Blank { .. }, Some(letter)) => {
             let display = letter.to_lowercase();
-            (TileDto::Blank { acting_as: Some(letter) }, display)
+            (
+                TileDto::Blank {
+                    acting_as: Some(letter),
+                },
+                display,
+            )
         }
         (TileDto::Blank { .. }, None) => (TileDto::Blank { acting_as: None }, "?".to_string()),
         (other, _) => (other.clone(), tile.display.clone()),
@@ -3247,14 +3311,13 @@ fn seat_is_open_or_owned_by(participant: &ParticipantDto, viewer_player_id: Opti
 /// seat (regardless of whose turn it is), else the current seat if it's
 /// unclaimed, else `None`.
 fn viewer_rack_seat(game: &GameStateDto, viewer_player_id: Option<&str>) -> Option<usize> {
-    if let Some(viewer_player_id) = viewer_player_id {
-        if let Some(owned) = game
+    if let Some(viewer_player_id) = viewer_player_id
+        && let Some(owned) = game
             .participants
             .iter()
             .find(|participant| participant.player_id.as_deref() == Some(viewer_player_id))
-        {
-            return Some(owned.seat_number as usize);
-        }
+    {
+        return Some(owned.seat_number as usize);
     }
     let current = game.participants.get(game.current_seat as usize)?;
     if current.player_id.is_none() {
@@ -3290,7 +3353,9 @@ fn rack_tiles_for_seat(
     let mut tiles = Vec::new();
 
     for (index, count) in rack.counts.iter().enumerate() {
-        let Some(grapheme) = rules.alphabet.to_grapheme(rules_shared::Letter::from(index as u8))
+        let Some(grapheme) = rules
+            .alphabet
+            .to_grapheme(rules_shared::Letter::from(index as u8))
         else {
             continue;
         };
@@ -3328,7 +3393,10 @@ fn rack_tiles_for_seat(
 /// whenever the tile count changes) are silently dropped rather than
 /// panicking.
 fn apply_rack_order(tiles: &[RackTileView], order: &[usize]) -> Vec<RackTileView> {
-    order.iter().filter_map(|&i| tiles.get(i).cloned()).collect()
+    order
+        .iter()
+        .filter_map(|&i| tiles.get(i).cloned())
+        .collect()
 }
 
 /// Moves `dragged_id` to sit where `target_id` currently is (dragging a
@@ -3388,7 +3456,11 @@ mod tests {
 
     #[test]
     fn apply_rack_order_reorders_tiles_to_match() {
-        let tiles = vec![sample_tile(0, 'A'), sample_tile(1, 'B'), sample_tile(2, 'C')];
+        let tiles = vec![
+            sample_tile(0, 'A'),
+            sample_tile(1, 'B'),
+            sample_tile(2, 'C'),
+        ];
         let reordered = apply_rack_order(&tiles, &[2, 0, 1]);
         let letters: Vec<String> = reordered.iter().map(|t| t.display.clone()).collect();
         assert_eq!(letters, vec!["C", "A", "B"]);
@@ -3509,7 +3581,11 @@ mod tests {
         }
     }
 
-    fn letter_placement(board_index: usize, rack_tile_id: usize, letter: char) -> StagedPlacementView {
+    fn letter_placement(
+        board_index: usize,
+        rack_tile_id: usize,
+        letter: char,
+    ) -> StagedPlacementView {
         StagedPlacementView {
             board_index,
             rack_tile_id,
@@ -3525,7 +3601,10 @@ mod tests {
         assert_eq!(step_index(0, DirectionDto::Horizontal, false), None);
         assert_eq!(step_index(0, DirectionDto::Vertical, false), None);
         assert_eq!(step_index(0, DirectionDto::Horizontal, true), Some(1));
-        assert_eq!(step_index(0, DirectionDto::Vertical, true), Some(BOARD_WIDTH));
+        assert_eq!(
+            step_index(0, DirectionDto::Vertical, true),
+            Some(BOARD_WIDTH)
+        );
 
         let last = BOARD_WIDTH * BOARD_HEIGHT - 1;
         assert_eq!(step_index(last, DirectionDto::Horizontal, true), None);
@@ -3598,9 +3677,9 @@ mod tests {
     fn find_next_placeable_cell_wrapping_skips_occupied_cells_on_the_way_around() {
         let mut board = empty_board();
         // Fill the whole row except index 5.
-        for x in 0..BOARD_WIDTH {
+        for (x, cell) in board.iter_mut().enumerate().take(BOARD_WIDTH) {
             if x != 5 {
-                board[x].letter = Some("A".to_string());
+                cell.letter = Some("A".to_string());
             }
         }
         let game = test_game(board);
@@ -3613,8 +3692,8 @@ mod tests {
     #[test]
     fn find_next_placeable_cell_wrapping_returns_none_when_the_whole_line_is_full() {
         let mut board = empty_board();
-        for x in 0..BOARD_WIDTH {
-            board[x].letter = Some("A".to_string());
+        for cell in board.iter_mut().take(BOARD_WIDTH) {
+            cell.letter = Some("A".to_string());
         }
         let game = test_game(board);
         assert_eq!(

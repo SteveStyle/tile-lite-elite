@@ -41,11 +41,17 @@ fn main() {
     }
     rack1.blanks = 1;
 
-    for (label, rack) in [("seat0 (D,D,K,R,S,U,?)", rack0), ("seat1 (A,E,F,N,O,T,?)", rack1)] {
+    for (label, rack) in [
+        ("seat0 (D,D,K,R,S,U,?)", rack0),
+        ("seat1 (A,E,F,N,O,T,?)", rack1),
+    ] {
         let t0 = std::time::Instant::now();
         let candidates: Vec<_> = engine.enumerate_legal_moves(&state, &rack).collect();
         let gen_elapsed = t0.elapsed();
-        println!("{label}: {} raw candidates from generator ({gen_elapsed:?})", candidates.len());
+        println!(
+            "{label}: {} raw candidates from generator ({gen_elapsed:?})",
+            candidates.len()
+        );
 
         let t1 = std::time::Instant::now();
         let mut valid_count = 0;
@@ -54,7 +60,7 @@ fn main() {
             if let Ok(validated) = engine.validate_game_move(&state, Some(&rack), candidate) {
                 valid_count += 1;
                 let score = validated.score.total;
-                if best.as_ref().map_or(true, |(_, s)| score > *s) {
+                if best.as_ref().is_none_or(|(_, s)| score > *s) {
                     best = Some((validated.preview.main_word.clone(), score));
                 }
             }

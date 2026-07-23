@@ -61,7 +61,12 @@ pub async fn send_invitation(
 /// Unlike `send_invitation`, `to` has no known `Player` account behind it
 /// yet — this is what `SeatClaim::Email` sends instead (see its doc
 /// comment), a plain join link rather than "log in to accept".
-pub async fn send_join_invitation(config: &EmailConfig, to: &str, inviter_name: &str, join_url: &str) {
+pub async fn send_join_invitation(
+    config: &EmailConfig,
+    to: &str,
+    inviter_name: &str,
+    join_url: &str,
+) {
     let (subject, body) = render(
         JOIN_INVITATION_TEMPLATE,
         &[("inviter_name", inviter_name), ("join_url", join_url)],
@@ -128,7 +133,12 @@ async fn send(config: &EmailConfig, to: &str, subject: &str, text_body: &str) {
         // there's no provider to deliver it — log it in full (rather than
         // just "would have sent something") so the flow stays usable and
         // testable in local dev with zero Resend setup.
-        tracing::info!(to, subject, text_body, "email not sent (no RESEND_API_KEY configured)");
+        tracing::info!(
+            to,
+            subject,
+            text_body,
+            "email not sent (no RESEND_API_KEY configured)"
+        );
         return;
     };
 
@@ -182,10 +192,7 @@ mod tests {
                 INVITATION_TEMPLATE,
                 &["invitee_name", "inviter_name", "base_url"][..],
             ),
-            (
-                JOIN_INVITATION_TEMPLATE,
-                &["inviter_name", "join_url"][..],
-            ),
+            (JOIN_INVITATION_TEMPLATE, &["inviter_name", "join_url"][..]),
             (PASSWORD_RESET_TEMPLATE, &["reset_url"][..]),
             (
                 MOVE_REMINDER_TEMPLATE,

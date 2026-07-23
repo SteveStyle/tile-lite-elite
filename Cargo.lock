@@ -5174,6 +5174,7 @@ dependencies = [
 [[package]]
 name = "srm-utils"
 version = "0.2.3"
+source = "git+https://github.com/SteveStyle/utils?rev=c7acec77ecc1445b1c596c4e8a7195736236c3b7#c7acec77ecc1445b1c596c4e8a7195736236c3b7"
 dependencies = [
  "anyhow",
  "bumpalo",

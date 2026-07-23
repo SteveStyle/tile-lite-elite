@@ -3,7 +3,13 @@ resolver="3"
 members=["crates/*", "old-crates/*"]
 default-members=["crates/*"]
 [workspace.dependencies]
-srm-utils = {path = "../utils"}
+# Only used by the archived old-crates (first-try/second-try), for
+# `srm_utils::timer::Timer`. Referenced by git commit rather than a local
+# `../utils` path so a fresh checkout (CI included) can resolve the whole
+# workspace without that sibling directory present. Pinned by `rev` for
+# reproducible builds; this commit is `v0.2.3` (== the tip `main` fast-forwards
+# to). Bump the rev to advance it. https://github.com/SteveStyle/utils
+srm-utils = { git = "https://github.com/SteveStyle/utils", rev = "c7acec77ecc1445b1c596c4e8a7195736236c3b7" }
 
 
 [profile]

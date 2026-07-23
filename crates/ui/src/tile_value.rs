@@ -84,7 +84,11 @@ mod tests {
     #[test]
     fn blank_tile_is_always_zero_even_once_resolved() {
         assert_eq!(
-            tile_point_value(&TileDto::Blank { acting_as: None }, &official_values(), &latin26()),
+            tile_point_value(
+                &TileDto::Blank { acting_as: None },
+                &official_values(),
+                &latin26()
+            ),
             0
         );
         assert_eq!(

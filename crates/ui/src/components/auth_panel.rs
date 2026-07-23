@@ -45,7 +45,8 @@ fn submit_login_or_register(
         error_message.set(None);
         let outcome = match mode {
             AuthMode::Login => {
-                crate::app::login_player(&server_url, &name, &password_value, stay, retry_message).await
+                crate::app::login_player(&server_url, &name, &password_value, stay, retry_message)
+                    .await
             }
             AuthMode::Register => {
                 crate::app::register_player(

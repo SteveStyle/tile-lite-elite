@@ -62,7 +62,8 @@ fn load_impl() -> Option<StoredAuth> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn save_impl(auth: &StoredAuth) -> Result<(), String> {
-    let path = config_file_path().ok_or_else(|| "Could not resolve config directory".to_string())?;
+    let path =
+        config_file_path().ok_or_else(|| "Could not resolve config directory".to_string())?;
     let contents = serde_json::to_string(auth).map_err(|error| error.to_string())?;
     std::fs::write(path, contents).map_err(|error| error.to_string())
 }
@@ -114,8 +115,8 @@ fn load_chat_watermarks_impl() -> Option<StoredChatWatermarks> {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn save_chat_watermarks_impl(watermarks: &StoredChatWatermarks) -> Result<(), String> {
-    let path =
-        chat_watermarks_file_path().ok_or_else(|| "Could not resolve config directory".to_string())?;
+    let path = chat_watermarks_file_path()
+        .ok_or_else(|| "Could not resolve config directory".to_string())?;
     let contents = serde_json::to_string(watermarks).map_err(|error| error.to_string())?;
     std::fs::write(path, contents).map_err(|error| error.to_string())
 }

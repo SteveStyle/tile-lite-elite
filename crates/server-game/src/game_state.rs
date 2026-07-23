@@ -6,7 +6,7 @@ use api::{
     MoveCandidateDto, MoveRecordDto, ParticipantDto, PositionDto, PremiumDto, RackDto,
     SeatInvitationStatus, SeatKind, TileDto, TilePlacementDto,
 };
-use engine_core::{EngineAction, EngineMetadata, EngineRequest, GreedyEngine, GameEngine};
+use engine_core::{EngineAction, EngineMetadata, EngineRequest, GameEngine, GreedyEngine};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rules_shared::{
@@ -334,11 +334,9 @@ impl GameSession {
         if self.status != GameStatus::Waiting {
             return Err("Seats can only be reordered before the game starts".to_string());
         }
-        if self
-            .participants
-            .iter()
-            .any(|participant| participant.kind == SeatKind::Human && participant.player_id.is_none())
-        {
+        if self.participants.iter().any(|participant| {
+            participant.kind == SeatKind::Human && participant.player_id.is_none()
+        }) {
             return Err("Every seat must be filled before seats can be reordered".to_string());
         }
         let a = seat_a as usize;
@@ -498,7 +496,7 @@ impl GameSession {
     pub fn to_summary_dto(&self, last_activity_at: String) -> api::GameSummaryDto {
         api::GameSummaryDto {
             id: self.id.clone(),
-            status: self.status.clone(),
+            status: self.status,
             variant: self.variant.clone(),
             current_seat: self.current_seat,
             participants: self
@@ -523,7 +521,10 @@ impl GameSession {
             last_activity_at,
             move_time_limit_seconds: self.move_time_limit_seconds,
             turn_started_at: self.turn_started_at.clone(),
-            last_message_at: self.messages.last().map(|message| message.created_at.clone()),
+            last_message_at: self
+                .messages
+                .last()
+                .map(|message| message.created_at.clone()),
             // Caller-relative fields — `list_games` fills these in per
             // requester since "why does this game show up" depends on who's
             // asking, not on the game itself.
@@ -535,7 +536,7 @@ impl GameSession {
     pub fn to_dto(&self) -> GameStateDto {
         GameStateDto {
             id: self.id.clone(),
-            status: self.status.clone(),
+            status: self.status,
             creator_player_id: self.creator_player_id.clone(),
             variant: self.variant.clone(),
             language: self.language.clone(),
@@ -807,7 +808,11 @@ impl GameSession {
         if participant.resigned {
             return Err("That seat has already resigned".to_string());
         }
-        self.finish_via_resignation(seat_number, "force_resign", "resigned (by the game creator)")
+        self.finish_via_resignation(
+            seat_number,
+            "force_resign",
+            "resigned (by the game creator)",
+        )
     }
 
     /// `move_type` is `"resign"` for a voluntary self-resignation or
@@ -821,7 +826,12 @@ impl GameSession {
     /// than that still playing, this seat simply drops out and everyone
     /// else continues, matching a real multi-player table where one
     /// player quitting shouldn't end the game for the rest.
-    fn finish_via_resignation(&mut self, seat_number: u8, move_type: &str, reason: &str) -> Result<(), String> {
+    fn finish_via_resignation(
+        &mut self,
+        seat_number: u8,
+        move_type: &str,
+        reason: &str,
+    ) -> Result<(), String> {
         let participant = self
             .participants
             .get_mut(seat_number as usize)
@@ -1037,7 +1047,12 @@ impl GameSession {
     /// land on it (reachable the moment a game can continue with some
     /// seats already exited, see `handle_seat_exit`).
     fn compute_winner_seat(&self) -> Option<u8> {
-        let max_score = self.participants.iter().filter(|p| !p.resigned).map(|p| p.score).max()?;
+        let max_score = self
+            .participants
+            .iter()
+            .filter(|p| !p.resigned)
+            .map(|p| p.score)
+            .max()?;
         let mut leaders = self
             .participants
             .iter()
@@ -1504,7 +1519,8 @@ mod tests {
     fn remove_for_player_rejects_someone_not_seated_in_the_game() {
         let mut game = two_human_game(Some("alice"));
         game.start();
-        game.apply_resign(0).expect("alice should be able to resign");
+        game.apply_resign(0)
+            .expect("alice should be able to resign");
         let result = game.remove_for_player("carol");
         assert!(result.is_err());
     }
@@ -1513,7 +1529,8 @@ mod tests {
     fn remove_for_player_only_marks_the_calling_seat() {
         let mut game = two_human_game(Some("alice"));
         game.start();
-        game.apply_resign(0).expect("alice should be able to resign");
+        game.apply_resign(0)
+            .expect("alice should be able to resign");
         game.remove_for_player("alice")
             .expect("alice is seated in this finished game");
         assert!(game.participants[0].removed_by_player);
@@ -1549,7 +1566,8 @@ mod tests {
         assert_eq!(game.participants[0].player_id.as_deref(), Some("alice"));
         assert_eq!(game.participants[1].player_id.as_deref(), Some("bob"));
 
-        game.swap_seats(0, 1).expect("both seats are filled and the game hasn't started");
+        game.swap_seats(0, 1)
+            .expect("both seats are filled and the game hasn't started");
 
         assert_eq!(game.participants[0].player_id.as_deref(), Some("bob"));
         assert_eq!(game.participants[0].seat_number, 0);

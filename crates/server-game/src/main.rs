@@ -18,7 +18,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let database_url = std::env::var("TILE_LITE_ELITE_DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://data/tile-lite-elite.sqlite3".to_string());
-    let bind = std::env::var("TILE_LITE_ELITE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+    let bind =
+        std::env::var("TILE_LITE_ELITE_BIND").unwrap_or_else(|_| "127.0.0.1:3000".to_string());
     // Only used to build the link inside a password-reset email — see
     // `AppState::public_base_url`'s doc comment. Defaults to the local web
     // dev server so the flow works out of the box in dev without this var
@@ -28,7 +29,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Unset in local dev by default — every email-triggering flow still
     // works without it, just logging the message instead of sending it
     // (see EmailConfig's doc comment). Production sets both explicitly.
-    let email_api_key = std::env::var("RESEND_API_KEY").ok().filter(|key| !key.is_empty());
+    let email_api_key = std::env::var("RESEND_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty());
     let email_from_address = std::env::var("RESEND_FROM_ADDRESS")
         .unwrap_or_else(|_| "Tile Lite Elite <noreply@mail.tileliteelite.com>".to_string());
     let email_config = EmailConfig::new(email_api_key, email_from_address);

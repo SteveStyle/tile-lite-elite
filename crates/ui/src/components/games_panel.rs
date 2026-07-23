@@ -395,123 +395,125 @@ pub fn GamesPanel(
     // created).
     let rows_for_render = draft_rows(include_creator(), creator_position(), &additional_seats());
     let last_row_position = rows_for_render.len().saturating_sub(1);
-    let draft_row_elements = rows_for_render.into_iter().enumerate().map(|(position, row)| {
-        let reorder = rsx! {
-            span { class: "player-table-reorder",
-                button {
-                    class: "player-table-reorder-button",
-                    r#type: "button",
-                    disabled: position == 0,
-                    title: "Move up (plays earlier)",
-                    onclick: move |_| {
-                        let (new_position, new_seats) = swap_draft_rows(
-                            include_creator(),
-                            creator_position(),
-                            &additional_seats(),
-                            position,
-                            position.saturating_sub(1),
-                        );
-                        creator_position.set(new_position);
-                        additional_seats.set(new_seats);
-                    },
-                    "▲"
+    let draft_row_elements = rows_for_render
+        .into_iter()
+        .enumerate()
+        .map(|(position, row)| {
+            let reorder = rsx! {
+                span { class: "player-table-reorder",
+                    button {
+                        class: "player-table-reorder-button",
+                        r#type: "button",
+                        disabled: position == 0,
+                        title: "Move up (plays earlier)",
+                        onclick: move |_| {
+                            let (new_position, new_seats) = swap_draft_rows(
+                                include_creator(),
+                                creator_position(),
+                                &additional_seats(),
+                                position,
+                                position.saturating_sub(1),
+                            );
+                            creator_position.set(new_position);
+                            additional_seats.set(new_seats);
+                        },
+                        "▲"
+                    }
+                    button {
+                        class: "player-table-reorder-button",
+                        r#type: "button",
+                        disabled: position >= last_row_position,
+                        title: "Move down (plays later)",
+                        onclick: move |_| {
+                            let (new_position, new_seats) = swap_draft_rows(
+                                include_creator(),
+                                creator_position(),
+                                &additional_seats(),
+                                position,
+                                position + 1,
+                            );
+                            creator_position.set(new_position);
+                            additional_seats.set(new_seats);
+                        },
+                        "▼"
+                    }
                 }
-                button {
-                    class: "player-table-reorder-button",
-                    r#type: "button",
-                    disabled: position >= last_row_position,
-                    title: "Move down (plays later)",
-                    onclick: move |_| {
-                        let (new_position, new_seats) = swap_draft_rows(
-                            include_creator(),
-                            creator_position(),
-                            &additional_seats(),
-                            position,
-                            position + 1,
-                        );
-                        creator_position.set(new_position);
-                        additional_seats.set(new_seats);
-                    },
-                    "▼"
-                }
+            };
+            match row {
+                DraftRow::You => rsx! {
+                    tr { key: "you",
+                        td { {reorder} "{my_display_name.clone().unwrap_or_default()} (you)" }
+                        td { "Human" }
+                        td {
+                            button {
+                                class: "toggle-button toggle-button-muted seat-draft-remove",
+                                onclick: move |_| include_creator.set(false),
+                                "Remove"
+                            }
+                        }
+                    }
+                },
+                DraftRow::Seat(index, draft) => rsx! {
+                    tr { key: "{index}",
+                        td {
+                            {reorder}
+                            if draft.kind == AdditionalSeatKind::Named {
+                                NameAutocompleteInput {
+                                    value: draft.name.clone(),
+                                    on_change: move |value| {
+                                        additional_seats.with_mut(|seats| {
+                                            if let Some(seat) = seats.get_mut(index) {
+                                                seat.name = value;
+                                            }
+                                        });
+                                    },
+                                    server_url: server_url.clone(),
+                                    token: token.clone(),
+                                    placeholder: "Display name to invite".to_string(),
+                                }
+                            } else if draft.kind == AdditionalSeatKind::Email {
+                                input {
+                                    class: "seat-draft-name-input",
+                                    r#type: "email",
+                                    placeholder: "Email to invite",
+                                    value: "{draft.name}",
+                                    oninput: move |event| {
+                                        additional_seats.with_mut(|seats| {
+                                            if let Some(seat) = seats.get_mut(index) {
+                                                seat.name = event.value();
+                                            }
+                                        });
+                                    },
+                                }
+                            } else {
+                                "{seat_draft_label(draft.kind)}"
+                            }
+                        }
+                        td { "{seat_draft_kind_label(draft.kind)}" }
+                        td {
+                            button {
+                                class: "toggle-button toggle-button-muted seat-draft-remove",
+                                onclick: move |_| {
+                                    additional_seats.with_mut(|seats| {
+                                        if index < seats.len() {
+                                            seats.remove(index);
+                                        }
+                                    });
+                                },
+                                "Remove"
+                            }
+                        }
+                    }
+                },
             }
-        };
-        match row {
-            DraftRow::You => rsx! {
-                tr { key: "you",
-                    td { {reorder} "{my_display_name.clone().unwrap_or_default()} (you)" }
-                    td { "Human" }
-                    td {
-                        button {
-                            class: "toggle-button toggle-button-muted seat-draft-remove",
-                            onclick: move |_| include_creator.set(false),
-                            "Remove"
-                        }
-                    }
-                }
-            },
-            DraftRow::Seat(index, draft) => rsx! {
-                tr { key: "{index}",
-                    td {
-                        {reorder}
-                        if draft.kind == AdditionalSeatKind::Named {
-                            NameAutocompleteInput {
-                                value: draft.name.clone(),
-                                on_change: move |value| {
-                                    additional_seats.with_mut(|seats| {
-                                        if let Some(seat) = seats.get_mut(index) {
-                                            seat.name = value;
-                                        }
-                                    });
-                                },
-                                server_url: server_url.clone(),
-                                token: token.clone(),
-                                placeholder: "Display name to invite".to_string(),
-                            }
-                        } else if draft.kind == AdditionalSeatKind::Email {
-                            input {
-                                class: "seat-draft-name-input",
-                                r#type: "email",
-                                placeholder: "Email to invite",
-                                value: "{draft.name}",
-                                oninput: move |event| {
-                                    additional_seats.with_mut(|seats| {
-                                        if let Some(seat) = seats.get_mut(index) {
-                                            seat.name = event.value();
-                                        }
-                                    });
-                                },
-                            }
-                        } else {
-                            "{seat_draft_label(draft.kind)}"
-                        }
-                    }
-                    td { "{seat_draft_kind_label(draft.kind)}" }
-                    td {
-                        button {
-                            class: "toggle-button toggle-button-muted seat-draft-remove",
-                            onclick: move |_| {
-                                additional_seats.with_mut(|seats| {
-                                    if index < seats.len() {
-                                        seats.remove(index);
-                                    }
-                                });
-                            },
-                            "Remove"
-                        }
-                    }
-                }
-            },
-        }
-    });
+        });
 
-    let can_submit_builder = additional_seats()
-        .iter()
-        .all(|seat| {
-            !matches!(seat.kind, AdditionalSeatKind::Named | AdditionalSeatKind::Email)
-                || !seat.name.trim().is_empty()
-        })
-        && (include_creator() || !additional_seats().is_empty());
+    let can_submit_builder = additional_seats().iter().all(|seat| {
+        !matches!(
+            seat.kind,
+            AdditionalSeatKind::Named | AdditionalSeatKind::Email
+        ) || !seat.name.trim().is_empty()
+    }) && (include_creator() || !additional_seats().is_empty());
 
     // A draft with only engine seats (plus optionally you) has nobody left
     // to hear from — creating it lands straight on "Ready to start" with
@@ -639,11 +641,10 @@ pub fn GamesPanel(
                                 class: "seat-draft-name-input",
                                 value: "{time_limit_hours()}",
                                 oninput: move |event| {
-                                    if let Ok(hours) = event.value().parse::<u32>() {
-                                        if hours > 0 {
+                                    if let Ok(hours) = event.value().parse::<u32>()
+                                        && hours > 0 {
                                             time_limit_hours.set(hours);
                                         }
-                                    }
                                 },
                             }
                         }
@@ -759,7 +760,8 @@ fn game_row(
     // Only known once the full game (not just the list summary) has
     // loaded — every management control below stays hidden until then,
     // same as `can_reorder` already waits on `loaded_matches`.
-    let viewer_is_creator = viewer_player_id.is_some() && creator_player_id.as_deref() == viewer_player_id;
+    let viewer_is_creator =
+        viewer_player_id.is_some() && creator_player_id.as_deref() == viewer_player_id;
     // Mirrors the server's `resolve_viewer_access` `Participant` tier
     // exactly — a genuinely claimed seat. A creator watching their own game
     // (e.g. Bot Showdown) or a spectator never gets chat.
@@ -780,8 +782,11 @@ fn game_row(
     // Same enable condition as the Start button below — reordering and
     // starting are both creator-only, "this row's full state is loaded,
     // every seat's filled, and we're online" operations.
-    let can_reorder =
-        summary.status == GameStatus::Waiting && can_start && loaded_matches && ready && viewer_is_creator;
+    let can_reorder = summary.status == GameStatus::Waiting
+        && can_start
+        && loaded_matches
+        && ready
+        && viewer_is_creator;
     let badge_class = format!(
         "game-status-badge game-status-{}",
         status_slug(&summary.status, ready)
@@ -1011,7 +1016,8 @@ fn player_table(
 ) -> Element {
     let link_words = is_english_dictionary(variant);
     let last_seat = participants.len().saturating_sub(1) as u8;
-    let show_manage_column = game_status == GameStatus::Waiting || game_status == GameStatus::Active;
+    let show_manage_column =
+        game_status == GameStatus::Waiting || game_status == GameStatus::Active;
 
     let rows = participants.iter().map(|participant| {
         let is_you = viewer_player_id.is_some() && participant.player_id.as_deref() == viewer_player_id;
@@ -1209,8 +1215,10 @@ fn add_seat_row(
     mut name: Signal<String>,
     on_add_seat: EventHandler<AddSeatSubmission>,
 ) -> Element {
-    let can_submit =
-        !matches!(kind(), AdditionalSeatKind::Named | AdditionalSeatKind::Email) || !name().trim().is_empty();
+    let can_submit = !matches!(
+        kind(),
+        AdditionalSeatKind::Named | AdditionalSeatKind::Email
+    ) || !name().trim().is_empty();
     rsx! {
         div { class: "game-builder-add-row",
             select {
@@ -1332,7 +1340,9 @@ fn NameAutocompleteInput(
                 searched_and_empty.set(false);
                 return;
             }
-            if let Ok(names) = crate::app::search_players(&server_url, trimmed, token.as_deref()).await {
+            if let Ok(names) =
+                crate::app::search_players(&server_url, trimmed, token.as_deref()).await
+            {
                 searched_and_empty.set(names.is_empty());
                 suggestions.set(names);
             }
@@ -1388,7 +1398,11 @@ enum LastMoveCell {
 }
 
 fn last_move_cell(moves: &[MoveRecordDto], seat_number: u8) -> LastMoveCell {
-    match moves.iter().rev().find(|record| record.seat_number == seat_number) {
+    match moves
+        .iter()
+        .rev()
+        .find(|record| record.seat_number == seat_number)
+    {
         None => LastMoveCell::None,
         Some(record) if record.move_type == "place" => LastMoveCell::Word {
             word: record.main_word.clone().unwrap_or_default(),
@@ -1449,7 +1463,10 @@ fn action_note(record: &MoveRecordDto) -> String {
                 .split_whitespace()
                 .find_map(|token| token.parse::<u32>().ok())
                 .unwrap_or(0);
-            format!("exchanged {count} letter{}", if count == 1 { "" } else { "s" })
+            format!(
+                "exchanged {count} letter{}",
+                if count == 1 { "" } else { "s" }
+            )
         }
         other => other.to_string(),
     }
@@ -1577,7 +1594,10 @@ mod tests {
         let seats = build_seats(
             false,
             0,
-            &[AdditionalSeatDraft { kind: AdditionalSeatKind::Engine, name: String::new() }],
+            &[AdditionalSeatDraft {
+                kind: AdditionalSeatKind::Engine,
+                name: String::new(),
+            }],
             Some("Alice"),
         );
         assert_eq!(seats.len(), 1);
@@ -1585,7 +1605,10 @@ mod tests {
     }
 
     fn engine_seat() -> AdditionalSeatDraft {
-        AdditionalSeatDraft { kind: AdditionalSeatKind::Engine, name: String::new() }
+        AdditionalSeatDraft {
+            kind: AdditionalSeatKind::Engine,
+            name: String::new(),
+        }
     }
 
     #[test]
@@ -1603,7 +1626,13 @@ mod tests {
     #[test]
     fn draft_rows_omits_you_when_not_included() {
         let rows = draft_rows(false, 0, &[engine_seat(), engine_seat()]);
-        assert_eq!(rows, vec![DraftRow::Seat(0, engine_seat()), DraftRow::Seat(1, engine_seat())]);
+        assert_eq!(
+            rows,
+            vec![
+                DraftRow::Seat(0, engine_seat()),
+                DraftRow::Seat(1, engine_seat())
+            ]
+        );
     }
 
     #[test]
@@ -1617,15 +1646,25 @@ mod tests {
         assert_eq!(new_position, 1);
         assert_eq!(new_seats, vec![engine_seat()]);
         // The engine seat itself is unchanged, just now first.
-        assert_eq!(draft_rows(true, new_position, &new_seats), vec![DraftRow::Seat(0, engine_seat()), DraftRow::You]);
+        assert_eq!(
+            draft_rows(true, new_position, &new_seats),
+            vec![DraftRow::Seat(0, engine_seat()), DraftRow::You]
+        );
     }
 
     #[test]
     fn swap_draft_rows_reorders_two_additional_seats_leaving_you_in_place() {
-        let named = AdditionalSeatDraft { kind: AdditionalSeatKind::Named, name: "Bob".to_string() };
+        let named = AdditionalSeatDraft {
+            kind: AdditionalSeatKind::Named,
+            name: "Bob".to_string(),
+        };
         // you, engine, named -- swap the two additional seats (positions 1, 2).
-        let (new_position, new_seats) = swap_draft_rows(true, 0, &[engine_seat(), named.clone()], 1, 2);
-        assert_eq!(new_position, 0, "you weren't involved in the swap, so your position is unchanged");
+        let (new_position, new_seats) =
+            swap_draft_rows(true, 0, &[engine_seat(), named.clone()], 1, 2);
+        assert_eq!(
+            new_position, 0,
+            "you weren't involved in the swap, so your position is unchanged"
+        );
         assert_eq!(new_seats, vec![named, engine_seat()]);
     }
 
@@ -1737,7 +1776,10 @@ mod tests {
 
     #[test]
     fn all_engine_seats_are_always_ready() {
-        let participants = vec![participant(SeatKind::Engine, None), participant(SeatKind::Engine, None)];
+        let participants = vec![
+            participant(SeatKind::Engine, None),
+            participant(SeatKind::Engine, None),
+        ];
         assert!(is_ready_to_start(&participants));
     }
 

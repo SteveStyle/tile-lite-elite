@@ -8,19 +8,10 @@ use crate::model::{
     Score, Tile, TilePlacement, ValidatedMove, VariantRules,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GameState {
     pub board: BoardState,
     pub cache: RuleCache,
-}
-
-impl Default for GameState {
-    fn default() -> Self {
-        Self {
-            board: BoardState::default(),
-            cache: RuleCache::default(),
-        }
-    }
 }
 
 impl GameState {
@@ -531,8 +522,8 @@ mod tests {
     use crate::cache::RuleCache;
     use crate::dictionary::WordListDictionary;
     use crate::model::{
-        Direction, Letter, MoveCandidate, MoveError, Position, Premium, Rack, Tile,
-        TilePlacement, VariantRules,
+        Direction, Letter, MoveCandidate, MoveError, Position, Premium, Rack, Tile, TilePlacement,
+        VariantRules,
     };
 
     fn sample_rules() -> VariantRules {

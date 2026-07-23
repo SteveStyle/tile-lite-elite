@@ -156,7 +156,7 @@ impl GameEngine for GreedyEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{EngineAction, EngineRequest, GreedyEngine, GameEngine};
+    use super::{EngineAction, EngineRequest, GameEngine, GreedyEngine};
     use rules_shared::{GameState, Letter, Rack, SOWPODS, VariantRules};
 
     #[test]

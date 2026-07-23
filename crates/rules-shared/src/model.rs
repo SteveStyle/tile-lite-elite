@@ -729,8 +729,13 @@ impl VariantRules {
 
     /// Every edition name the UI's picker can enumerate without duplicating
     /// the list `by_name` matches against.
-    pub const EDITION_NAMES: &[&str] =
-        &["official", "wordfeud", "north_american", "german", "spanish"];
+    pub const EDITION_NAMES: &[&str] = &[
+        "official",
+        "wordfeud",
+        "north_american",
+        "german",
+        "spanish",
+    ];
 
     /// The edition registry — every bundled ruleset this server knows
     /// about, looked up by name. `None` for an unrecognized name (the

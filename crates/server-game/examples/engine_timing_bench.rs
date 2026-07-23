@@ -52,7 +52,8 @@ fn git_commit_label() -> String {
 }
 
 fn append_result_row(row: &str) -> std::io::Result<std::path::PathBuf> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/engine_timing_results.csv");
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/engine_timing_results.csv");
     let is_new_file = !path.exists();
     let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     if is_new_file {

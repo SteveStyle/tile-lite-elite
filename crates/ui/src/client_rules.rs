@@ -40,9 +40,7 @@ fn to_rules_letter(s: &str, alphabet: &rules_shared::Alphabet) -> rules_shared::
 
 pub fn to_rules_tile(tile: &TileDto, alphabet: &rules_shared::Alphabet) -> rules_shared::Tile {
     match tile {
-        TileDto::Letter { letter } => {
-            rules_shared::Tile::Letter(to_rules_letter(letter, alphabet))
-        }
+        TileDto::Letter { letter } => rules_shared::Tile::Letter(to_rules_letter(letter, alphabet)),
         TileDto::Blank { acting_as } => rules_shared::Tile::Blank {
             acting_as: acting_as
                 .as_ref()
@@ -201,7 +199,10 @@ mod tests {
         };
         let rules_candidate = to_rules_candidate(&candidate, &latin26());
         assert_eq!(rules_candidate.start, rules_shared::Position::new(7, 7));
-        assert_eq!(rules_candidate.direction, rules_shared::Direction::Horizontal);
+        assert_eq!(
+            rules_candidate.direction,
+            rules_shared::Direction::Horizontal
+        );
         assert_eq!(rules_candidate.tiles.len(), 2);
         assert_eq!(rules_candidate.tiles[1].offset, 1);
     }

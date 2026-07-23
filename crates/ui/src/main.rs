@@ -61,7 +61,10 @@ fn App() -> Element {
 /// connect (see `app.rs`'s `check_api_version`).
 #[allow(dead_code)]
 fn app_version() -> String {
-    format_app_version(env!("CARGO_PKG_VERSION"), option_env!("TILE_LITE_ELITE_BUILD_ID"))
+    format_app_version(
+        env!("CARGO_PKG_VERSION"),
+        option_env!("TILE_LITE_ELITE_BUILD_ID"),
+    )
 }
 
 #[allow(dead_code)]

@@ -73,11 +73,16 @@ fn seat_exit(session: &GameSession, seat_number: u8) -> Option<SeatExit> {
         .moves
         .iter()
         .rev()
-        .find(|mv| mv.seat_number == seat_number && matches!(mv.move_type.as_str(), "resign" | "force_resign" | "timeout"))
+        .find(|mv| {
+            mv.seat_number == seat_number
+                && matches!(mv.move_type.as_str(), "resign" | "force_resign" | "timeout")
+        })
         .map(|mv| match mv.move_type.as_str() {
             "timeout" => SeatExit::TimedOut,
             "force_resign" => SeatExit::ForceResigned,
-            _ => SeatExit::Resigned { move_number: mv.move_number },
+            _ => SeatExit::Resigned {
+                move_number: mv.move_number,
+            },
         })
 }
 
@@ -111,7 +116,12 @@ pub fn compute_participant_outcomes(session: &GameSession) -> Vec<ParticipantOut
     // can be any number of resigned/timed-out/force-resigned seats, not
     // just one — win/loss/tie is decided purely among the seats that were
     // still active when the game ended.
-    let max_score = session.participants.iter().filter(|p| !p.resigned).map(|p| p.score).max();
+    let max_score = session
+        .participants
+        .iter()
+        .filter(|p| !p.resigned)
+        .map(|p| p.score)
+        .max();
 
     session
         .participants
@@ -123,13 +133,23 @@ pub fn compute_participant_outcomes(session: &GameSession) -> Vec<ParticipantOut
                     // A force-resignation and a voluntary resignation are
                     // the same stats bucket — only their ranking/rating
                     // treatment differs (see `settle_ratings`).
-                    Some(SeatExit::ForceResigned) | Some(SeatExit::Resigned { .. }) | None => Outcome::Resigned,
+                    Some(SeatExit::ForceResigned) | Some(SeatExit::Resigned { .. }) | None => {
+                        Outcome::Resigned
+                    }
                 }
             } else {
                 match max_score {
                     Some(max) if p.score == max => {
-                        let sharers = session.participants.iter().filter(|q| !q.resigned && q.score == max).count();
-                        if sharers > 1 { Outcome::Tie } else { Outcome::Win }
+                        let sharers = session
+                            .participants
+                            .iter()
+                            .filter(|q| !q.resigned && q.score == max)
+                            .count();
+                        if sharers > 1 {
+                            Outcome::Tie
+                        } else {
+                            Outcome::Win
+                        }
                     }
                     _ => Outcome::Loss,
                 }
@@ -231,11 +251,13 @@ pub async fn settle_ratings(
 
     let mut ratings_before = Vec::with_capacity(seats.len());
     for (kind, id, _) in &seats {
-        let row = sqlx::query("select rating from player_ratings where subject_kind = ?1 and subject_id = ?2")
-            .bind(*kind)
-            .bind(id.as_str())
-            .fetch_optional(&mut **tx)
-            .await?;
+        let row = sqlx::query(
+            "select rating from player_ratings where subject_kind = ?1 and subject_id = ?2",
+        )
+        .bind(*kind)
+        .bind(id.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
         ratings_before.push(row.map(|r| r.get::<f64, _>(0)).unwrap_or(DEFAULT_RATING));
     }
 
@@ -259,9 +281,12 @@ pub async fn settle_ratings(
     // Group by subject — a subject occupying multiple seats gets its
     // deltas (and its pre-game rating, identical across those seats since
     // it's the same DB row) summed into one net update.
-    let mut by_subject: std::collections::BTreeMap<(&'static str, String), (f64, f64)> = std::collections::BTreeMap::new();
+    let mut by_subject: std::collections::BTreeMap<(&'static str, String), (f64, f64)> =
+        std::collections::BTreeMap::new();
     for (i, (kind, id, _)) in seats.iter().enumerate() {
-        let entry = by_subject.entry((*kind, id.clone())).or_insert((ratings_before[i], 0.0));
+        let entry = by_subject
+            .entry((*kind, id.clone()))
+            .or_insert((ratings_before[i], 0.0));
         entry.1 += deltas[i];
     }
 
@@ -348,9 +373,13 @@ pub async fn get_subject_stats(
     }
 
     let bingo_count: i64 = if subject_kind == "player" {
-        sqlx::query("select coalesce(sum(bingo_count), 0) from game_participants where player_id = ?1")
+        sqlx::query(
+            "select coalesce(sum(bingo_count), 0) from game_participants where player_id = ?1",
+        )
     } else {
-        sqlx::query("select coalesce(sum(bingo_count), 0) from game_participants where engine_id = ?1")
+        sqlx::query(
+            "select coalesce(sum(bingo_count), 0) from game_participants where engine_id = ?1",
+        )
     }
     .bind(subject_id)
     .fetch_one(pool)
@@ -367,7 +396,11 @@ pub async fn get_subject_stats(
         .unwrap_or((DEFAULT_RATING, 0));
 
     Ok(api::PlayerStatsDto {
-        subject_kind: if subject_kind == "player" { api::RatingSubjectKind::Player } else { api::RatingSubjectKind::Engine },
+        subject_kind: if subject_kind == "player" {
+            api::RatingSubjectKind::Player
+        } else {
+            api::RatingSubjectKind::Engine
+        },
         subject_id: subject_id.to_string(),
         rating,
         games_rated,
@@ -415,7 +448,10 @@ pub async fn get_rating_history(
 /// response and the `GameFinished` broadcast carry the same rating info —
 /// letting the client show "your rating just moved" at the moment a game
 /// ends.
-pub async fn attach_rating_deltas(pool: &Pool<Sqlite>, dto: &mut api::GameStateDto) -> Result<(), sqlx::Error> {
+pub async fn attach_rating_deltas(
+    pool: &Pool<Sqlite>,
+    dto: &mut api::GameStateDto,
+) -> Result<(), sqlx::Error> {
     if dto.status != api::GameStatus::Finished {
         return Ok(());
     }
@@ -455,8 +491,12 @@ pub async fn attach_rating_deltas(pool: &Pool<Sqlite>, dto: &mut api::GameStateD
 /// an unclaimed seat. One small query per distinct subject rather than
 /// one per seat, since a self-play game (e.g. a "Bot Showdown") would
 /// otherwise look the same subject up twice.
-pub async fn attach_current_ratings(pool: &Pool<Sqlite>, dto: &mut api::GameStateDto) -> Result<(), sqlx::Error> {
-    let mut seen: std::collections::HashMap<(&'static str, String), f64> = std::collections::HashMap::new();
+pub async fn attach_current_ratings(
+    pool: &Pool<Sqlite>,
+    dto: &mut api::GameStateDto,
+) -> Result<(), sqlx::Error> {
+    let mut seen: std::collections::HashMap<(&'static str, String), f64> =
+        std::collections::HashMap::new();
     for participant in &dto.participants {
         let subject = match (&participant.player_id, &participant.engine_id) {
             (Some(id), None) => Some(("player", id.clone())),
@@ -467,12 +507,17 @@ pub async fn attach_current_ratings(pool: &Pool<Sqlite>, dto: &mut api::GameStat
         if seen.contains_key(&(kind, id.clone())) {
             continue;
         }
-        let row = sqlx::query("select rating from player_ratings where subject_kind = ?1 and subject_id = ?2")
-            .bind(kind)
-            .bind(&id)
-            .fetch_optional(pool)
-            .await?;
-        seen.insert((kind, id), row.map(|r| r.get::<f64, _>(0)).unwrap_or(DEFAULT_RATING));
+        let row = sqlx::query(
+            "select rating from player_ratings where subject_kind = ?1 and subject_id = ?2",
+        )
+        .bind(kind)
+        .bind(&id)
+        .fetch_optional(pool)
+        .await?;
+        seen.insert(
+            (kind, id),
+            row.map(|r| r.get::<f64, _>(0)).unwrap_or(DEFAULT_RATING),
+        );
     }
 
     for participant in &mut dto.participants {

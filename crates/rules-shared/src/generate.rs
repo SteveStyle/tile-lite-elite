@@ -66,15 +66,13 @@ impl<'a, D: Dictionary> RulesEngine<'a, D> {
                     // lane is extending an existing word rather than
                     // starting fresh) — the cursor tracks the *whole*
                     // word being built, not just the newly placed part.
-                    let Some(cursor) =
-                        seed_cursor(
-                            self.dictionary.root_cursor(),
-                            &state.board,
-                            start,
-                            direction,
-                            &self.rules.alphabet,
-                        )
-                    else {
+                    let Some(cursor) = seed_cursor(
+                        self.dictionary.root_cursor(),
+                        &state.board,
+                        start,
+                        direction,
+                        &self.rules.alphabet,
+                    ) else {
                         continue;
                     };
 
@@ -176,9 +174,11 @@ impl<'a, D: Dictionary> RulesEngine<'a, D> {
                     Direction::Vertical => cached.vertical,
                 };
 
-                for tile in
-                    available_tiles_for_crosscheck(remaining, cross_check, self.rules.alphabet.len())
-                {
+                for tile in available_tiles_for_crosscheck(
+                    remaining,
+                    cross_check,
+                    self.rules.alphabet.len(),
+                ) {
                     // The actual pruning win: skip a letter entirely (no
                     // recursion, no rack mutation) the moment it can't
                     // possibly continue toward any real word, rather than
@@ -424,8 +424,8 @@ mod tests {
         let alphabet = Alphabet::from_chars(('A'..='Z').chain(['É']));
         let mut letter_values = [1u8; crate::model::MAX_ALPHABET_SIZE];
         let mut tile_distribution = [0u8; crate::model::MAX_ALPHABET_SIZE];
-        for letter in 0..alphabet.len() {
-            tile_distribution[letter] = 4;
+        for dist in tile_distribution.iter_mut().take(alphabet.len()) {
+            *dist = 4;
         }
         // Give the non-ASCII letter a distinctive value so a test can
         // confirm it actually took effect, rather than just defaulting.

@@ -156,7 +156,10 @@ impl WordListDictionary {
         let mut sorted_words: Vec<Vec<char>> =
             words.iter().map(|word| word.chars().collect()).collect();
         sorted_words.sort_unstable();
-        Self { words, sorted_words }
+        Self {
+            words,
+            sorted_words,
+        }
     }
 
     /// The starting point for an incremental prefix search — advance it
@@ -326,7 +329,10 @@ mod tests {
             dictionary_by_name("enable2k").unwrap(),
             &*ENABLE2K
         ));
-        assert!(std::ptr::eq(dictionary_by_name("german").unwrap(), &*GERMAN));
+        assert!(std::ptr::eq(
+            dictionary_by_name("german").unwrap(),
+            &*GERMAN
+        ));
         assert!(std::ptr::eq(
             dictionary_by_name("spanish").unwrap(),
             &*SPANISH

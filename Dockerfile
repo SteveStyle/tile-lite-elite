@@ -31,20 +31,17 @@ ENV RUSTC_WRAPPER=""
 
 # Workspace manifests first, so dependency compilation is cached across
 # rebuilds that only touch application code. old-crates/{first-try,
-# second-try} are separate workspace members that depend on `srm-utils`, a
-# path dependency (`../utils`, relative to the workspace root) living
-# outside this repo entirely — Cargo needs *some* crate there to load the
-# workspace manifest, even though nothing built here depends on it. A
-# trivial stub satisfies that without needing the real, private, out-of-repo
-# crate as part of the build context (this does mean old-crates' own real
-# dependency tree gets dropped from the image's Cargo.lock, which is fine —
-# old-crates aren't built here).
+# second-try} are workspace members (Cargo needs their manifests present to
+# load the workspace), but nothing built here depends on them. Their only
+# non-crates.io dependency, `srm-utils`, is a git dependency
+# (github.com/SteveStyle/utils, pinned by rev in Cargo.lock) that Cargo
+# fetches over the network like any crates.io dependency — no local
+# `../utils` checkout or stub crate is needed. old-crates themselves are
+# never compiled: the build below is scoped to server-game/admin-cli plus
+# the wasm UI.
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY old-crates ./old-crates
-RUN mkdir -p /utils/src \
-    && printf '[package]\nname = "srm-utils"\nversion = "0.2.3"\nedition = "2021"\n' > /utils/Cargo.toml \
-    && touch /utils/src/lib.rs
 
 # Baked into both binaries via `option_env!` (see each crate's
 # `app_version()`) as SemVer build metadata, e.g. `0.2.0+a1c9f02`. Passed

@@ -1,8 +1,8 @@
 use crate::board::{BoardCell, BoardState};
 use crate::dictionary::Dictionary;
 use crate::model::{
-    mask_contains, mask_insert, Direction, Letter, LetterMask, Position, Score, VariantRules,
-    MAX_ALPHABET_SIZE,
+    Direction, Letter, LetterMask, MAX_ALPHABET_SIZE, Position, Score, VariantRules, mask_contains,
+    mask_insert,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,33 +20,18 @@ impl Default for RuleCache {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CachedCell {
     pub horizontal: CrossCheck,
     pub vertical: CrossCheck,
     pub anchor_flags: AnchorFlags,
 }
 
-impl Default for CachedCell {
-    fn default() -> Self {
-        Self {
-            horizontal: CrossCheck::default(),
-            vertical: CrossCheck::default(),
-            anchor_flags: AnchorFlags::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CrossCheck {
+    #[default]
     Unconstrained,
     Constrained(ConstrainedCrossCheck),
-}
-
-impl Default for CrossCheck {
-    fn default() -> Self {
-        Self::Unconstrained
-    }
 }
 
 impl CrossCheck {
@@ -226,16 +211,16 @@ fn board_has_any_tiles(board: &BoardState, rules: &VariantRules) -> bool {
 
 fn touches_filled_neighbor(board: &BoardState, pos: Position, rules: &VariantRules) -> bool {
     for direction in [Direction::Horizontal, Direction::Vertical] {
-        if let Some(next) = pos.try_step_backward(direction) {
-            if matches!(board.get(next), Some(BoardCell::Filled(_))) {
-                return true;
-            }
+        if let Some(next) = pos.try_step_backward(direction)
+            && matches!(board.get(next), Some(BoardCell::Filled(_)))
+        {
+            return true;
         }
 
-        if let Some(next) = pos.try_step_forward(direction, rules.width, rules.height) {
-            if matches!(board.get(next), Some(BoardCell::Filled(_))) {
-                return true;
-            }
+        if let Some(next) = pos.try_step_forward(direction, rules.width, rules.height)
+            && matches!(board.get(next), Some(BoardCell::Filled(_)))
+        {
+            return true;
         }
     }
 
@@ -320,7 +305,7 @@ pub fn compute_cross_check<D: Dictionary>(
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_cross_check, CrossCheck, RuleCache};
+    use super::{CrossCheck, RuleCache, compute_cross_check};
     use crate::board::{BoardCell, BoardState, EmptyCell, FilledCell};
     use crate::dictionary::WordListDictionary;
     use crate::model::{Direction, Letter, Position, Premium, VariantRules};

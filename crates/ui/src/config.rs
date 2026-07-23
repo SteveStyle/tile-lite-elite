@@ -48,6 +48,10 @@ fn default_server_url() -> String {
         .to_string()
 }
 
+// Used via `init_from_args` under the `desktop` feature; unused on a plain
+// host build (e.g. `cargo test`/CI), same feature-conditional deadness as
+// `main.rs`'s `app_version`.
+#[allow(dead_code)]
 fn resolve_from_args(args: &[String]) -> String {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -81,7 +85,9 @@ fn resolve_from_args(args: &[String]) -> String {
 static SERVER_URL: OnceLock<String> = OnceLock::new();
 
 /// Call once from `main()`, before launching the app, with the process's
-/// CLI args (excluding argv[0]).
+/// CLI args (excluding argv[0]). Only wired up under the `desktop` feature
+/// (see `main.rs`), hence `allow(dead_code)` for plain host builds.
+#[allow(dead_code)]
 pub fn init_from_args(args: &[String]) {
     let _ = SERVER_URL.set(resolve_from_args(args));
 }

@@ -21,7 +21,11 @@ use clap::{Parser, Subcommand};
 struct Cli {
     /// Base URL of the server's HTTP API. Must resolve to loopback from the
     /// server's point of view, or every request will 403.
-    #[arg(long, env = "TILE_LITE_ELITE_API_BASE_URL", default_value = "http://127.0.0.1:3000")]
+    #[arg(
+        long,
+        env = "TILE_LITE_ELITE_API_BASE_URL",
+        default_value = "http://127.0.0.1:3000"
+    )]
     server: String,
 
     #[command(subcommand)]
@@ -92,13 +96,21 @@ fn main() {
     }
 }
 
-fn run_users(client: &reqwest::blocking::Client, server: &str, action: UsersAction) -> Result<(), String> {
+fn run_users(
+    client: &reqwest::blocking::Client,
+    server: &str,
+    action: UsersAction,
+) -> Result<(), String> {
     match action {
         UsersAction::List => {
-            let users: Vec<api::PlayerDto> =
-                check_response(client.get(format!("{server}/admin/users")).send().map_err(fmt_err)?)?
-                    .json()
-                    .map_err(fmt_err)?;
+            let users: Vec<api::PlayerDto> = check_response(
+                client
+                    .get(format!("{server}/admin/users"))
+                    .send()
+                    .map_err(fmt_err)?,
+            )?
+            .json()
+            .map_err(fmt_err)?;
             if users.is_empty() {
                 println!("No users.");
                 return Ok(());
@@ -122,7 +134,10 @@ fn run_users(client: &reqwest::blocking::Client, server: &str, action: UsersActi
             )?;
             println!("Deleted user {player_id}.");
         }
-        UsersAction::ResetPassword { player_id, password } => {
+        UsersAction::ResetPassword {
+            player_id,
+            password,
+        } => {
             let new_password = password.unwrap_or_else(generate_password);
             check_response(
                 client
@@ -140,9 +155,16 @@ fn run_users(client: &reqwest::blocking::Client, server: &str, action: UsersActi
     Ok(())
 }
 
-fn run_games(client: &reqwest::blocking::Client, server: &str, action: GamesAction) -> Result<(), String> {
+fn run_games(
+    client: &reqwest::blocking::Client,
+    server: &str,
+    action: GamesAction,
+) -> Result<(), String> {
     match action {
-        GamesAction::List { status, older_than_days } => {
+        GamesAction::List {
+            status,
+            older_than_days,
+        } => {
             let mut request = client.get(format!("{server}/admin/games"));
             let mut query = Vec::new();
             if let Some(status) = &status {
@@ -154,7 +176,9 @@ fn run_games(client: &reqwest::blocking::Client, server: &str, action: GamesActi
             request = request.query(&query);
 
             let games: Vec<api::AdminGameSummaryDto> =
-                check_response(request.send().map_err(fmt_err)?)?.json().map_err(fmt_err)?;
+                check_response(request.send().map_err(fmt_err)?)?
+                    .json()
+                    .map_err(fmt_err)?;
             if games.is_empty() {
                 println!("No games match.");
                 return Ok(());
@@ -199,10 +223,15 @@ fn run_games(client: &reqwest::blocking::Client, server: &str, action: GamesActi
 }
 
 fn fmt_err(error: reqwest::Error) -> String {
-    format!("could not reach {}: {error}", error.url().map(|u| u.as_str()).unwrap_or("server"))
+    format!(
+        "could not reach {}: {error}",
+        error.url().map(|u| u.as_str()).unwrap_or("server")
+    )
 }
 
-fn check_response(response: reqwest::blocking::Response) -> Result<reqwest::blocking::Response, String> {
+fn check_response(
+    response: reqwest::blocking::Response,
+) -> Result<reqwest::blocking::Response, String> {
     if response.status().is_success() {
         return Ok(response);
     }

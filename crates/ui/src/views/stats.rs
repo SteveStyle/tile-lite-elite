@@ -18,24 +18,26 @@ pub fn StatsView(
     let mut is_loading = use_signal(|| false);
     let mut requested = use_signal(|| false);
 
-    if let Some(player_id) = player_id.clone() {
-        if !requested() {
-            requested.set(true);
-            is_loading.set(true);
-            let server_url = server_url.clone();
-            let token = token.clone();
-            spawn(async move {
-                match crate::app::fetch_player_stats(&server_url, &player_id, token.as_deref()).await {
-                    Ok(fetched) => stats.set(Some(fetched)),
-                    Err(error) => error_message.set(Some(error)),
-                }
-                match crate::app::fetch_player_rating_history(&server_url, &player_id, token.as_deref()).await {
-                    Ok(fetched) => history.set(fetched),
-                    Err(error) => error_message.set(Some(error)),
-                }
-                is_loading.set(false);
-            });
-        }
+    if let Some(player_id) = player_id.clone()
+        && !requested()
+    {
+        requested.set(true);
+        is_loading.set(true);
+        let server_url = server_url.clone();
+        let token = token.clone();
+        spawn(async move {
+            match crate::app::fetch_player_stats(&server_url, &player_id, token.as_deref()).await {
+                Ok(fetched) => stats.set(Some(fetched)),
+                Err(error) => error_message.set(Some(error)),
+            }
+            match crate::app::fetch_player_rating_history(&server_url, &player_id, token.as_deref())
+                .await
+            {
+                Ok(fetched) => history.set(fetched),
+                Err(error) => error_message.set(Some(error)),
+            }
+            is_loading.set(false);
+        });
     }
 
     rsx! {
