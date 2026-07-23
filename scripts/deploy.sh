@@ -118,10 +118,16 @@ ssh "${SSH_OPTS[@]}" "$REMOTE" "
     docker image prune -f > /dev/null
 "
 
-echo "==> Ensuring the 'sa' alias for tile-lite-elite-admin is set up on the VM"
+echo "==> Ensuring the 'sa' alias for tile-lite-elite-admin is set up and current on the VM"
 ssh "${SSH_OPTS[@]}" "$REMOTE" "
-    grep -qF 'alias sa=' ~/.bashrc 2>/dev/null || \
-        echo \"alias sa='docker compose -f ~/$DEPLOY_REMOTE_DIR/docker-compose.yml exec server tile-lite-elite-admin'\" >> ~/.bashrc \
+    # Drop any existing 'alias sa=' line first, then re-append the current
+    # definition. A stale line (e.g. an old deploy dir, or the pre-rename
+    # admin binary name) used to survive because the previous logic only
+    # appended when *no* 'alias sa=' line existed at all — so an out-of-date
+    # value was never refreshed. Delete-then-append converges to exactly one
+    # correct line whether the alias was absent, current, or stale.
+    sed -i '/alias sa=/d' ~/.bashrc 2>/dev/null || true
+    echo \"alias sa='docker compose -f ~/$DEPLOY_REMOTE_DIR/docker-compose.yml exec server tile-lite-elite-admin'\" >> ~/.bashrc \
         || echo \"    (warning: could not set up the 'sa' alias for tile-lite-elite-admin)\"
 "
 
