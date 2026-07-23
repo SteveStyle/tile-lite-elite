@@ -74,7 +74,7 @@ echo "==> HEAD ($HEAD_SHA) confirmed pushed to $UPSTREAM"
 # this check, testing commit A in staging and then committing a "quick
 # fix" B before deploying would silently ship B untested — easy to do
 # without noticing, since deploy.sh has no other way to know staging
-# wasn't re-run. See docs/3.3-testing-and-staging.md.
+# wasn't re-run. See docs/3.3-testing-ci-and-release.md.
 STAGING_HEALTH="$(curl -sf --max-time 5 "$STAGING_URL/health" 2>/dev/null || true)"
 STAGING_VERSION="$(printf '%s' "$STAGING_HEALTH" | grep -o '"app_version":"[^"]*"' | cut -d'"' -f4)"
 STAGING_SHA="${STAGING_VERSION#*+}"

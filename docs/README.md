@@ -21,12 +21,12 @@ This folder collects the design notes and operating guides for Tile Lite Elite, 
 
 ## 3.x — Lifecycle
 
-Run in this order for a normal change: Setup once, then Development → Testing & Staging → Deployment → Production Support & Maintenance repeatedly.
+Run in this order for a normal change: Setup once, then Development → Testing, CI & Release → Deployment → Production Support & Maintenance repeatedly.
 
 - [3.0 Tools](3.0-tools.md) — every script, linking to where it's explained
 - [3.1 Setup](3.1-setup.md) — one-time: dev machine, Oracle VM, HTTPS, troubleshooting
 - [3.2 Development](3.2-development.md) — running services locally, building, resetting local state
-- [3.3 Testing & Staging](3.3-testing-and-staging.md) — `cargo test`, the local staging environment
+- [3.3 Testing, CI & Release](3.3-testing-ci-and-release.md) — `cargo test`, GitHub Actions CI, the local staging environment, and the end-to-end release runbook
 - [3.4 Deployment](3.4-deployment.md) — container deployment, redeploying production
 - [3.5 Production Support & Maintenance](3.5-production-support.md) — admin CLI, logging, backups, wiping production
 
