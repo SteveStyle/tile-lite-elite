@@ -514,6 +514,12 @@ pub fn RootApp() -> Element {
         direction_override(),
     );
 
+    // Shown in the top bar so you can always tell which build/wire-contract is
+    // actually running — `app` mirrors GET /health's `app_version` (includes
+    // the +build-sha on deployed builds), `api` mirrors `api_version`.
+    let app_version = crate::app_version();
+    let api_version = api::API_VERSION.to_string();
+
     rsx! {
         document::Link { rel: "stylesheet", href: MAIN_CSS }
 
@@ -522,7 +528,10 @@ pub fn RootApp() -> Element {
         } else {
         div { class: "app-shell",
             header { class: "topbar",
-                p { class: "topbar-kicker", "Tile Lite Elite" }
+                div { class: "topbar-brand",
+                    p { class: "topbar-kicker", "Tile Lite Elite" }
+                    p { class: "topbar-version", "app {app_version} · api {api_version}" }
+                }
                 if !IS_ONLINE() {
                     span { class: "offline-indicator", "Can't reach the server — reconnecting..." }
                 }

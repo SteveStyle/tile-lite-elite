@@ -67,6 +67,31 @@ button:disabled {
     margin-bottom: 6px;
 }
 
+/* Brand block: the title with the running build/api version directly under it,
+   so you can always tell which build is live (see app.rs). */
+.topbar-brand {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+/* A bit larger than the shared eyebrow style above, and no bottom margin since
+   the version line now sits right beneath it. Keeps the uppercase brand look. */
+.topbar-kicker {
+    font-size: 1.05rem;
+    margin-bottom: 0;
+    color: rgba(35, 25, 15, 0.82);
+}
+
+.topbar-version {
+    font-family: "SFMono-Regular", ui-monospace, Menlo, Consolas, monospace;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 0.68rem;
+    color: rgba(35, 25, 15, 0.5);
+    margin: 0;
+}
+
 .topbar-title,
 .hero-panel h1 {
     font-family: "Palatino Linotype", "Book Antiqua", Georgia, serif;
