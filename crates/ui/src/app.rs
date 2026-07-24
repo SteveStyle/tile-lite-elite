@@ -267,7 +267,13 @@ pub fn RootApp() -> Element {
     {
         let server_url = server_url.clone();
         use_effect(move || {
-            if IS_ONLINE() || is_reconnecting() {
+            // Subscribe to IS_ONLINE (we want to re-run when it flips), but read
+            // the `is_reconnecting` guard with `.peek()` so we DON'T subscribe to
+            // a signal this same effect also writes below — a tracked read + write
+            // of one signal makes the effect re-trigger itself (Dioxus flags it as
+            // a "read and write in the same scope" loop). `.peek()` keeps it as a
+            // plain re-entrancy guard.
+            if IS_ONLINE() || *is_reconnecting.peek() {
                 return;
             }
             is_reconnecting.set(true);
