@@ -1319,25 +1319,57 @@ pub fn RootApp() -> Element {
                     // earlier this turn — landing on the next free cell if
                     // there's room anywhere in the row/column, or leaving
                     // the selection where it is if the whole line is full.
-                    on_move_selection: move |(direction, forward): (DirectionDto, bool)| {
+                    on_move_selection: move |(direction, forward, onto_occupied): (
+                        DirectionDto,
+                        bool,
+                        bool,
+                    )| {
                         if !can_submit_human_action || exchange_mode() {
                             return;
                         }
                         let Some(current) = selected_cell() else {
                             return;
                         };
-                        if let Some(next) = find_next_placeable_cell_wrapping(
-                            &game_for_move,
-                            &staged_placements(),
-                            current,
-                            direction,
-                            forward,
-                        ) {
+                        // With a modifier held, step exactly one cell (wrapping)
+                        // and land there regardless of occupancy; otherwise skip
+                        // to the next free cell as before.
+                        let next = if onto_occupied {
+                            Some(step_index_wrapping(current, direction, forward))
+                        } else {
+                            find_next_placeable_cell_wrapping(
+                                &game_for_move,
+                                &staged_placements(),
+                                current,
+                                direction,
+                                forward,
+                            )
+                        };
+                        if let Some(next) = next {
                             selected_cell.set(Some(next));
                         }
                     },
                     on_click_rack_tile: move |tile_id: usize| {
                         if !can_submit_human_action || exchange_mode() {
+                            return;
+                        }
+                        // A tile that's already staged on the board shows as a
+                        // greyed "used" slot in the rack; clicking that slot
+                        // returns the tile to the rack (removes its placement)
+                        // and reselects the freed cell to keep composing there —
+                        // the click counterpart to dragging a staged tile off
+                        // the board.
+                        if let Some(placement) = staged_placements()
+                            .iter()
+                            .find(|p| p.rack_tile_id == tile_id)
+                            .cloned()
+                        {
+                            error_message.set(None);
+                            info_message.set(None);
+                            staged_placements
+                                .with_mut(|placements| {
+                                    placements.retain(|p| p.rack_tile_id != tile_id)
+                                });
+                            selected_cell.set(Some(placement.board_index));
                             return;
                         }
                         let Some(cell_index) = selected_cell() else {

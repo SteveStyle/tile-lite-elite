@@ -35,7 +35,7 @@ pub fn Home(
     on_drag_end_staged_tile: EventHandler<usize>,
     on_drop_board_cell: EventHandler<usize>,
     on_select_cell: EventHandler<usize>,
-    on_move_selection: EventHandler<(DirectionDto, bool)>,
+    on_move_selection: EventHandler<(DirectionDto, bool, bool)>,
     on_click_rack_tile: EventHandler<usize>,
     on_type_letter: EventHandler<char>,
     on_backspace: EventHandler<()>,
@@ -136,22 +136,30 @@ pub fn Home(
                 if selected_cell.is_none() {
                     return;
                 }
+                // Holding any of Ctrl/Shift/Alt while arrowing lets the cursor
+                // step *onto* occupied cells (a played letter, or a tile staged
+                // earlier this turn) instead of skipping past them — e.g. to
+                // land on a specific staged tile and Delete it. Plain arrows
+                // keep the skip-to-next-free-cell behavior.
+                let onto_occupied = event
+                    .modifiers()
+                    .intersects(Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT);
                 match event.key() {
                     Key::ArrowLeft => {
                         event.prevent_default();
-                        on_move_selection.call((DirectionDto::Horizontal, false));
+                        on_move_selection.call((DirectionDto::Horizontal, false, onto_occupied));
                     }
                     Key::ArrowRight => {
                         event.prevent_default();
-                        on_move_selection.call((DirectionDto::Horizontal, true));
+                        on_move_selection.call((DirectionDto::Horizontal, true, onto_occupied));
                     }
                     Key::ArrowUp => {
                         event.prevent_default();
-                        on_move_selection.call((DirectionDto::Vertical, false));
+                        on_move_selection.call((DirectionDto::Vertical, false, onto_occupied));
                     }
                     Key::ArrowDown => {
                         event.prevent_default();
-                        on_move_selection.call((DirectionDto::Vertical, true));
+                        on_move_selection.call((DirectionDto::Vertical, true, onto_occupied));
                     }
                     Key::Character(text) if text == " " => {
                         if can_toggle_direction {

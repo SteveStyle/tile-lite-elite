@@ -30,7 +30,15 @@ pub fn RackView(
             class_name.push_str(" rack-tile-selected");
         }
         let draggable = can_stage_moves && !exchange_mode && !tile.is_used;
-        let clickable = !tile.is_used && (exchange_mode || can_stage_moves);
+        // In exchange mode only unused tiles are selectable. When staging,
+        // both are clickable: an unused tile places onto the selected cell, a
+        // used (already-placed) tile's greyed slot returns it to the rack —
+        // `on_click_tile` in app.rs decides which by looking at the placements.
+        let clickable = if exchange_mode {
+            !tile.is_used
+        } else {
+            can_stage_moves
+        };
 
         rsx! {
             div {
