@@ -252,11 +252,13 @@ pub async fn save_game(pool: &Pool<Sqlite>, session: &GameSession) -> Result<(),
     } else {
         Some(now)
     })
-    .bind(if session.status == GameStatus::Finished {
-        Some(now)
-    } else {
-        None::<i64>
-    })
+    .bind(
+        if matches!(session.status, GameStatus::Finished | GameStatus::Aborted) {
+            Some(now)
+        } else {
+            None::<i64>
+        },
+    )
     .bind(status_name(&session.status))
     .bind(&session.variant)
     .bind(&session.language)
@@ -1341,6 +1343,7 @@ fn status_name(status: &GameStatus) -> &'static str {
         GameStatus::Waiting => "waiting",
         GameStatus::Active => "active",
         GameStatus::Finished => "finished",
+        GameStatus::Aborted => "aborted",
     }
 }
 

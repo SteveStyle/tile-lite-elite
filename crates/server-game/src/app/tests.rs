@@ -6274,3 +6274,162 @@ async fn reset_password_succeeds_updates_password_and_signs_out_existing_session
     .await;
     assert_eq!(new_login.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn creator_can_abort_an_active_game() {
+    let database_url = test_database_url();
+    let state = create_test_state(&database_url).await;
+    let app = build_router(state.clone());
+
+    let started = create_two_human_game(app.clone()).await;
+
+    // A non-creator can't abort.
+    let non_creator = send_empty_auth(
+        app.clone(),
+        Method::POST,
+        &format!("/games/{}/abort", started.game.id),
+        Some(&started.bob.session_token),
+    )
+    .await;
+    assert_eq!(non_creator.status(), StatusCode::UNAUTHORIZED);
+
+    // The creator aborts the whole game.
+    let response = send_empty_auth(
+        app.clone(),
+        Method::POST,
+        &format!("/games/{}/abort", started.game.id),
+        Some(&started.alice.session_token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let aborted: GameStateDto = read_json(response).await;
+    assert_eq!(aborted.status, api::GameStatus::Aborted);
+    assert_eq!(aborted.winner_seat, None, "an abort has no winner");
+    assert!(
+        aborted.participants.iter().all(|p| p.resigned),
+        "every seat is force-resigned by an abort"
+    );
+    assert_eq!(
+        aborted.moves.last().expect("a terminal move").move_type,
+        "abort"
+    );
+
+    // Aborting again is rejected — the game has already ended.
+    let again = send_empty_auth(
+        app,
+        Method::POST,
+        &format!("/games/{}/abort", started.game.id),
+        Some(&started.alice.session_token),
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn creator_can_abort_a_waiting_game() {
+    let database_url = test_database_url();
+    let state = create_test_state(&database_url).await;
+    let app = build_router(state.clone());
+
+    let waiting = create_two_human_game_waiting(app.clone()).await;
+    assert_eq!(waiting.game.status, api::GameStatus::Waiting);
+
+    let response = send_empty_auth(
+        app,
+        Method::POST,
+        &format!("/games/{}/abort", waiting.game.id),
+        Some(&waiting.alice.session_token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let aborted: GameStateDto = read_json(response).await;
+    assert_eq!(aborted.status, api::GameStatus::Aborted);
+}
+
+#[tokio::test]
+async fn aborting_a_game_does_not_move_rating() {
+    let database_url = test_database_url();
+    let state = create_test_state(&database_url).await;
+    let app = build_router(state.clone());
+
+    let started = create_two_human_game(app.clone()).await;
+    let response = send_empty_auth(
+        app,
+        Method::POST,
+        &format!("/games/{}/abort", started.game.id),
+        Some(&started.alice.session_token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let aborted: GameStateDto = read_json(response).await;
+    assert_eq!(aborted.status, api::GameStatus::Aborted);
+    for participant in &aborted.participants {
+        assert_eq!(
+            participant.rating_before, None,
+            "an aborted game must not move rating"
+        );
+        assert_eq!(participant.rating_after, None);
+    }
+
+    let alice_stats = stats::get_subject_stats(&state.db, "player", &started.alice.player_id)
+        .await
+        .expect("stats query should succeed");
+    assert_eq!(alice_stats.games_rated, 0);
+}
+
+#[tokio::test]
+async fn an_aborted_game_reloads_from_its_snapshot() {
+    let database_url = test_database_url();
+    let state = create_test_state(&database_url).await;
+    let app = build_router(state.clone());
+
+    let started = create_two_human_game(app.clone()).await;
+    let response = send_empty_auth(
+        app,
+        Method::POST,
+        &format!("/games/{}/abort", started.game.id),
+        Some(&started.alice.session_token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Reload straight from the DB (bypassing the in-memory cache) to confirm
+    // the `aborted` status round-trips through the snapshot blob.
+    let reloaded = persistence::load_game(&state.db, &started.game.id)
+        .await
+        .expect("load ok")
+        .expect("aborted game still loads");
+    assert_eq!(reloaded.status, api::GameStatus::Aborted);
+    assert!(reloaded.participants.iter().all(|p| p.resigned));
+}
+
+#[tokio::test]
+async fn a_finished_game_cannot_be_aborted() {
+    let database_url = test_database_url();
+    let state = create_test_state(&database_url).await;
+    let app = build_router(state.clone());
+
+    // Finish the game: the creator force-resigns the only other seat, leaving
+    // one active seat, which ends the game as Finished.
+    let started = create_two_human_game(app.clone()).await;
+    let finish = send_empty_auth(
+        app.clone(),
+        Method::POST,
+        &format!("/games/{}/seats/1/force-resign", started.game.id),
+        Some(&started.alice.session_token),
+    )
+    .await;
+    assert_eq!(finish.status(), StatusCode::OK);
+    let finished: GameStateDto = read_json(finish).await;
+    assert_eq!(finished.status, api::GameStatus::Finished);
+
+    // Abort must not overwrite a real result.
+    let response = send_empty_auth(
+        app,
+        Method::POST,
+        &format!("/games/{}/abort", started.game.id),
+        Some(&started.alice.session_token),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

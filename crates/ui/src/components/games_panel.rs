@@ -296,6 +296,7 @@ pub fn GamesPanel(
     on_remove_seat: EventHandler<u8>,
     on_withdraw_seat: EventHandler<u8>,
     on_force_resign: EventHandler<u8>,
+    on_abort: EventHandler<()>,
     on_add_seat: EventHandler<AddSeatSubmission>,
     on_refresh: EventHandler<()>,
 ) -> Element {
@@ -311,6 +312,10 @@ pub fn GamesPanel(
     // render, not per row, but since only one row's detail view is ever
     // shown at a time that's not observably different from being per-row.
     let confirm_seat_action = use_signal(|| None::<SeatConfirmAction>);
+    // The game-level "abort" confirmation, separate from the seat-keyed
+    // `confirm_seat_action` above — holds the id of the game awaiting an abort
+    // confirm (shared across rows, but only one detail view is open at a time).
+    let confirm_abort = use_signal(|| None::<String>);
     let add_seat_kind = use_signal(|| AdditionalSeatKind::Named);
     let add_seat_name = use_signal(String::new);
 
@@ -359,6 +364,7 @@ pub fn GamesPanel(
                     drafting,
                     chat_draft,
                     confirm_seat_action,
+                    confirm_abort,
                     add_seat_kind,
                     add_seat_name,
                     on_select,
@@ -372,6 +378,7 @@ pub fn GamesPanel(
                     on_remove_seat,
                     on_withdraw_seat,
                     on_force_resign,
+                    on_abort,
                     on_add_seat,
                 )
             });
@@ -703,6 +710,7 @@ fn game_row(
     mut drafting: Signal<bool>,
     mut chat_draft: Signal<String>,
     confirm_seat_action: Signal<Option<SeatConfirmAction>>,
+    mut confirm_abort: Signal<Option<String>>,
     add_seat_kind: Signal<AdditionalSeatKind>,
     add_seat_name: Signal<String>,
     on_select: EventHandler<String>,
@@ -716,6 +724,7 @@ fn game_row(
     on_remove_seat: EventHandler<u8>,
     on_withdraw_seat: EventHandler<u8>,
     on_force_resign: EventHandler<u8>,
+    on_abort: EventHandler<()>,
     on_add_seat: EventHandler<AddSeatSubmission>,
 ) -> Element {
     let is_selected = selected_id == Some(summary.id.as_str());
@@ -853,7 +862,31 @@ fn game_row(
                             }
                         }
                     }
-                    if summary.status == GameStatus::Finished && can_remove {
+                    // Creator-only "abort" — cancels the whole game (see
+                    // `GameSession::abort`). Offered while there's still a game
+                    // to cancel (waiting or active); a confirm guards it since
+                    // it's irreversible.
+                    if viewer_is_creator
+                        && (summary.status == GameStatus::Waiting
+                            || summary.status == GameStatus::Active)
+                    {
+                        div { class: "game-builder-add-row",
+                            button {
+                                class: "toggle-button toggle-button-muted",
+                                disabled: is_loading,
+                                onclick: {
+                                    let abort_id = summary.id.clone();
+                                    move |_| confirm_abort.set(Some(abort_id.clone()))
+                                },
+                                "Abort game"
+                            }
+                        }
+                    }
+                    // Aborted games are terminal like finished ones, so they
+                    // get the same "Remove from my list" affordance.
+                    if matches!(summary.status, GameStatus::Finished | GameStatus::Aborted)
+                        && can_remove
+                    {
                         div { class: "game-builder-add-row",
                             button {
                                 class: "toggle-button toggle-button-muted",
@@ -863,6 +896,31 @@ fn game_row(
                                     move |_| on_remove_game.call(remove_id.clone())
                                 },
                                 "Remove"
+                            }
+                        }
+                    }
+                    if confirm_abort().as_deref() == Some(summary.id.as_str()) {
+                        div { class: "modal-backdrop",
+                            div { class: "modal-card",
+                                h2 { class: "modal-title", "Abort this game?" }
+                                p { class: "modal-copy",
+                                    "This ends the game for everyone right away and can't be undone. It won't affect anyone's rating."
+                                }
+                                div { class: "modal-actions",
+                                    button {
+                                        class: "toggle-button toggle-button-muted",
+                                        onclick: move |_| confirm_abort.set(None),
+                                        "Cancel"
+                                    }
+                                    button {
+                                        class: "toggle-button",
+                                        onclick: move |_| {
+                                            confirm_abort.set(None);
+                                            on_abort.call(());
+                                        },
+                                        "Abort game"
+                                    }
+                                }
                             }
                         }
                     }
@@ -1457,6 +1515,7 @@ fn action_note(record: &MoveRecordDto) -> String {
         "resign" => "resigned".to_string(),
         "force_resign" => "resigned (forced)".to_string(),
         "timeout" => "retired (exceeded time limit)".to_string(),
+        "abort" => "game aborted".to_string(),
         "exchange" => {
             let count = record
                 .description
@@ -1525,6 +1584,7 @@ fn status_label(status: &GameStatus, ready_to_start: bool) -> &'static str {
         GameStatus::Waiting => "Waiting",
         GameStatus::Active => "Playing",
         GameStatus::Finished => "Finished",
+        GameStatus::Aborted => "Aborted",
     }
 }
 
@@ -1534,6 +1594,7 @@ fn status_slug(status: &GameStatus, ready_to_start: bool) -> &'static str {
         GameStatus::Waiting => "waiting",
         GameStatus::Active => "active",
         GameStatus::Finished => "finished",
+        GameStatus::Aborted => "aborted",
     }
 }
 

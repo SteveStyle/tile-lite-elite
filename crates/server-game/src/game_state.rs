@@ -867,6 +867,33 @@ impl GameSession {
         self.status = GameStatus::Finished;
     }
 
+    /// The creator's "abort" — cancels the whole game at once, conceptually
+    /// force-resigning every seat still in play. Unlike `force_resign` (which
+    /// runs the last-seat-standing win logic via `handle_seat_exit`), an abort
+    /// has no winner and settles no ratings: it lands in its own terminal
+    /// `Aborted` state, distinct from a played-out `Finished`. Allowed from
+    /// `Waiting` (cancel before it starts) or `Active`; a game that's already
+    /// terminal is rejected so an abort can't overwrite a real result.
+    pub fn abort(&mut self) -> Result<(), String> {
+        if self.status == GameStatus::Finished || self.status == GameStatus::Aborted {
+            return Err("The game has already ended".to_string());
+        }
+        for participant in &mut self.participants {
+            participant.resigned = true;
+        }
+        self.moves.push(MoveRecord {
+            move_number: self.turn_number,
+            seat_number: self.current_seat,
+            move_type: "abort".to_string(),
+            main_word: None,
+            score_delta: 0,
+            positions: Vec::new(),
+            description: "Game aborted by the creator".to_string(),
+        });
+        self.status = GameStatus::Aborted;
+        Ok(())
+    }
+
     /// Hides a finished game from one seat's player — a purely per-viewer
     /// display concern (see `ParticipantState::removed_by_player`), not a
     /// deletion: the game keeps playing for/existing to everyone else, and

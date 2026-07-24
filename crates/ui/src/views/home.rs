@@ -443,6 +443,11 @@ fn last_move_board_indices(moves: &[api::MoveRecordDto]) -> HashSet<usize> {
 /// games list and work the scores out by hand. `None` while the game is
 /// still in progress.
 fn finished_game_summary(game: &GameStateDto) -> Option<String> {
+    // An aborted game is terminal but not a result — no winner to announce,
+    // just a note that the creator called it off.
+    if game.status == GameStatus::Aborted {
+        return Some("Game aborted by the creator.".to_string());
+    }
     if game.status != GameStatus::Finished {
         return None;
     }
@@ -482,6 +487,7 @@ fn format_status(game: &GameStateDto) -> &'static str {
         api::GameStatus::Waiting => "Waiting",
         api::GameStatus::Active => "Playing",
         api::GameStatus::Finished => "Finished",
+        api::GameStatus::Aborted => "Aborted",
     }
 }
 

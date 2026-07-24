@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// binary's own `app_version()`.
 // 2.0: every timestamp DTO field changed from a `String` (unix seconds as
 // text) to a plain `i64` — a breaking wire change, hence the major bump.
-pub const API_VERSION: ApiVersion = ApiVersion { major: 2, minor: 0 };
+pub const API_VERSION: ApiVersion = ApiVersion { major: 2, minor: 1 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ApiVersion {
@@ -55,6 +55,10 @@ pub enum GameStatus {
     Waiting,
     Active,
     Finished,
+    /// The game's creator cancelled it (force-resigning everyone) before a
+    /// natural finish. Terminal like `Finished`, but not a real result — no
+    /// winner, no rating change.
+    Aborted,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

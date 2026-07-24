@@ -173,6 +173,7 @@ pub fn build_router(state: AppState) -> Router {
             "/games/{game_id}/seats/{seat_number}/force-resign",
             post(force_resign_seat),
         )
+        .route("/games/{game_id}/abort", post(abort_game))
         .route("/games/{game_id}/actions", post(submit_action))
         .route("/games/{game_id}/chat", post(post_chat_message))
         .route("/games/{game_id}/remove", post(remove_game_for_player))

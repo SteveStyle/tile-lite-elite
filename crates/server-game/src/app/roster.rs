@@ -311,3 +311,56 @@ pub(crate) async fn force_resign_seat(
 
     Ok(Json(redact_game_state(dto, &access)))
 }
+
+/// Creator-only "abort" — cancels a whole game at once (see
+/// `GameSession::abort`), landing it in the terminal `Aborted` state rather
+/// than a played-out `Finished`. Mirrors `force_resign_seat`'s auth and
+/// broadcast, but always ends the game outright, so it reuses the terminal
+/// `GameFinished` event (the DTO's `status: aborted` is what tells clients it
+/// wasn't a real result).
+pub(crate) async fn abort_game(
+    Path(game_id): Path<String>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<api::GameStateDto>, ApiProblem> {
+    let caller_player_id = authenticated_player_id(&state, &headers)
+        .await
+        .ok_or_else(|| ApiProblem::unauthorized("Sign in to abort a game"))?;
+
+    let (mut dto, access) = {
+        let mut games = state.games.write().await;
+        let game = games
+            .get_mut(&game_id)
+            .ok_or_else(|| ApiProblem::not_found("Game not found"))?;
+
+        if !caller_may_manage_game(game, Some(&caller_player_id)) {
+            return Err(ApiProblem::unauthorized(
+                "Only the game's creator can abort a game",
+            ));
+        }
+
+        game.abort().map_err(ApiProblem::bad_request)?;
+        let dto = game.to_dto();
+        persistence::save_game(&state.db, game)
+            .await
+            .map_err(ApiProblem::from_sqlx)?;
+        let access = resolve_viewer_access(game, Some(&caller_player_id));
+        (dto, access)
+    };
+    stats::attach_current_ratings(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+    // Always a no-op — an aborted game never moves rating (settle only runs
+    // for `Finished`, see `stats::settle_ratings`) — kept for consistency with
+    // every other place a terminal game's DTO goes out.
+    stats::attach_rating_deltas(&state.db, &mut dto)
+        .await
+        .map_err(ApiProblem::from_sqlx)?;
+
+    tracing::info!(game_id, "game aborted by creator");
+    let _ = state
+        .events
+        .send(GameEventDto::GameFinished { game: dto.clone() });
+
+    Ok(Json(redact_game_state(dto, &access)))
+}

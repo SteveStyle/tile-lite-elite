@@ -489,6 +489,7 @@ pub fn RootApp() -> Element {
     let server_url_for_remove_seat = server_url.clone();
     let server_url_for_withdraw_seat = server_url.clone();
     let server_url_for_force_resign = server_url.clone();
+    let server_url_for_abort = server_url.clone();
     let server_url_for_resign = server_url.clone();
     let server_url_for_manual = server_url.clone();
     let game_for_home = game_for_view.clone();
@@ -1075,6 +1076,28 @@ pub fn RootApp() -> Element {
                                 is_loading.set(true);
                                 error_message.set(None);
                                 match force_resign_seat(&server_url, &current_game.id, seat_number, token.as_deref()).await {
+                                    Ok(updated) => {
+                                        info_message.set(None);
+                                        game.set(Some(updated));
+                                        if let Ok(summaries) = load_game_summaries(&server_url, token.as_deref()).await {
+                                            game_summaries.set(summaries);
+                                        }
+                                    }
+                                    Err(error) => error_message.set(Some(error)),
+                                }
+                                is_loading.set(false);
+                            });
+                        }
+                    },
+                    on_abort: move |_| {
+                        let server_url = server_url_for_abort.clone();
+                        let current_game = game().clone();
+                        let token = session().map(|current| current.session_token.clone());
+                        if let Some(current_game) = current_game {
+                            spawn(async move {
+                                is_loading.set(true);
+                                error_message.set(None);
+                                match abort_game(&server_url, &current_game.id, token.as_deref()).await {
                                     Ok(updated) => {
                                         info_message.set(None);
                                         game.set(Some(updated));
@@ -2255,6 +2278,14 @@ async fn force_resign_seat(
         &(),
     )
     .await
+}
+
+async fn abort_game(
+    server_url: &str,
+    game_id: &str,
+    token: Option<&str>,
+) -> Result<GameStateDto, String> {
+    post_json(&format!("{server_url}/games/{game_id}/abort"), token, &()).await
 }
 
 async fn submit_pass(

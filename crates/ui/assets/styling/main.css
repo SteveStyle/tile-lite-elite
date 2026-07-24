@@ -849,6 +849,10 @@ button:disabled {
     background: rgba(111, 75, 44, 0.14);
 }
 
+.game-status-aborted {
+    background: rgba(150, 90, 78, 0.22);
+}
+
 .game-status-new {
     background: rgba(212, 162, 58, 0.3);
 }
