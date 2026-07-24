@@ -197,12 +197,14 @@ pub fn RootApp() -> Element {
                 VersionCheck::Compatible | VersionCheck::Unreachable => {}
                 VersionCheck::MinorMismatch { server, client } => {
                     info_message.set(Some(format!(
-                        "Server API v{server} differs from this client's v{client} (non-breaking) — some features may be unavailable until you update."
+                        "Server API v{server} differs from this client's v{client} (non-breaking) — {}",
+                        update_hint_soft()
                     )));
                 }
                 VersionCheck::MajorMismatch { server, client } => {
                     error_message.set(Some(format!(
-                        "This client (API v{client}) is incompatible with the server (API v{server}). Please update the app before continuing."
+                        "This client (API v{client}) is incompatible with the server (API v{server}). {}",
+                        update_hint_hard()
                     )));
                     return;
                 }
@@ -2032,6 +2034,33 @@ enum VersionCheck {
     /// `/health` didn't answer at all — not a version problem, the normal
     /// offline/reachability handling elsewhere in bootstrap covers it.
     Unreachable,
+}
+
+/// How to update, phrased for the platform this build targets: a web client
+/// updates by reloading the page (it gets a fresh static bundle from the
+/// server); a desktop client needs a new download/install. No download link
+/// yet — there's no download page to point at (see the follow-up notes); the
+/// message stays generic until there is.
+fn update_hint_hard() -> &'static str {
+    #[cfg(feature = "desktop")]
+    {
+        "A newer version is available — please download and install the latest desktop client to continue."
+    }
+    #[cfg(not(feature = "desktop"))]
+    {
+        "Please refresh your browser to load the latest version."
+    }
+}
+
+fn update_hint_soft() -> &'static str {
+    #[cfg(feature = "desktop")]
+    {
+        "some features may be unavailable until you update the desktop client."
+    }
+    #[cfg(not(feature = "desktop"))]
+    {
+        "some features may be unavailable until you refresh your browser."
+    }
 }
 
 fn compare_api_version(server: api::ApiVersion, client: api::ApiVersion) -> VersionCheck {
