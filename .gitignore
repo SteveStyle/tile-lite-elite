@@ -57,3 +57,11 @@ node_modules/
 data/*.sqlite3
 data/*.sqlite3-wal
 data/*.sqlite3-shm
+
+# Playwright E2E (Node lives only under e2e/)
+e2e/test-results/
+e2e/playwright-report/
+e2e/.last-run.json
+
+# Local dev DB backups (see scripts / 3.4 Production Environment)
+data/backups/
