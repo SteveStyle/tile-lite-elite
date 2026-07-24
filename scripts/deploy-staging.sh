@@ -36,7 +36,7 @@ set -euo pipefail
 #
 # To test against a realistic copy of production data rather than whatever
 # staging has accumulated on its own, restore a production backup
-# (docs/3.5-production-support.md's Backups section) into
+# (docs/3.4-production-environment.md's Backups section) into
 # tile-lite-elite-staging-data before running this.
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"

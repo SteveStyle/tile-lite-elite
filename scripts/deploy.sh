@@ -8,7 +8,7 @@ set -euo pipefail
 # (VM.Standard.E2.1.Micro) has 1GB RAM, which isn't enough to compile the
 # Rust/wasm workspace. So this always builds locally (where there's room)
 # and transfers the finished images instead of the source — `docker save`,
-# scp, `docker load`, `docker compose up`. See docs/3.4-deployment.md's
+# scp, `docker load`, `docker compose up`. See docs/3.3-testing-ci-and-release.md's
 # "Container Deployment" section for the full story, including the Oracle
 # Cloud networking setup this assumes is already in place.
 #

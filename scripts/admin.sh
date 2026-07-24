@@ -6,7 +6,7 @@ set -euo pipefail
 #
 # This only works against a server running on the same machine — the
 # server's /admin/* endpoints reject anything that isn't a loopback
-# connection, by design (see docs/3.5-production-support.md's "Admin CLI" section).
+# connection, by design (see docs/3.4-production-environment.md's "Admin CLI" section).
 # That means this script can't reach the Oracle VM's server; use
 # `docker compose exec server tile-lite-elite-admin ...` there instead (same doc
 # section covers it).
