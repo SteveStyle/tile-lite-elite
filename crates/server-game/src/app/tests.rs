@@ -6433,3 +6433,47 @@ async fn a_finished_game_cannot_be_aborted() {
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn display_name_login_and_uniqueness_are_case_insensitive() {
+    let database_url = test_database_url();
+    let state = create_test_state(&database_url).await;
+    let app = build_router(state);
+
+    // Registered as entered — mixed case preserved in storage.
+    let alice = register_player(app.clone(), "Alice").await;
+    assert_eq!(alice.display_name, "Alice");
+
+    // Logging in with a different case resolves to the same account, and the
+    // stored display name keeps its original case.
+    let login = send_json(
+        app.clone(),
+        Method::POST,
+        "/auth/login",
+        &LoginPlayerRequest {
+            display_name: "alice".to_string(),
+            password: "correct horse battery staple".to_string(),
+            stay_logged_in: false,
+        },
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::OK);
+    let logged_in: PlayerSessionDto = read_json(login).await;
+    assert_eq!(logged_in.player_id, alice.player_id);
+    assert_eq!(logged_in.display_name, "Alice", "stored case is preserved");
+
+    // A case-variant registration is rejected as already taken.
+    let dup = send_json(
+        app,
+        Method::POST,
+        "/auth/register",
+        &RegisterPlayerRequest {
+            display_name: "ALICE".to_string(),
+            email: "alice-alt@example.com".to_string(),
+            password: "correct horse battery staple".to_string(),
+            stay_logged_in: false,
+        },
+    )
+    .await;
+    assert_eq!(dup.status(), StatusCode::BAD_REQUEST);
+}

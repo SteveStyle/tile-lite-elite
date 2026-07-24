@@ -709,13 +709,20 @@ pub async fn create_player(
     })
 }
 
+/// Case-**insensitive** lookup by display name (`collate nocase`), so a player
+/// logs in as "alice"/"ALICE"/"Alice" interchangeably. The name is still stored
+/// and shown exactly as entered at registration — only the *match* is folded.
+/// This one function backs login, the registration "already taken" check, and
+/// the update-details check, so all three treat the name case-insensitively;
+/// the `idx_players_display_name_nocase` unique index (migration 0005) is the
+/// matching DB-level guarantee against a case-variant slipping in via a race.
 pub async fn get_player_by_name(
     pool: &Pool<Sqlite>,
     display_name: &str,
 ) -> Result<Option<PlayerRecord>, sqlx::Error> {
     let row = sqlx::query(
         "select id, display_name, email, password_hash, created_at, updated_at, last_seen_at
-         from players where display_name = ?1",
+         from players where display_name = ?1 collate nocase",
     )
     .bind(display_name)
     .fetch_optional(pool)

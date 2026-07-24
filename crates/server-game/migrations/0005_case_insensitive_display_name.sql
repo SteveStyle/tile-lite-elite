@@ -1,0 +1,22 @@
+-- Case-insensitive display-name uniqueness.
+--
+-- `players.display_name` is still stored and displayed exactly as the player
+-- entered it at registration; this changes only how names are *matched*. A
+-- unique index with COLLATE NOCASE makes "Alice" and "alice" collide, so login
+-- can resolve a name case-insensitively (see persistence.rs's
+-- `get_player_by_name`) without two case-variant accounts making it ambiguous.
+-- The original case-sensitive `unique` on the column stays — redundant but
+-- harmless, since any set that's unique case-insensitively is also unique
+-- case-sensitively.
+--
+-- PRE-DEPLOY CHECK: this fails (and the server then refuses to start) if the
+-- database already holds two names differing only by case. Before deploying,
+-- confirm there are none:
+--
+--   select lower(display_name), count(*) from players
+--   group by 1 having count(*) > 1;   -- expect zero rows
+--
+-- (NOCASE folds ASCII A-Z only, which matches the existing case-insensitive
+-- prefix search in `search_players`.)
+create unique index idx_players_display_name_nocase
+    on players (display_name collate nocase);
